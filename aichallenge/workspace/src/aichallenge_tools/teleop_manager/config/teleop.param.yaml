@@ -1,8 +1,8 @@
 /**:
   ros__parameters:
     # --- 基本設定 ---
-    speed_scale:          1.0  
-    steer_scale:          1.0
+    speed_scale:          10.0  #1.0 
+    steer_scale:          0.4 #1.0
     timer_hz:             50.0
     joy_timeout_sec:      0.5 
 

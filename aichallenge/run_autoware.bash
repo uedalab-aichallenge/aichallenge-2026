@@ -7,16 +7,16 @@ out_dir="${out_dir:-/output/$(date +%Y%m%d-%H%M%S)/d${id}}"
 
 case "${mode}" in
 "awsim")
-    opts=("simulation:=true" "use_sim_time:=true" "run_rviz:=true")
+    opts=("simulation:=true" "use_sim_time:=true" "run_rviz:=true" "control_method:=${CONTROL_METHOD:-mpc}")
     ;;
 "awsim-no-viz")
-    opts=("simulation:=true" "use_sim_time:=true" "run_rviz:=false")
+    opts=("simulation:=true" "use_sim_time:=true" "run_rviz:=false" "control_method:=${CONTROL_METHOD:-mpc}")
     ;;
 "vehicle")
-    opts=("simulation:=false" "use_sim_time:=false" "run_rviz:=false")
+    opts=("simulation:=false" "use_sim_time:=false" "run_rviz:=false" "control_method:=${CONTROL_METHOD:-mpc}")
     ;;
 "rosbag")
-    opts=("simulation:=false" "use_sim_time:=true" "run_rviz:=true")
+    opts=("simulation:=false" "use_sim_time:=true" "run_rviz:=true" "control_method:=${CONTROL_METHOD:-mpc}")
     ;;
 *)
     echo "invalid argument (use 'awsim' or 'vehicle' or 'rosbag')"

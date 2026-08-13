@@ -22,6 +22,7 @@ x-autoware-base: &autoware-base
     - HOST_UID=${HOST_UID:-}
     - HOST_GID=${HOST_GID:-}
     - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}
+    - CONTROL_METHOD=${CONTROL_METHOD:-mpc}
     - LOG_DIR=${LOG_DIR:-}
   volumes:
     - ./output:${OUTPUT_ROOT:-/output}
@@ -38,6 +39,8 @@ x-autoware-base: &autoware-base
     - /dev/dri
     - /dev/video0
     - /dev/input
+  group_add:
+    - input
   working_dir: /aichallenge
 
 x-autoware-rosbag-base: &autoware-rosbag-base

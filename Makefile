@@ -78,7 +78,14 @@ dev4: SIM_MODE := dev4
 dev2 dev3 dev4: simulator
 	@N=$(@:dev%=%); \
 	echo "Start $$N-vehicle dev (autoware on ROS_DOMAIN_ID 1..$$N via docker compose -p)"; \
-	for p in $$(seq 1 $$N); do LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=$$p docker compose -p $$p up -d autoware; done; \
+	for p in $$(seq 1 $$N); do \
+		control_var="D$${p}_CONTROL_METHOD"; \
+		control_method="$${!control_var}"; \
+		if [ -z "$$control_method" ]; then \
+			if [ "$$p" = "1" ]; then control_method="$${CONTROL_METHOD:-joycon}"; else control_method="$${CONTROL_METHOD:-mpc}"; fi; \
+		fi; \
+		LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=$$p CONTROL_METHOD=$$control_method docker compose -p $$p up -d autoware; \
+	done; \
 	echo "To Stop: make down"
 
 gate1: SIM_MODE := gate1
