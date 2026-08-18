@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    log_interval_sec: 5.0
+
+    model:
+      policy_path: ""
+      dataset_repo_id: ""
+      dataset_root: ""
+      device: "cuda"
+      image_height: 200
+      image_width: 320
+      crop_top_ratio: 0.375
+      crop_bottom_ratio: 0.0
+
+    state_mode: "none"  # "none", "odometry", or "vehicle_status"
+    control_mode: "ai"  # "ai" or "fixed"
+    acceleration: 0.6
+    debug: false

@@ -1,0 +1,22 @@
+<launch>
+  <arg name="act_lerobot_node_param" default="$(find-pkg-share act_lerobot_controller)/config/act_lerobot_node.param.yaml"/>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="image_topic" default="/sensing/camera/image_raw"/>
+  <arg name="control_cmd_topic" default="/control/command/control_cmd"/>
+  <arg name="policy_path" default=""/>
+  <arg name="dataset_repo_id" default=""/>
+  <arg name="dataset_root" default=""/>
+
+  <node pkg="act_lerobot_controller"
+        exec="act_lerobot_controller_node.py"
+        name="act_lerobot_controller_node"
+        output="screen">
+    <param from="$(var act_lerobot_node_param)"/>
+    <param name="model.policy_path" value="$(var policy_path)"/>
+    <param name="model.dataset_repo_id" value="$(var dataset_repo_id)"/>
+    <param name="model.dataset_root" value="$(var dataset_root)"/>
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <remap from="/image_raw" to="$(var image_topic)"/>
+    <remap from="/control/command/control_cmd" to="$(var control_cmd_topic)"/>
+  </node>
+</launch>

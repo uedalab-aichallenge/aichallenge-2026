@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="policy_path" default=""/>
+  <arg name="dataset_repo_id" default=""/>
+  <arg name="dataset_root" default=""/>
+
+  <include file="$(find-pkg-share act_lerobot_controller)/launch/act_lerobot.launch.xml">
+    <arg name="policy_path" value="$(var policy_path)"/>
+    <arg name="dataset_repo_id" value="$(var dataset_repo_id)"/>
+    <arg name="dataset_root" value="$(var dataset_root)"/>
+    <arg name="control_cmd_topic" value="/control/command/control_cmd"/>
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
+  </include>
+</launch>

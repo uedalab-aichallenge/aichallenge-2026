@@ -18,7 +18,7 @@
 
   <!-- Control method -->
   <arg name="control_method" default="mpc"
-       description="Select control: mpc, pure_pursuit, tiny_lidar_net, pilot_net, joycon"/>
+       description="Select control: mpc, pure_pursuit, tiny_lidar_net, pilot_net, act_lerobot, joycon"/>
 
   <!-- Global parameters -->
   <group scoped="false">
@@ -154,6 +154,12 @@
 
   <group if="$(eval &quot;'$(var control_method)' == 'pilot_net'&quot;)">
     <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/pilot_net.launch.xml">
+      <arg name="use_sim_time" value="$(var use_sim_time)"/>
+    </include>
+  </group>
+
+  <group if="$(eval &quot;'$(var control_method)' == 'act_lerobot'&quot;)">
+    <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/act_lerobot.launch.xml">
       <arg name="use_sim_time" value="$(var use_sim_time)"/>
     </include>
   </group>
