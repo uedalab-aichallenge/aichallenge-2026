@@ -20,7 +20,7 @@ exec $AWSIM_DIRECTORY/AWSIM.x86_64 \
     --handicap off \
     --wall-recovery on \
     --ranking off \
-    --camera off \
+    --camera gpu \
     --lidar off
 
 # Cameraを使う場合 : --camera cpu or gpu

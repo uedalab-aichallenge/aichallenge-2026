@@ -285,12 +285,10 @@ def main() -> None:
             LOGGER.warning("%s: no synchronized samples; skipped", bag_path)
             continue
 
-        first_ts = samples[0].timestamp_ns
         for sample in samples:
             frame = {
                 "observation.images.front": sample.image,
                 "action": sample.action,
-                "timestamp": (sample.timestamp_ns - first_ts) * 1e-9,
                 "task": args.task,
             }
             if sample.state is not None:
