@@ -665,6 +665,82 @@ void StuckRecoveryController::onNominalCommand(
   updateStuckDetection(*msg, now);
 }
 
+// 車体前方の同一レーンにいる最寄りの他車までの距離[m]。いなければ無限大。
+//
+// 追い越し層が通路なしと判断すると速度指令 0 を出すため、指令速度だけを見る
+// motion_requested 条件では複数台が接触したまま永久停止する。前方の同一レーンに
+// 限ることで、通常の低速走行や横並びを誤って拾わない。
+double StuckRecoveryController::nearestForwardVehicle() const
+{
+  double nearest = std::numeric_limits<double>::infinity();
+  if (!v2x_ || !odom_) { return nearest; }
+  const auto & self = odom_->pose.pose.position;
+  const auto & q = odom_->pose.pose.orientation;
+  const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  const double cy = std::cos(yaw), sy = std::sin(yaw);
+  for (const auto & vehicle : v2x_->vehicles) {
+    const double dx = vehicle.position.x - self.x;
+    const double dy = vehicle.position.y - self.y;
+    const double longitudinal = dx * cy + dy * sy;
+    const double lateral = -dx * sy + dy * cy;
+    if (longitudinal > kBlockedVehicleMinLongitudinal &&
+        longitudinal <= kBlockedVehicleMaxLongitudinal &&
+        std::abs(lateral) <= kBlockedVehicleMaxLateral)
+    {
+      nearest = std::min(nearest, longitudinal);
+    }
+  }
+  return nearest;
+}
+
+// 前後左右を問わず、一定半径内に他車がいるか。
+//
+// 前方だけを見ていたときは**横に並んで押し合っている接触を拾えなかった**
+// (ユーザー報告: idx105 でカート同士がぶつかったのに復帰が出ない)。
+// 誤発動の心配は小さい。呼び出し側は実速度 <= 0.1m/s が 3秒続くことも
+// 同時に要求しており、レース中にその状態が続くのは実際に詰まっているときだけ。
+bool StuckRecoveryController::anyVehicleNear() const
+{
+  if (!v2x_ || !odom_) { return false; }
+  const auto & self = odom_->pose.pose.position;
+  for (const auto & vehicle : v2x_->vehicles) {
+    const double d = std::hypot(vehicle.position.x - self.x,
+                                vehicle.position.y - self.y);
+    if (d < kBlockedVehicleAnyDirRange) { return true; }
+  }
+  return false;
+}
+
+// 「進んでいない」を瞬間速度ではなく実際の移動量で見る。
+//
+// 【直したバグ(ユーザー報告)】
+// 「P1とP2がぶつかり、復帰処理をせずずっとアクセルを踏み続けて強引に復帰した」。
+// 従来の入口判定は瞬間速度だけ (|velocity| <= kStuckSpeedThreshold(0.1)) だった。
+// カート同士が押し合っている状態は車体が擦れながら **0.2〜0.5 m/s で動き続ける**。
+// 0.1 を超えるので stuck と判定されず、一方 motion_requested は成立し続けるので
+// アクセルを踏み続け、復帰が一度も起動しないまま力任せに押し抜けていた。
+// 実測: 車両接触1回に対し復帰完了0回。
+//
+// 復帰処理の**内部**には既に「距離が伸びていなければ停滞」という判定
+// (kStallDist / stall_since_)があるのに、**入口だけが瞬間速度**という不整合だった。
+bool StuckRecoveryController::hasNoProgress(const rclcpp::Time & now)
+{
+  recovery::Pose cp;
+  if (!currentPose(cp)) { return false; }
+  if (!entry_ref_valid_ ||
+      std::hypot(cp.x - entry_ref_x_, cp.y - entry_ref_y_) > kEntryProgressDist)
+  {
+    entry_ref_x_ = cp.x;
+    entry_ref_y_ = cp.y;
+    entry_ref_time_ = now;
+    entry_ref_valid_ = true;
+    return false;
+  }
+  // kEntryProgressSec 秒かけて kEntryProgressDist も進めていない
+  return (now - entry_ref_time_).seconds() >= kEntryProgressSec;
+}
+
 void StuckRecoveryController::updateStuckDetection(
   const AckermannControlCommand & command, const rclcpp::Time & now)
 {
@@ -692,26 +768,7 @@ void StuckRecoveryController::updateStuckDetection(
   // 追い越し層が通路なしと判断すると速度指令0を出すため、従来の
   // motion_requested 条件では複数台が接触したまま永久停止する。
   // 車体前方の同一レーンにいる近接車だけを見て、通常の低速走行や横並びを除外する。
-  double nearest_forward_vehicle = std::numeric_limits<double>::infinity();
-  if (v2x_ && odom_) {
-    const auto & self = odom_->pose.pose.position;
-    const auto & q = odom_->pose.pose.orientation;
-    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
-                                  1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-    const double cy = std::cos(yaw), sy = std::sin(yaw);
-    for (const auto & vehicle : v2x_->vehicles) {
-      const double dx = vehicle.position.x - self.x;
-      const double dy = vehicle.position.y - self.y;
-      const double longitudinal = dx * cy + dy * sy;
-      const double lateral = -dx * sy + dy * cy;
-      if (longitudinal > kBlockedVehicleMinLongitudinal &&
-          longitudinal <= kBlockedVehicleMaxLongitudinal &&
-          std::abs(lateral) <= kBlockedVehicleMaxLateral)
-      {
-        nearest_forward_vehicle = std::min(nearest_forward_vehicle, longitudinal);
-      }
-    }
-  }
+  const double nearest_forward_vehicle = nearestForwardVehicle();
   // 近くに他車がいて止まっているか。
   //
   // 【直した穴 その1: 指令速度の不感帯】
@@ -729,15 +786,7 @@ void StuckRecoveryController::updateStuckDetection(
   //
   // 誤発動の心配は小さい。**実速度 <= 0.1m/s が 3秒続く**ことも同時に要求しており、
   // レース中にその状態が3秒続くのは実際に詰まっているときだけ。
-  bool car_near = std::isfinite(nearest_forward_vehicle);
-  if (!car_near && v2x_ && odom_) {
-    const auto & self = odom_->pose.pose.position;
-    for (const auto & vehicle : v2x_->vehicles) {
-      const double d = std::hypot(vehicle.position.x - self.x,
-                                  vehicle.position.y - self.y);
-      if (d < kBlockedVehicleAnyDirRange) { car_near = true; break; }
-    }
-  }
+  const bool car_near = std::isfinite(nearest_forward_vehicle) || anyVehicleNear();
   const bool blocked_by_vehicle =
     std::abs(command.longitudinal.speed) < kCommandSpeedThreshold &&
     std::abs(velocity) <= kStuckSpeedThreshold &&
@@ -779,23 +828,7 @@ void StuckRecoveryController::updateStuckDetection(
   // 復帰処理の**内部**には既に「距離が伸びていなければ停滞」という判定
   // (kStallDist / stall_since_)があるのに、**入口だけが瞬間速度**という
   // 不整合だった。入口も実際の移動量で見る。
-  bool no_progress = false;
-  {
-    recovery::Pose cp;
-    if (currentPose(cp)) {
-      if (!entry_ref_valid_ ||
-          std::hypot(cp.x - entry_ref_x_, cp.y - entry_ref_y_) > kEntryProgressDist)
-      {
-        entry_ref_x_ = cp.x;
-        entry_ref_y_ = cp.y;
-        entry_ref_time_ = now;
-        entry_ref_valid_ = true;
-      } else if ((now - entry_ref_time_).seconds() >= kEntryProgressSec) {
-        // kEntryProgressSec 秒かけて kEntryProgressDist も進めていない
-        no_progress = true;
-      }
-    }
-  }
+  const bool no_progress = hasNoProgress(now);
 
   if (std::abs(velocity) <= kStuckSpeedThreshold || no_progress) {
     if (!stuck_start_time_.has_value()) {
@@ -1024,6 +1057,210 @@ void StuckRecoveryController::beginRecovery(
 
 // 計画した区間を順に実行する。
 // 区間ごとにギアと舵角が決まっているので、走った距離が区間長に達したら次へ進む。
+// 領域内へ戻り、向きも揃い、走り出せるなら通常制御へ返す。返したら true。
+//
+// 以前は横位置しか見ておらず、コースに対して直角(yaw=111deg)のまま
+// 「復帰 完了」と返して2秒後に再スタックしていた。
+bool StuckRecoveryController::tryHandBack(
+  const recovery::Pose & p, const rclcpp::Time & now, double total)
+{
+  double lat = 0.0, lo = 0.0, hi = 0.0, yaw_err = 0.0;
+  // 壁から十分離れていること。境界からわずかに内側という程度で返すと、
+  // 通常制御がすぐまた壁へ寄せて同じ場所で詰まる(実測で同一地点8回)。
+  const bool inside = lateralNow(lat, lo, hi) &&
+                      lat > lo + kHandbackMargin && lat < hi - kHandbackMargin;
+  const bool aligned = !headingErrorToTrack(yaw_err) || yaw_err < kAlignYaw;
+  // 通常制御が狙う先へ実際に走り出せること。
+  // ただし長引いたら見る距離を縮める。12m 先まで完全に空くのを待ち続けると、
+  // 狭い区間では条件が満たせず 30 秒を使い切る(実測1件)。
+  // 途中まで空いていれば返して、また詰まったら復帰し直すほうが速い。
+  const double look = (total > kHandbackRelaxSec)
+                        ? kHandbackAhead * 0.5 : kHandbackAhead;
+  const bool can_go = handbackPathClear(look);
+  // 復帰開始地点から実際に離れていること。後退しただけで
+  // 「領域内・向きOK」を満たして返してしまうのを防ぐ。
+  const double gone = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
+  if (inside && aligned && can_go && gone > kEscapeDist &&
+      std::abs(latest_velocity_) > kMovingSpeedThreshold) {
+    RCLCPP_INFO(get_logger(),
+                "復帰 完了 %.1fs 計画%d回 方位差%.0fdeg 移動%.1fm 状況= %s",
+                total, replan_count_, yaw_err * 180.0 / M_PI, gone,
+                situation_.c_str());
+    finishRecovery(now);
+    return true;
+  }
+  return false;
+}
+
+// 最終手段。計画で抜けられる姿勢ではないときに、強引に動かす。
+//
+// 舵を左右に振りながら前後へ全開で当て、車体の向きを変えて隙間を作る。
+// 相手を押すことにもなるので、他に手が無いときだけ。
+// ここへ入るのは (a) 計画を kReplanMax 回出しても 1.2m も動けない
+// (b) 経路が 1 本も出せない、のどちらか。(b) は前後とも塞がれている場合で、
+// 以前は通常制御へ返して押し付けを繰り返すだけだった。
+void StuckRecoveryController::runDesperate(
+  const recovery::Pose & p, const rclcpp::Time & now)
+{
+  const double moved = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
+  if (moved > kDesperateFreeDist) {
+    RCLCPP_INFO(get_logger(), "復帰 強引な脱出で %.1fm 動けた。計画に戻す", moved);
+    desperate_ = false;
+    replan_count_ = 0;
+    makePlan(now, 0);
+    return;
+  }
+  const double t = (now - desperate_since_).seconds();
+  const int swing = static_cast<int>(t / kDesperateSwingSec);
+  if (swing != desperate_swing_) {
+    desperate_swing_ = swing;
+    RCLCPP_WARN(get_logger(), "復帰 強引な脱出 %d回目 (最終手段)", swing + 1);
+  }
+  // 前後を交互に、舵も交互に振る。同じ当て方を続けても抜けないため。
+  const bool fwd = (swing % 2) == 0;
+  const float steer = static_cast<float>(
+    ((swing / 2) % 2 == 0 ? 1.0 : -1.0) * kMaxSteerRad);
+  publishGear(fwd ? GearCommand::DRIVE : GearCommand::REVERSE);
+  publishCommand(fwd ? kDesperateSpeed : -kDesperateSpeed, kDesperateAccel, steer);
+}
+
+// 計画を走り切った / そもそも計画が無いときに、引き直すか最終手段へ移る。
+//
+// 戻り値: 値があれば runRecovery はそれをそのまま返す(この周期は終わり)。
+//         std::nullopt なら計画が用意できたので、そのまま実行へ進む。
+std::optional<bool> StuckRecoveryController::replanOrEscalate(
+  const recovery::Pose & p, const rclcpp::Time & now)
+{
+  // 計画を走り切ったのに戻れていない。今の姿勢から引き直す。
+  if (replan_count_ >= kReplanMax) {
+    const double moved = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
+    if (moved < kDesperateFreeDist) {
+      // 計画を出しても1歩も動けていない。走行可能領域では説明のつかない
+      // 何か(壁の当たり方、他車)に阻まれている。最終手段に切り替える。
+      RCLCPP_WARN(get_logger(),
+                  "復帰 計画%d回で %.2fm しか動けない。強引な脱出に切り替える",
+                  replan_count_, moved);
+      desperate_ = true;
+      desperate_since_ = now;
+      desperate_swing_ = -1;
+      return true;
+    }
+    RCLCPP_WARN(get_logger(), "復帰 計画%d回でも戻れない。通常制御へ返す 状況= %s",
+                replan_count_, situation_.c_str());
+    finishRecovery(now);
+    return false;
+  }
+  ++replan_count_;
+  // 動けなかった向きを覚えているなら、その逆から始める計画を求める。
+  if (!makePlan(now, blocked_dir_ != 0 ? -blocked_dir_ : 0)) {
+    // --- 経路が1本も出せない = 前後とも塞がれている
+    //
+    // 【直したバグ(ユーザー報告: ぶつかって復帰が働かずアクセル踏みっぱなし)】
+    // ここは finishRecovery() で通常制御へ返していた。しかし通常制御は
+    // 前へ指令を出し続けるだけなので、返した瞬間にまた押し付けが始まり、
+    // stuck 判定 -> 経路が出せない -> 返す、を延々と繰り返す。
+    // 実測(3台走行 d2): `復帰 経路を計算できない` が 12 回、
+    // stuck 判定が 8 回。その間ずっと前の車へ押し付けていた。
+    //
+    // 強引な脱出(desperate_)の仕組みは下に既にあるが、入口が
+    // `replan_count_ >= kReplanMax` だけで、**経路が出せない場合は
+    // そこへ到達する前にここで降りていた**。だから一度も発動していない。
+    //
+    // 経路が出せないのは「計画で抜けられる姿勢ではない」ということなので、
+    // まさに強引な脱出が要る場面。ここから直接切り替える
+    // (ユーザー指示: 完全に動けないのであれば強引に切り返しを何度も行う)。
+    RCLCPP_WARN(get_logger(),
+                "復帰 経路が出せない(%d回目)。強引な脱出に切り替える 状況= %s",
+                replan_count_, situation_.c_str());
+    desperate_ = true;
+    desperate_since_ = now;
+    desperate_swing_ = -1;
+    return true;
+  }
+  return std::nullopt;
+}
+
+// 前進中に壁へ近づいたら、動けなくなる前に引き直す。引き直したら true。
+bool StuckRecoveryController::replanIfWallNear(
+  const recovery::Pose & p, const recovery::Phase & ph, const rclcpp::Time & now)
+{
+  // --- 前進中に壁へ近づいたら、動けなくなる前に引き直す
+  //
+  // 【ユーザー報告】「壁にぶつからない処理を入れているのに、
+  //   低速の復帰動作でまた壁に突っ込む」。
+  //
+  // 【実測(20260828-175600-s0/d2、ヘアピン idx130 付近)】
+  //   復帰 計画0: 前進舵-18deg 3.0m            <- 後退なしの前進のみ計画
+  //   走行0.00m yaw-34 壁まで 0.45             <- 計画時は 0.45m あった
+  //   走行0.18m yaw-47 壁まで 0.14
+  //   走行0.24m yaw-51 壁まで-0.10             <- 食い込み
+  //   走行0.30m yaw-55 壁まで-0.14
+  //   復帰 前進 で動けない。後退から引き直す    <- 楔状に嵌まってから初めて反応
+  //
+  // 【なぜ計画の壁判定をすり抜けたか】
+  //  (1) 計画時の余裕が 0.45m あったので `touching` が偽になり、
+  //      「接触中は出だしで食い込みを増やさない」ガードが素通りした。
+  //  (2) 経路の検証は自転車モデル(advance())で行うが、
+  //      **壁際・低速では車がその通りに動かない**。実測では 0.30m 進む間に
+  //      yaw が 21 度も回っている。指令舵 -18deg の自転車モデルでは
+  //      説明がつかない(車が並進せずその場で振れている)。
+  //      つまり計画時に「3.0m 先まで当たらない」と検証しても、
+  //      実際の軌跡は別物になる。
+  //
+  // 【対策】計画の妥当性をモデルに任せきりにせず、**実測のクリアランス**で
+  // 見張る。前進中に余裕が閾値を割ったら、停滞を待たずに即座に後退から引き直す。
+  // 停滞判定(kStallSec)を待つと、その頃には壁に押し付けられて動けない。
+  if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
+  const double clear_now = recovery::wallClearanceAt(obstacles_, veh_, p);
+  // 壁も同じ。狭い所ではもともと余裕が小さいので、
+  // 「閾値を割った」だけでは降りない。**区間開始より悪化している**ことを条件にする。
+  if (clear_now < kFwdAbortClearance &&
+      clear_now < phase_start_wall_clear_ - kFwdAbortWorsen &&
+      phase_travelled_ > kFwdAbortMinTravel)
+  {
+    ++replan_count_;
+    blocked_dir_ = 1;                     // 前進は駄目だったと覚える
+    RCLCPP_WARN(get_logger(),
+                "復帰 前進中に壁まで %.2fm まで詰まった(走行%.2fm)。"
+                "動けなくなる前に後退から引き直す(%d回目)",
+                clear_now, phase_travelled_, replan_count_);
+    makePlan(now, -1);                    // 後退から始める計画を要求
+    return true;
+  }
+  }
+  return false;
+}
+
+// 前進中に他車へ近づいたら、ぶつかる前に引き直す。引き直したら true。
+bool StuckRecoveryController::replanIfCarNear(
+  const recovery::Pose & p, const recovery::Phase & ph, const rclcpp::Time & now)
+{
+  // --- 前進中に他車へ近づいたら、ぶつかる前に引き直す
+  // 経路計画にも他車を入れたが、壁のときと同じで**計画どおりに動かない**
+  // (壁際・低速では車が並進せず振れる)。実測のクリアランスでも見張る。
+  if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
+  // **符号付きの余裕**を使う。`carViolation` は 0 で初期化した「重なりの深さ」で
+  // 離れていても 0 を返すので、距離として使うと他車が1台もいなくても
+  // 条件が真になり、前進のたびに中断して無限に切り返す(実際に出したバグ)。
+  const double cc = recovery::carClearanceAt(carObstacles(), veh_, p);
+  // 近いだけでは降りない。**区間開始より悪化している**ときだけ降りる。
+  // そうしないと、もともと狭い所では出だしで必ず降りて同じ計画を引き直し続ける。
+  if (cc < kFwdAbortCarDist && cc < phase_start_car_clear_ - kFwdAbortWorsen &&
+      phase_travelled_ > kFwdAbortMinTravel)
+  {
+    ++replan_count_;
+    blocked_dir_ = 1;
+    RCLCPP_WARN(get_logger(),
+                "復帰 前進中に他車まで %.2fm(開始時%.2fm)。"
+                "ぶつかる前に引き直す(%d回目)",
+                cc, phase_start_car_clear_, replan_count_);
+    makePlan(now, -1);
+    return true;
+  }
+  }
+  return false;
+}
+
 bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 {
   if (!recovery_start_time_.has_value()) { return false; }
@@ -1046,112 +1283,15 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   last_y_ = p.y;
   last_valid_ = true;
 
-  // 領域内へ戻り、向きも揃っていれば通常制御へ返す。
-  // 以前は横位置しか見ておらず、コースに対して直角(yaw=111deg)のまま
-  // 「復帰 完了」と返して2秒後に再スタックしていた。
-  {
-    double lat = 0.0, lo = 0.0, hi = 0.0, yaw_err = 0.0;
-    // 壁から十分離れていること。境界からわずかに内側という程度で返すと、
-    // 通常制御がすぐまた壁へ寄せて同じ場所で詰まる(実測で同一地点8回)。
-    const bool inside = lateralNow(lat, lo, hi) &&
-                        lat > lo + kHandbackMargin && lat < hi - kHandbackMargin;
-    const bool aligned = !headingErrorToTrack(yaw_err) || yaw_err < kAlignYaw;
-    // 通常制御が狙う先へ実際に走り出せること。
-    // ただし長引いたら見る距離を縮める。12m 先まで完全に空くのを待ち続けると、
-    // 狭い区間では条件が満たせず 30 秒を使い切る(実測1件)。
-    // 途中まで空いていれば返して、また詰まったら復帰し直すほうが速い。
-    const double look = (total > kHandbackRelaxSec)
-                          ? kHandbackAhead * 0.5 : kHandbackAhead;
-    const bool can_go = handbackPathClear(look);
-    // 復帰開始地点から実際に離れていること。後退しただけで
-    // 「領域内・向きOK」を満たして返してしまうのを防ぐ。
-    const double gone = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
-    if (inside && aligned && can_go && gone > kEscapeDist &&
-        std::abs(latest_velocity_) > kMovingSpeedThreshold) {
-      RCLCPP_INFO(get_logger(),
-                  "復帰 完了 %.1fs 計画%d回 方位差%.0fdeg 移動%.1fm 状況= %s",
-                  total, replan_count_, yaw_err * 180.0 / M_PI, gone,
-                  situation_.c_str());
-      finishRecovery(now);
-      return false;
-    }
-  }
+  if (tryHandBack(p, now, total)) { return false; }
 
-  // --- 最終手段 ---
-  // 計画をすべて試しても1歩も動けていないなら、強引に動かす。
-  // 舵を左右に振りながら前後へ全開で当て、車体の向きを変えて隙間を作る。
-  // 相手を押すことにもなるので、他に手が無いときだけ。
-  if (desperate_) {
-    const double moved = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
-    if (moved > kDesperateFreeDist) {
-      RCLCPP_INFO(get_logger(), "復帰 強引な脱出で %.1fm 動けた。計画に戻す", moved);
-      desperate_ = false;
-      replan_count_ = 0;
-      makePlan(now, 0);
-      return true;
-    }
-    const double t = (now - desperate_since_).seconds();
-    const int swing = static_cast<int>(t / kDesperateSwingSec);
-    if (swing != desperate_swing_) {
-      desperate_swing_ = swing;
-      RCLCPP_WARN(get_logger(), "復帰 強引な脱出 %d回目 (最終手段)", swing + 1);
-    }
-    // 前後を交互に、舵も交互に振る。同じ当て方を続けても抜けないため。
-    const bool fwd = (swing % 2) == 0;
-    const float steer = static_cast<float>(
-      ((swing / 2) % 2 == 0 ? 1.0 : -1.0) * kMaxSteerRad);
-    publishGear(fwd ? GearCommand::DRIVE : GearCommand::REVERSE);
-    publishCommand(fwd ? kDesperateSpeed : -kDesperateSpeed, kDesperateAccel, steer);
-    return true;
-  }
+  
+
+  if (desperate_) { runDesperate(p, now); return true; }
 
   if (!plan_.valid || phase_idx_ >= plan_.phases.size()) {
-    // 計画を走り切ったのに戻れていない。今の姿勢から引き直す。
-    if (replan_count_ >= kReplanMax) {
-      const double moved = std::hypot(p.x - recovery_start_x_, p.y - recovery_start_y_);
-      if (moved < kDesperateFreeDist) {
-        // 計画を出しても1歩も動けていない。走行可能領域では説明のつかない
-        // 何か(壁の当たり方、他車)に阻まれている。最終手段に切り替える。
-        RCLCPP_WARN(get_logger(),
-                    "復帰 計画%d回で %.2fm しか動けない。強引な脱出に切り替える",
-                    replan_count_, moved);
-        desperate_ = true;
-        desperate_since_ = now;
-        desperate_swing_ = -1;
-        return true;
-      }
-      RCLCPP_WARN(get_logger(), "復帰 計画%d回でも戻れない。通常制御へ返す 状況= %s",
-                  replan_count_, situation_.c_str());
-      finishRecovery(now);
-      return false;
-    }
-    ++replan_count_;
-    // 動けなかった向きを覚えているなら、その逆から始める計画を求める。
-    if (!makePlan(now, blocked_dir_ != 0 ? -blocked_dir_ : 0)) {
-      // --- 経路が1本も出せない = 前後とも塞がれている
-      //
-      // 【直したバグ(ユーザー報告: ぶつかって復帰が働かずアクセル踏みっぱなし)】
-      // ここは finishRecovery() で通常制御へ返していた。しかし通常制御は
-      // 前へ指令を出し続けるだけなので、返した瞬間にまた押し付けが始まり、
-      // stuck 判定 -> 経路が出せない -> 返す、を延々と繰り返す。
-      // 実測(3台走行 d2): `復帰 経路を計算できない` が 12 回、
-      // stuck 判定が 8 回。その間ずっと前の車へ押し付けていた。
-      //
-      // 強引な脱出(desperate_)の仕組みは下に既にあるが、入口が
-      // `replan_count_ >= kReplanMax` だけで、**経路が出せない場合は
-      // そこへ到達する前にここで降りていた**。だから一度も発動していない。
-      //
-      // 経路が出せないのは「計画で抜けられる姿勢ではない」ということなので、
-      // まさに強引な脱出が要る場面。ここから直接切り替える
-      // (ユーザー指示: 完全に動けないのであれば強引に切り返しを何度も行う)。
-      RCLCPP_WARN(get_logger(),
-                  "復帰 経路が出せない(%d回目)。強引な脱出に切り替える 状況= %s",
-                  replan_count_, situation_.c_str());
-      desperate_ = true;
-      desperate_since_ = now;
-      desperate_swing_ = -1;
-      return true;
-    }
+    const auto done = replanOrEscalate(p, now);
+    if (done.has_value()) { return done.value(); }
   }
 
   const auto & ph = plan_.phases[phase_idx_];
@@ -1260,74 +1400,9 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   // また待機に入ってタイマーがリセットされる無限ループになる。
   rear_waiting_ = false;
 
-  // --- 前進中に壁へ近づいたら、動けなくなる前に引き直す
-  //
-  // 【ユーザー報告】「壁にぶつからない処理を入れているのに、
-  //   低速の復帰動作でまた壁に突っ込む」。
-  //
-  // 【実測(20260828-175600-s0/d2、ヘアピン idx130 付近)】
-  //   復帰 計画0: 前進舵-18deg 3.0m            <- 後退なしの前進のみ計画
-  //   走行0.00m yaw-34 壁まで 0.45             <- 計画時は 0.45m あった
-  //   走行0.18m yaw-47 壁まで 0.14
-  //   走行0.24m yaw-51 壁まで-0.10             <- 食い込み
-  //   走行0.30m yaw-55 壁まで-0.14
-  //   復帰 前進 で動けない。後退から引き直す    <- 楔状に嵌まってから初めて反応
-  //
-  // 【なぜ計画の壁判定をすり抜けたか】
-  //  (1) 計画時の余裕が 0.45m あったので `touching` が偽になり、
-  //      「接触中は出だしで食い込みを増やさない」ガードが素通りした。
-  //  (2) 経路の検証は自転車モデル(advance())で行うが、
-  //      **壁際・低速では車がその通りに動かない**。実測では 0.30m 進む間に
-  //      yaw が 21 度も回っている。指令舵 -18deg の自転車モデルでは
-  //      説明がつかない(車が並進せずその場で振れている)。
-  //      つまり計画時に「3.0m 先まで当たらない」と検証しても、
-  //      実際の軌跡は別物になる。
-  //
-  // 【対策】計画の妥当性をモデルに任せきりにせず、**実測のクリアランス**で
-  // 見張る。前進中に余裕が閾値を割ったら、停滞を待たずに即座に後退から引き直す。
-  // 停滞判定(kStallSec)を待つと、その頃には壁に押し付けられて動けない。
-  if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
-    const double clear_now = recovery::wallClearanceAt(obstacles_, veh_, p);
-    // 壁も同じ。狭い所ではもともと余裕が小さいので、
-    // 「閾値を割った」だけでは降りない。**区間開始より悪化している**ことを条件にする。
-    if (clear_now < kFwdAbortClearance &&
-        clear_now < phase_start_wall_clear_ - kFwdAbortWorsen &&
-        phase_travelled_ > kFwdAbortMinTravel)
-    {
-      ++replan_count_;
-      blocked_dir_ = 1;                     // 前進は駄目だったと覚える
-      RCLCPP_WARN(get_logger(),
-                  "復帰 前進中に壁まで %.2fm まで詰まった(走行%.2fm)。"
-                  "動けなくなる前に後退から引き直す(%d回目)",
-                  clear_now, phase_travelled_, replan_count_);
-      makePlan(now, -1);                    // 後退から始める計画を要求
-      return true;
-    }
-  }
+  if (replanIfWallNear(p, ph, now)) { return true; }
 
-  // --- 前進中に他車へ近づいたら、ぶつかる前に引き直す
-  // 経路計画にも他車を入れたが、壁のときと同じで**計画どおりに動かない**
-  // (壁際・低速では車が並進せず振れる)。実測のクリアランスでも見張る。
-  if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
-    // **符号付きの余裕**を使う。`carViolation` は 0 で初期化した「重なりの深さ」で
-    // 離れていても 0 を返すので、距離として使うと他車が1台もいなくても
-    // 条件が真になり、前進のたびに中断して無限に切り返す(実際に出したバグ)。
-    const double cc = recovery::carClearanceAt(carObstacles(), veh_, p);
-    // 近いだけでは降りない。**区間開始より悪化している**ときだけ降りる。
-    // そうしないと、もともと狭い所では出だしで必ず降りて同じ計画を引き直し続ける。
-    if (cc < kFwdAbortCarDist && cc < phase_start_car_clear_ - kFwdAbortWorsen &&
-        phase_travelled_ > kFwdAbortMinTravel)
-    {
-      ++replan_count_;
-      blocked_dir_ = 1;
-      RCLCPP_WARN(get_logger(),
-                  "復帰 前進中に他車まで %.2fm(開始時%.2fm)。"
-                  "ぶつかる前に引き直す(%d回目)",
-                  cc, phase_start_car_clear_, replan_count_);
-      makePlan(now, -1);
-      return true;
-    }
-  }
+  if (replanIfCarNear(p, ph, now)) { return true; }
 
   // 動けていないなら計画を引き直す。同じ指令を出し続けても出られない。
   // ただし、区間を始めた直後とギアを入れ替えた直後は数に入れない。

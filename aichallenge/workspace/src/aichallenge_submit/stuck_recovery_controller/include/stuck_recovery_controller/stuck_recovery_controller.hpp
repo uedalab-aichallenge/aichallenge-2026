@@ -44,6 +44,13 @@ private:
   void publishCommand(float speed, float acceleration, float steer = 0.0f);
   void loadRaceline(const std::string & raceline_csv, const std::string & corridor_csv);
   bool isRearClear();
+  // --- stuck 判定の材料(updateStuckDetection から切り出したもの) ---
+  // 車体前方の同一レーンにいる最寄りの他車までの距離[m]。いなければ無限大。
+  double nearestForwardVehicle() const;
+  // 前後左右を問わず一定半径内に他車がいるか。横並びの押し合いを拾うため。
+  bool anyVehicleNear() const;
+  // 「進んでいない」を瞬間速度ではなく実際の移動量で判定する。
+  bool hasNoProgress(const rclcpp::Time & now);
   // 後方の他車までの距離[m]。いなければ大きな値。
   // 「6m 空くまで待つ」と、レース中は後ろに車がいるのが普通なので
   // 待っているうちに上限に達する。空いている距離ぶんだけ下がる計画にする。
@@ -52,6 +59,18 @@ private:
   // 単独で壁に刺さった場合と、他車に当てた/当てられた場合では
   // 使える空間も相手の動きもまったく違うので、分けて集計できるようにする。
   std::string situationText() const;
+  // 領域内へ戻り向きも揃い走り出せるなら通常制御へ返す。返したら true。
+  bool tryHandBack(const recovery::Pose & p, const rclcpp::Time & now, double total);
+  // 最終手段。舵を左右に振りながら前後へ全開で当て、強引に隙間を作る。
+  void runDesperate(const recovery::Pose & p, const rclcpp::Time & now);
+  // 計画を引き直すか最終手段へ移る。値があれば runRecovery はそれを返す。
+  std::optional<bool> replanOrEscalate(const recovery::Pose & p, const rclcpp::Time & now);
+  // 前進中に壁へ近づいたら引き直す。引き直したら true。
+  bool replanIfWallNear(const recovery::Pose & p, const recovery::Phase & ph,
+                        const rclcpp::Time & now);
+  // 前進中に他車へ近づいたら引き直す。引き直したら true。
+  bool replanIfCarNear(const recovery::Pose & p, const recovery::Phase & ph,
+                       const rclcpp::Time & now);
   // 復帰の前進区間を軌道として publish する。戻せたら true。
   bool publishRecoveryTrajectory();
   // 自車の横位置とその地点のコリドア境界を返す。コリドアが無ければ false。
