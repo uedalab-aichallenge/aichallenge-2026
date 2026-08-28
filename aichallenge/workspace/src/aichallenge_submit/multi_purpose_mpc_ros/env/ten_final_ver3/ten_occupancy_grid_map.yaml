@@ -1,0 +1,12 @@
+# ユーザーが GIMP で編集した占有格子地図。
+# 元は ten_final_ver3/occupancy_grid_map.pgm(現行)。解像度・原点・しきい値は同一で、
+# 塗り分けだけが違う(自由セル -1389、塞いだ 5434 / 開けた 4045、差分 9479 セル)。
+free_thresh: 0.196
+image: ten_occupancy_grid_map.pgm
+negate: 0
+occupied_thresh: 0.65
+origin:
+- 89608.69387016428
+- 43117.15165326744
+- 0.0
+resolution: 0.1

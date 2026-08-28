@@ -15,6 +15,11 @@ x-autoware-base: &autoware-base
     - TZ=Asia/Tokyo
     - RUN_MODE=${RUN_MODE:-}
     - SIM_MODE=${SIM_MODE:-}
+    # 複数のシミュレータを同時に走らせるためのスロット指定。既定は空で、
+    # simulator_scripts 側が 0 とみなすので通常の実験の条件は変わらない。
+    - ROS2_BASE_DOMAIN=${ROS2_BASE_DOMAIN:-}
+    - AWSIM_ADMIN_DOMAIN=${AWSIM_ADMIN_DOMAIN:-}
+    - AWSIM_HEADLESS=${AWSIM_HEADLESS:-}
     - CMD=${CMD:-}
     - COLCON_TRACE=${COLCON_TRACE:-}
     - ROS_HOME=${ROS_HOME:-}

@@ -21,13 +21,13 @@ def launch_setup(context, *args, **kwargs):
     config_path = (
         Path(get_package_share_directory("multi_purpose_mpc_ros"))
         / "config"
-        / "config.yaml"
+        / "ten_config.yaml"
     )
 
     ref_vel_path = (
         Path(get_package_share_directory("multi_purpose_mpc_ros"))
         / "config"
-        / "ref_vel.yaml"
+        / "ten_ref_vel.yaml"
     )
 
     mpc_controller = Node(

@@ -13,7 +13,7 @@ def launch_setup(context, *args, **kwargs):
     config_path = (
         Path(get_package_share_directory("multi_purpose_mpc_ros"))
         / "config"
-        / "config.yaml"
+        / "ten_config.yaml"
     )
 
     ref_path_visualizer = Node(

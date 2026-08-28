@@ -202,14 +202,18 @@ autoware_auto_control_msgs（Autoware underlay に存在）
 
 colcon が自動解決するため、特別な指定は不要。
 
-### config.yaml の確認・調整
+### ten_config.yaml の確認・調整
 
-MPC の config ファイル: `multi_purpose_mpc_ros/config/config.yaml`
+MPC の config ファイル: `multi_purpose_mpc_ros/config/ten_config.yaml`
+
+citycircuit ではこの `ten_config.yaml` / `ten_ref_vel.yaml` が読み込まれる（`mpc.launch.xml`）。
+上流の `config.yaml` / `ref_vel.yaml` と `env/final_ver3/` は比較用の基準として未変更のまま残して
+あり、`config_file:=config.yaml ref_vel_file:=ref_vel.yaml` を渡せば上流設定で走らせられる。
 
 | 設定項目 | 現在の値 | 確認事項 |
 |---------|---------|---------|
-| `map.yaml_path` | `env/final_ver3/occupancy_grid_map.yaml` | 占有格子地図が存在するか |
-| `reference_path.csv_path` | `env/final_ver3/traj_mincurv.csv` | 最適化済み経路が存在するか |
+| `map.yaml_path` | `env/ten_final_ver3/occupancy_grid_map.yaml` | 占有格子地図が存在するか |
+| `reference_path.csv_path` | `env/ten_final_ver3/traj_mincurv.csv` | 最適化済み経路が存在するか |
 | `reference_path.update_by_topic` | `false` | CSV 直接読み込みモード（推奨） |
 | `mpc.steering_tire_angle_gain_var` | `1.639` | 実機値。sim では `1.50` が必要かも |
 | `mpc.v_max` | `20.0` | 速度プリセット（中速）。環境に合わせて調整 |
@@ -367,8 +371,9 @@ env/
 ├── preliminary/     # 初期版（3種類の最適化軌跡あり）
 ├── final/           # 決勝版 v1
 ├── final_ver2/      # 決勝版 v2
-├── final_ver3/      # 決勝版 v3 ← 現在 config.yaml で参照中
+├── final_ver3/      # 決勝版 v3（上流のまま。比較用の基準）
 ├── final_ver4/      # 決勝版 v4
+├── ten_final_ver3/  # final_ver3 のコピー ← 現在 ten_config.yaml で参照中。編集はここ
 ├── official/        # 公式版（軌跡なし、地図のみ）
 └── others/          # 補助データ（ウェイポイント、障害物 CSV 等）
 ```

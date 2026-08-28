@@ -15,13 +15,24 @@
   <!-- Map -->
   <arg name="lanelet2_map_file" default="$(var track_subdir)lanelet2_map.osm" description="lanelet2 map file name"/>
   <arg name="pointcloud_map_file" default="pointcloud_map.pcd" description="pointcloud map file name"/>
+  <!-- Raceline CSV for simple_trajectory_generator (path + speed). citycircuit uses our tuning copy under
+       data/ten_map/; pass raceline_file:=raceline_awsim_30km_from_garage.csv to fall back to the upstream line. -->
+  <arg name="corridor_file" default="ten_map/corridor_ten.csv" description="追い越し時に使える横可動域(make_corridor.py で生成)"/>
+  <arg name="rank1_corner_gain" default="1.00" description="1位のときコーナー速度に掛ける係数"/>
+  <arg name="rank2_corner_gain" default="1.00" description="2位以下のときコーナー速度に掛ける係数"/>
+  <arg name="enable_overtake" default="true" description="V2X による追い越し・追従を有効にする"/>
+  <arg name="raceline_file" default="$(eval &quot;'ten_map/raceline_ten_v2.csv' if '$(var track)' == 'citycircuit' else '$(var track_subdir)raceline_awsim_30km_from_garage.csv'&quot;)" description="raceline csv path relative to simple_trajectory_generator/data"/>
 
   <!-- Vehicle -->
   <arg name="launch_vehicle_interface" default="$(eval &quot;'$(var simulation)' == 'false'&quot;)"/>
   <log message="echo launch param use_sim_time: $(var use_sim_time) launch_vehicle_interface: $(var launch_vehicle_interface) sensor_model: $(var sensor_model)"/>
 
   <!-- Control method -->
-  <arg name="control_method" default="mpc"
+  <!-- 環境変数 CONTROL_METHOD が設定されていればそれを使う。
+       ローカルの複数台検証で「敵車だけデフォルトMPCにする」ために使う。
+       compose の環境変数リストには入れていないので、通常の起動では未設定 =
+       既定の pure_pursuit になる（提出時の挙動は変わらない）。 -->
+  <arg name="control_method" default="$(env CONTROL_METHOD pure_pursuit)"
       description="Select control: mpc, pure_pursuit, tiny_lidar_net, pilot_net, joycon, rl_train"/>
 
   <!-- Global parameters -->
@@ -128,9 +139,52 @@
       <push-ros-namespace namespace="scenario_planning"/>
 
       <!-- Customizable -->
+      <!-- 素の軌道は trajectory_raw に出し、v2x_overtaker が他車を見て横にずらしてから
+           契約トピック /planning/scenario_planning/trajectory へ publish する。
+           他車がいなければオフセット 0 でそのまま素通しするので単独走行の挙動は変わらない。 -->
       <node pkg="simple_trajectory_generator" exec="simple_trajectory_generator_node" name="simple_trajectory_generator" output="screen">
-            <param name="csv_path" value="$(find-pkg-share simple_trajectory_generator)/data/$(var track_subdir)raceline_awsim_30km_from_garage.csv"/>
+            <remap from="trajectory" to="trajectory_raw"/>
+            <param name="csv_path" value="$(find-pkg-share simple_trajectory_generator)/data/$(var raceline_file)"/>
             <param name="z" value="6.5"/>
+      </node>
+
+      <node pkg="v2x_overtaker" exec="v2x_overtaker_node" name="v2x_overtaker" output="screen">
+            <param name="corridor_csv" value="$(find-pkg-share simple_trajectory_generator)/data/$(var corridor_file)"/>
+            <param name="enable" value="$(var enable_overtake)"/>
+            <!-- 距離系は車速に合わせる。v_max を 30->42km/h(11.67m/s) へ上げた結果、
+                 既定値のままでは判定が成立しなくなっていた。
+                 avoid_range: TTC 判定の手前で dist>avoid_range を切り捨てているので、
+                   ttc_threshold=1.0s * 11.67m/s = 11.7m より短いと TTC 判定が死ぬ。
+                 stopped_look_ahead: 制動距離 v^2/(2*a_min)=27.2m + stop_margin 3.0m
+                   = 30.2m。既定 30.0m では余裕がゼロだった。 -->
+            <!-- スタートグリッドの座標。P1(最後尾) / P2(中間) / P3(最前列=NPC) の順。
+                 実測して記録した値(2026-08-28、ten-qual 3台):
+                   P1 = (89631.0, 43128.0) 横 +1.4  進行度 329.2
+                   P2 = (89633.0, 43131.3) 横 -2.4  進行度 330.4
+                   P3 = (89628.9, 43131.5) 横 +0.6  進行度 333.5
+                 レース開始時に自車の座標を照合して P1/P2/P3 を確定する。
+                 他車の進行度から毎回並べ替える方法は V2X の到着に依存して
+                 崩れるので、固定のグリッド座標との照合を優先する。 -->
+            <param name="grid_slots"
+                   value="89631.0:43128.0,89633.0:43131.3,89628.9:43131.5"/>
+            <param name="detect_range" value="25.0"/>
+            <param name="avoid_range" value="14.0"/>
+            <param name="stopped_look_ahead" value="40.0"/>
+            <param name="pass_gap" value="1.9"/>
+            <param name="follow_gap" value="7.0"/>
+            <param name="offset_rate" value="1.2"/>
+            <!-- 順位別のコーナー速度係数。sweep.sh の順位別計測で最適値を決める。
+                 1.00 = 速度マップそのまま。1位は 25km/h 制限があるのでコーナーで稼ぐ余地がある。 -->
+            <param name="rank1_corner_gain" value="$(var rank1_corner_gain)"/>
+            <param name="rank2_corner_gain" value="$(var rank2_corner_gain)"/>
+            <remap from="input/trajectory" to="trajectory_raw"/>
+            <!-- 復帰処理が最後に入るので、ここでは中間トピックへ出す -->
+            <remap from="output/trajectory" to="trajectory_v2x"/>
+            <remap from="input/kinematics" to="/localization/kinematic_state"/>
+            <remap from="input/v2x" to="/v2x/vehicle_positions"/>
+            <remap from="input/awsim_status" to="/awsim/status"/>
+            <remap from="output/awsim_cmd" to="/awsim/cmd"/>
+            <remap from="output/overtaking" to="/planning/scenario_planning/overtaking"/>
       </node>
       
     </group>
@@ -141,6 +195,8 @@
     <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/pure_pursuit.launch.xml">
       <arg name="simulation" value="$(var simulation)"/>
       <arg name="use_sim_time" value="$(var use_sim_time)"/>
+      <arg name="raceline_file" value="$(var raceline_file)"/>
+      <arg name="corridor_file" value="$(var corridor_file)"/>
     </include>
   </group>
 

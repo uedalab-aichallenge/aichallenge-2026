@@ -2,6 +2,8 @@
 <launch>
   <arg name="simulation" default="true"/>
   <arg name="use_sim_time" default="true"/>
+  <arg name="raceline_file" default="ten_map/raceline_ten_v2.csv"/>
+  <arg name="corridor_file" default="ten_map/corridor_ten.csv"/>
 
   <let name="steering_tire_angle_gain_var" value="1.50" if="$(var simulation)"/>
   <let name="steering_tire_angle_gain_var" value="1.639" unless="$(var simulation)"/>
@@ -9,14 +11,57 @@
   <node pkg="simple_pure_pursuit" exec="simple_pure_pursuit" name="simple_pure_pursuit_node" output="screen">
     <param name="use_external_target_vel" value="false"/>
     <param name="external_target_vel" value="10.0"/>
-    <param name="lookahead_gain" value="0.5"/>
+    <param name="lookahead_gain" value="0.20"/>
     <param name="lookahead_min_distance" value="3.5"/>
+    <!-- 曲率に応じて lookahead を縮める。pure pursuit は lookahead が長いほど
+         コーナーを内側へ切り込むので、直線で有利な長さをそのままコーナーで使うと
+         壁に届く。実測(単独走行)でコース最小半径の idx82(R=4.7m)は外側の余裕が
+         0.16m しかなく、追従誤差(±0.24m)のほうが大きかった。
+         curve_ref 以上の半径で等倍、それより曲がっているほど curve_min まで縮める。 -->
+    <param name="lookahead_curve_ref" value="20.0"/>
+    <param name="lookahead_curve_min" value="0.45"/>
+    <!-- 場所を指定して lookahead を縮める。"開始:終了:倍率" をカンマ区切り。
+         idx165-185 は内側の余地が 0.90m しかなく、pure_pursuit が
+         ラインより 1.2m 内側を通ると領域外に出る。曲率で決めると
+         もっときつい idx51-65(R4.0m) 等が強く縮まって発振する。 -->
+    <param name="lookahead_scale_zones" value=""/>
+    <param name="lookahead_curve_ahead" value="6.0"/>
     <param name="speed_proportional_gain" value="1.0"/>
-    <param name="steering_tire_angle_gain" value="$(var steering_tire_angle_gain_var)"/>
-    <param name="max_acceleration" value="3.0"/>
+    <!-- OVER ペナルティ(|a|>3 m/s^2 で 2 秒間 5 km/h 制限)を踏まないための上限。
+         AWSIM は入力を ±1.37 に clamp するので 2.0 でも性能は落ちない。 -->
+    <param name="max_acceleration" value="2.0"/>
+    <param name="steering_tire_angle_gain" value="2.8"/>
 
     <remap from="input/kinematics" to="/localization/kinematic_state"/>
     <remap from="input/trajectory" to="/planning/scenario_planning/trajectory"/>
-    <remap from="output/control_cmd" to="/control/command/control_cmd"/>
+    <!-- 追い越し試行中は目標点を近づける。v2x_overtaker が状態を publish する -->
+    <remap from="input/overtaking" to="/planning/scenario_planning/overtaking"/>
+    <!-- 最終出力は stuck_recovery_controller が publish する。
+         pure_pursuit は nominal 側に出し、スタック時だけ復帰動作に差し替えられる。 -->
+    <remap from="output/control_cmd" to="/control/command/nominal_control_cmd"/>
+  </node>
+
+  <!-- 公式のスタック復帰制御。nominal を素通しし、スタック検知時のみ後退で復帰する。
+       検知条件: 実速度<=0.1 m/s が 1.0 秒継続(かつ指令速度>1.0, 指令加速度>0.3)
+       復帰動作: リバース4秒 -> DRIVE 0.5秒停止 -> 通常復帰
+       出典: https://github.com/AutomotiveAIChallenge/stuck_recovery_controller -->
+  <node pkg="stuck_recovery_controller" exec="stuck_recovery_controller_node"
+        name="stuck_recovery_controller" output="screen">
+    <!-- 復帰経路の計算に使う。コース境界(可動域)と他車位置から
+         「後退したときに最も空いている方向」を選んで舵を当てる。 -->
+    <param name="raceline_csv"
+           value="$(find-pkg-share simple_trajectory_generator)/data/$(var raceline_file)"/>
+    <param name="corridor_csv"
+           value="$(find-pkg-share simple_trajectory_generator)/data/$(var corridor_file)"/>
+    <!-- 壁の判定に使う占有格子。コリドア(中心線に対する横方向だけ)では
+         ヘアピンで鼻先が壁に当たっている状態を表現できないため。 -->
+    <param name="occupancy_grid_yaml"
+           value="$(find-pkg-share multi_purpose_mpc_ros)/env/ten_final_ver3/ten_occupancy_grid_map.yaml"/>
+    <!-- 復帰の前進区間は、指令を直接作るのではなく経路を渡して pure_pursuit に
+         追従させる。通常制御への戻りが連続になり、後退に頼る量も減る。
+         そのため軌道の経路にも入る(v2x_overtaker の出力を受け、
+         pure_pursuit が読むトピックへ流す)。 -->
+    <remap from="input/trajectory" to="/planning/scenario_planning/trajectory_v2x"/>
+    <remap from="output/trajectory" to="/planning/scenario_planning/trajectory"/>
   </node>
 </launch>
