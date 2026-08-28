@@ -1128,8 +1128,29 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
     ++replan_count_;
     // 動けなかった向きを覚えているなら、その逆から始める計画を求める。
     if (!makePlan(now, blocked_dir_ != 0 ? -blocked_dir_ : 0)) {
-      finishRecovery(now);
-      return false;
+      // --- 経路が1本も出せない = 前後とも塞がれている
+      //
+      // 【直したバグ(ユーザー報告: ぶつかって復帰が働かずアクセル踏みっぱなし)】
+      // ここは finishRecovery() で通常制御へ返していた。しかし通常制御は
+      // 前へ指令を出し続けるだけなので、返した瞬間にまた押し付けが始まり、
+      // stuck 判定 -> 経路が出せない -> 返す、を延々と繰り返す。
+      // 実測(3台走行 d2): `復帰 経路を計算できない` が 12 回、
+      // stuck 判定が 8 回。その間ずっと前の車へ押し付けていた。
+      //
+      // 強引な脱出(desperate_)の仕組みは下に既にあるが、入口が
+      // `replan_count_ >= kReplanMax` だけで、**経路が出せない場合は
+      // そこへ到達する前にここで降りていた**。だから一度も発動していない。
+      //
+      // 経路が出せないのは「計画で抜けられる姿勢ではない」ということなので、
+      // まさに強引な脱出が要る場面。ここから直接切り替える
+      // (ユーザー指示: 完全に動けないのであれば強引に切り返しを何度も行う)。
+      RCLCPP_WARN(get_logger(),
+                  "復帰 経路が出せない(%d回目)。強引な脱出に切り替える 状況= %s",
+                  replan_count_, situation_.c_str());
+      desperate_ = true;
+      desperate_since_ = now;
+      desperate_swing_ = -1;
+      return true;
     }
   }
 

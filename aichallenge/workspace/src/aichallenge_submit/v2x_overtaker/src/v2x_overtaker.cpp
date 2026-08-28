@@ -925,6 +925,891 @@ private:
 
   // ---- ここから onTimer から切り出した層 ----
 
+  // 他車 1 台を評価し、前をふさぐ相手なら追う / 抜くの判断まで行う。
+  //
+  // もとは planOvertake の 868 行のループ本体だった。1 台ぶんの評価が
+  // 独立しているので切り出す。ループの `continue` は `return` になっている。
+  void evaluateOpponent(const Frame & f, PlanCtx & c,
+                        const std::string & name, const OtherState & o)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const size_t n = f.n;
+    const double total = f.total;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
+
+    if (!o.valid) {
+      return;
+    }
+    if ((now - o.stamp).seconds() > v2x_timeout_) {
+      return;   // 情報が古い。信用しない
+    }
+    const size_t oi = nearest(in, o.x, o.y);
+    double gap = s[oi] - s[ei];
+    if (gap < 0) {
+      gap += total;      // 周回をまたぐ
+    }
+    // 進行度差だけで前後を判定すると、スタートのグリッドのように
+    // 横に並んでいる車が「差ほぼ0」となって前車として検出されず、
+    // 速度制限が掛からないまま加速して追突する。
+    // 車体の向きから見た実際の前方距離でも判定する。
+    double fwd_real = 1e9;
+    {
+      const auto & qq = odom_->pose.pose.orientation;
+      const double yaw = std::atan2(2.0 * (qq.w * qq.z + qq.x * qq.y),
+                                    1.0 - 2.0 * (qq.y * qq.y + qq.z * qq.z));
+      const double dxr = o.x - ex, dyr = o.y - ey;
+      const double f = dxr * std::cos(yaw) + dyr * std::sin(yaw);
+      const double sd = std::abs(-dxr * std::sin(yaw) + dyr * std::cos(yaw));
+      if (f > 0.0 && sd < front_lane_half_) {
+        fwd_real = f;      // 自分の進路上の前方にいる
+      }
+    }
+    const bool ahead_by_prog = (gap > 0.5 && gap < detect_range_);
+    const bool ahead_by_geom = (fwd_real < detect_range_);
+    if (!ahead_by_prog && !ahead_by_geom) {
+      return;
+    }
+    // 距離は小さい方を採用する(横並びでも実距離で反応できる)
+    gap = std::min(gap, fwd_real);
+    if (gap >= c.best_gap) {
+      return;
+    }
+    c.best_gap = gap;
+    c.blocker = name;
+
+    // 相手の横位置（ライン基準の符号付き）
+    double nx, ny;
+    normalAt(in, oi, nx, ny);
+    const auto & lp = in.points[oi].pose.position;
+    const double olat = (o.x - lp.x) * nx + (o.y - lp.y) * ny;
+
+    // 前車の進行方向速度を先に求める(抜くかどうかの判定に使う)
+    double ospeed_for_gate;
+    {
+      const auto & a2 = in.points[(oi + n - 1) % n].pose.position;
+      const auto & b2 = in.points[(oi + 1) % n].pose.position;
+      double tx2 = b2.x - a2.x, ty2 = b2.y - a2.y;
+      const double l2 = std::hypot(tx2, ty2);
+      if (l2 > 1e-9) {
+        tx2 /= l2;
+        ty2 /= l2;
+      }
+      ospeed_for_gate = o.vx * tx2 + o.vy * ty2;
+    }
+
+    // 相手と反対側へ、必要な間隔ぶん寄せる。
+    // ただし相手の横位置は揺れるので、毎周期で左右を決め直すと目標が反転し続ける。
+    // 一度どちらに抜けるか決めたら、対象車が変わるか一定時間経つまで側を保持する。
+    // 側は対象車が変わったときだけ決め直す。時間で決め直すと
+    // 追い越し中に左右が反転して危険なため。
+    // 相手と反対側が基本だが、その側にコリドアの余地が無いなら反対へ回る。
+    // どちらにも余地が無ければ side_fits_ を偽にして追い越し自体をやめる。
+    // 「pass_gap ぶん丸ごと寄れるか」で判定すると厳しすぎる。
+    // pass_gap=1.7m に対しコリドアの片側の余地が 1.35〜1.85m しかなく、
+    // 幅も時間も足りている場面が side_fits_=false で全部却下されていた
+    // (実測: zone=1 幅=4.0(要3.4) 所要=6.1s なのに feasible=0)。
+    // 実際に必要なのは「並んだときに車体が当たらない横間隔」なので、
+    // 寄れる範囲まで寄った結果の間隔が min_pass_sep 以上あれば良しとする。
+    const double reach_left = std::min(olat + pass_gap_, room_hi_);
+    const double reach_right = std::max(olat - pass_gap_, room_lo_);
+    bool fit_left = (reach_left - olat) >= min_pass_sep_;
+    bool fit_right = (olat - reach_right) >= min_pass_sep_;
+    // 学習した相手のラインで、抜き切るまでの区間を丸ごと見て側を決める。
+    // 瞬間値だけだと、相手がラインを横切っている最中の一瞬を見て
+    // 余地の無い側を選んでしまう(実測: 側OK=0 の 48% は反対側なら成立)。
+    double map_left = 0.0, map_right = 0.0;
+    int map_known = 0;
+    if (lane_map_side_) {
+      sideRoomMap(o, in, n, oi, lane_map_stretch_, olat, map_left, map_right, map_known);
+      // 学習データが区間の大半にある場合だけ信用する。
+      // map_left/right は「足りている区間が連続で何m続くか」。
+      // 抜き切るのに要る長さ(pass_len)を満たしていれば、その側は成立。
+      const double need = pass_len_ * lane_map_need_gain_;
+      if (map_known >= lane_map_min_pts_) {
+        fit_left = fit_left || (map_left >= need);
+        fit_right = fit_right || (map_right >= need);
+      }
+    }
+    dbg_map_l_ = map_left; dbg_map_r_ = map_right; dbg_map_n_ = map_known;
+    if (c.blocker != side_blocker_) {
+      side_blocker_ = c.blocker;
+      side_decided_at_ = now.seconds();
+      side_flip_cnt_ = 0;           // 対象車が変わったら側の変更枠を戻す
+      side_flip_at_ = now.seconds();
+      side_unfit_since_ = -1.0;
+      // 側の優先順位: イン > 相手の反対側。
+      // イン側を先に押さえると相手は避けざるを得ず、アウトから被せるより
+      // 成立しやすい(ユーザー方針: 攻められるならイン、無理なら反対側)。
+      // 直線(curve_sign_=0)では従来どおり相手の反対側。
+      double want = (olat >= 0.0) ? -1.0 : +1.0;   // 相手が左なら右へ
+      // --- 右側から抜くと決めている区間(ユーザー指示)
+      // メインストレート(idx220 -> 30)は右から抜く。
+      // side_sign_ は +1 が左、-1 が右(ログの表記と同じ)。
+      bool in_right_zone = false;
+      for (const auto & z : right_zones_) {
+        const bool inside = (z.first <= z.second)
+                              ? (ei >= z.first && ei <= z.second)
+                              : (ei >= z.first || ei <= z.second);
+        if (inside) { in_right_zone = true; break; }
+      }
+      if (in_right_zone) { want = -1.0; }
+      if (curve_sign_ != 0.0) {
+        const double inside_sign = (curve_sign_ > 0.0) ? +1.0 : -1.0;
+        const bool inside_fit = (inside_sign > 0.0) ? fit_left : fit_right;
+        if (inside_fit) { want = inside_sign; }
+      }
+      if (want < 0.0) {
+        side_sign_ = fit_right ? -1.0 : (fit_left ? +1.0 : -1.0);
+      } else {
+        side_sign_ = fit_left ? +1.0 : (fit_right ? -1.0 : +1.0);
+      }
+      // 両側とも成立するなら、並走できる区間が長いほうを選ぶ。
+      // イン優先は「相手が避けざるを得ない」ための策だが、
+      // 抜き切るまでの区間で明らかに狭ければ意味がない。
+      if (!in_right_zone && lane_map_side_ && map_known >= lane_map_min_pts_ &&
+          fit_left && fit_right) {
+        if (std::abs(map_left - map_right) > lane_map_margin_) {
+          side_sign_ = (map_left > map_right) ? +1.0 : -1.0;
+        }
+      }
+    }
+    side_fits_ = (side_sign_ > 0.0) ? fit_left : fit_right;
+
+    // --- 選んだ側に余地が無いままなら、一度だけ反対側へ回り直す
+    //
+    // 側は対象車が変わったときしか決め直していなかった。実測(3レース)では
+    // side_sign_ が t=0.04s に決まったきり最後まで変わらず、
+    // 却下の 83% が「幅・時間・距離は足りているのに side_fits_=false」だった。
+    //
+    // 【試して却下した版】無制限に回り直す実装は3台走行で悪化した
+    // (側の変更12回・追越成功0・stuck 2->7・復帰タイムアウト 1->6)。
+    // 左右に振られて壁に当たっていた。そこで制限を3つ入れてある。
+    //   (1) 対象車1台につき変更は side_flip_max 回まで
+    //   (2) 余地なしが side_flip_hold 秒連続で続いたときだけ
+    //   (3) まだ本当に踏み切っていない(|offset| < pass_gap*0.8)ときだけ
+    //
+    // 実測(3レース): 1台1回の枠は却下 128 件のうち 98 件(77%)が
+    // 「反対側なら成立していた」場面で使い果たされていた。枠を 4 回に増やし、
+    // 保持時間も 0.6s に縮めてある。左右に振られないための担保は
+    // side_room_ahead=15m(先読みを伸ばして側の判断が古くならないようにした)と
+    // 上の(3)。committed の判定を pass_gap*0.8(約1.4m)にしたので、
+    // 「まだ寄り始めただけ」の段階なら側を直せる。
+    if (!side_fits_) {
+      if (side_unfit_since_ < 0.0) { side_unfit_since_ = now.seconds(); }
+    } else {
+      side_unfit_since_ = -1.0;
+    }
+    // 使った枠を時間で戻す。総量制のままでは、同じ相手が長く前にいる間に
+    // 枠を使い切って「余地の無い側に張り付いたまま」になる。
+    if (side_flip_regen_ > 0.0 && side_flip_cnt_ > 0) {
+      const double dt = now.seconds() - side_flip_at_;
+      const int credit = static_cast<int>(dt / side_flip_regen_);
+      if (credit > 0) {
+        side_flip_cnt_ = std::max(0, side_flip_cnt_ - credit);
+        side_flip_at_ += credit * side_flip_regen_;
+      }
+    }
+    const bool other_fits = (side_sign_ > 0.0) ? fit_right : fit_left;
+    // 試行開始後に側を反転すると、横目標が左右へ1〜3秒周期で振られ、
+    // どちら側にも必要な横間隔を作れない。実測3レースでは側変更38/31/61回、
+    // 失敗66件中36件が allow/feasible/latch 全成立なのに横間隔0.34m未満だった。
+    // 狭区間では後段の latch_width_ok が試行を終了させるので、ここでは
+    // 試行が失敗・終了するまで選んだ側を固定する。
+    const bool committed = attempt_active_;
+    if (!side_fits_ && side_flip_cnt_ < side_flip_max_ && other_fits && !committed &&
+        side_unfit_since_ >= 0.0 &&
+        (now.seconds() - side_unfit_since_) >= side_flip_hold_)
+    {
+      side_sign_ = -side_sign_;
+      side_fits_ = true;            // 回った先は余地があると確認済み
+      side_flip_cnt_++;
+      side_flip_at_ = now.seconds();
+      side_unfit_since_ = -1.0;
+      side_decided_at_ = now.seconds();
+      RCLCPP_INFO(get_logger(),
+        "追越 側を変更(%d/%d) target=%s 側=%s 相手横=%.2f 余地=[%.2f,%.2f] offset=%.2f",
+        side_flip_cnt_, side_flip_max_,
+        c.blocker.c_str(), (side_sign_ > 0.0) ? "左" : "右",
+        olat, room_lo_, room_hi_, offset_);
+    }
+    // 抜いてよいかは「ゾーン内」または「相手が極端に遅い」場合。
+    // それに加えて「ブーストを使えば抜ける」と判断できるならゾーン外でも抜く。
+    c.slow_leader = (ospeed_for_gate < slow_leader_speed_);
+    const double my_speed = odom_->twist.twist.linear.x;
+
+    // 幅さえあれば、ブーストで詰められるかを見る。
+    // 速度差が小さくて自力では抜けないが、ブーストの上乗せがあれば
+    // 追い越しに要する距離を pass_len_ 以内に収められる場合に使う。
+    // ブーストの効果は「加速度 +0.5 m/s^2 を 10 秒」(parameter.md)。
+    // 最高速は上がらないので、既に頭打ちの速度域で撃っても無意味。
+    // 加速余地(目標速度との差)がある場面でのみ効く。
+    // --- 追い越せるかを「自車の性能」から判定する
+    //
+    // これまでは closing(今の速度差)だけを見ていたため、
+    // 自分が1位で 25 km/h 上限なのに、瞬間的に速度が出ている場面で
+    // 「抜ける」と誤判定して横に出て、抜けないまま並走して接触していた。
+    //
+    // 正しくは「自分がこれから到達できる速度」と「必要な加速時間」で判断する。
+    //   自車の速度上限 = 順位による handicap (1位:25km/h, 2位以下:36km/h)
+    //                    と、その地点の速度マップの小さい方
+    //   到達までの時間 = (目標速度 - 現在速度) / 実効加速度
+    const double v_target_here = in.points[ei].longitudinal_velocity_mps;
+    const double rank_cap = ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
+    const double v_reach = std::min(v_target_here, rank_cap);   // 自分が出せる上限
+    const double headroom = v_reach - my_speed;                 // まだ伸ばせる速度
+
+    // 相手を抜くのに必要な相対速度。相手より速くなれなければ抜けない。
+    const double closing_max = v_reach - ospeed_for_gate;
+
+    // 加速に要する時間を引いた「実際に使える時間」で距離を稼ぐ
+    const double accel_eff = std::max(vehicle_accel_, 0.05);
+    const double t_accel = std::max(headroom, 0.0) / accel_eff;
+    const double need = gap + pass_len_;             // 抜き切るのに詰める距離
+
+    // ブースト: 加速度 +0.5 m/s^2 を 10 秒。最高速は上げないので
+    // 加速余地がある場面でのみ効く(到達を早めるだけ)。
+    const double accel_boosted = accel_eff + boost_accel_;
+    const double t_accel_boosted = std::max(headroom, 0.0) / accel_boosted;
+
+    // 追い越しに要する時間の見積り。
+    // 加速中は平均的に closing_max/2 で詰め、到達後は closing_max で詰める。
+    auto pass_time = [&](double ta) {
+      if (closing_max <= 0.2) {
+        return 1e9;                                   // そもそも相手より速くなれない
+      }
+      const double d_accel = closing_max * 0.5 * ta;  // 加速中に詰まる距離
+      if (d_accel >= need) {
+        return ta * (need / std::max(d_accel, 1e-6));
+      }
+      return ta + (need - d_accel) / closing_max;
+    };
+
+    // --- 抜き切るのに必要な距離が、使える距離に収まるか
+    // 時間だけでなく距離でも見る。ゾーンが途中で終わるなら出ない。
+    auto pass_dist = [&](double ta) {
+      const double t = pass_time(ta);
+      if (t >= 1e8) {
+        return 1e9;
+      }
+      // その間に自車が進む距離
+      return my_speed * t + 0.5 * accel_eff * std::min(t, ta) * std::min(t, ta);
+    };
+
+    // 使える距離。
+    // ゾーン外だと zone_remain=0 になり、zone_exit_margin(25m) だけが使える距離になる。
+    // 周回遅れの遅い車を抜くには 34〜36m 必要なので、これでは却下されてしまう
+    // (実測: 相手12km/h で所要6.6s 距離36m が 25m 制限で却下されていた)。
+    // 速度差が十分大きい相手は、抜き切るまでの間ずっと有利なので距離を緩める。
+    const double closing_kmh = closing_max * 3.6;
+    double usable;
+    if (c.slow_leader || closing_kmh >= big_gap_closing_) {
+      usable = 1e9;                       // 相手が明らかに遅い。距離で縛らない
+    } else {
+      usable = c.zone_remain + zone_exit_margin_;
+    }
+
+    // イン(旋回内側)から抜く場合は判定を緩める。
+    // イン側を先に押さえられた相手は避ける動作を取らざるを得ないため、
+    // アウトから被せるより成立しやすい。
+    // 曲率の向きと抜こうとしている側が一致していればイン。
+    // ただし幅の割引はゾーン内に限る。
+    // ゾーンは幅を検証済みの区間なので割り引いても壁に寄らないが、
+    // ゾーン外で割り引くと 3.0m 幅の場所へ入り込んで壁に当たる
+    // (実測: 割引をゾーン外にも掛けたら d1 の壁接触が 3 -> 16 に増えた)。
+    const bool inside = (curve_sign_ != 0.0) && (side_sign_ * curve_sign_ > 0.0);
+    const bool inside_ok = inside && c.in_zone;
+    // --- 最下位のときは積極的に抜く ---
+    //
+    // 順位が下なら、抜かない限り結果は変わらない。多少の失敗より
+    // 「仕掛けないまま終わる」ほうが損。
+    // 実測(21:59版で2位だったレース): 3位スタートから 4倍遅い相手の
+    // 後ろで60秒を潰し、その間に勝者は 213m 先へ行った。
+    // 一方で1位・2位のときは、無理をして接触すると順位を落とすので
+    // 従来どおりの慎重さを保つ。
+    const bool aggressive = (rank_ >= 3);
+    const double t_limit = pass_time_limit_ * (inside ? inside_time_gain_ : 1.0)
+                           * (aggressive ? aggressive_time_gain_ : 1.0);
+    // 幅の割引は掛け合わせない。
+    // 両方が効くと 3.2 * 0.85 * 0.85 = 2.31m となり、カート2台ぶんの
+    // 物理的な下限(1.45 x 2 = 約2.9m)を割って必ず接触する。
+    // 効く条件のうち最も緩い1つだけを使う。
+    double w_gain = 1.0;
+    if (inside_ok) { w_gain = std::min(w_gain, inside_width_gain_); }
+    if (aggressive) { w_gain = std::min(w_gain, aggressive_width_gain_); }
+    const double w_need = min_pass_width_ * w_gain;
+    const bool width_ok = c.avail_width >= w_need;
+    // --- 実測データから「明らかに遅い相手」を判定する ---
+    // 溜めた走行データ(区間ごとの平均速度・ラップタイム)で相手の実力を見る。
+    // 瞬間の速度差(closing)ではなく実績で判定するのが重要:
+    // 自車が1位でハンデ(25km/h)を受けると、遅い MPC に対する closing が
+    // 12km/h を割って「同速」と誤分類され、周回67秒の相手を最後まで
+    // 抜けなくなる(実測: P1 のまま MPC の後ろで周回差を付けられた)。
+    bool clearly_slower = false;
+    {
+      const double om = o.meanSpeed();
+      const double mm = (my_speed_cnt_ > 20) ? my_speed_sum_ / my_speed_cnt_ : -1.0;
+      if (om > 0.0 && mm > 0.0 && om < mm * slow_rival_ratio_) {
+        clearly_slower = true;
+      }
+      // その区間での実績も見る。全体が遅くても、その場所だけ速いことがある。
+      if (clearly_slower && !line_x_.empty()) {
+        const int sec = static_cast<int>(oi * OtherState::kSections / n);
+        const double os = o.sectionSpeed(sec);
+        if (os > 0.0 && mm > 0.0 && os > mm * slow_rival_ratio_) {
+          clearly_slower = false;
+        }
+      }
+    }
+    // --- 同速の相手を攻めない ---
+    // 実測(3レース): 同じコードの僚車(自分と同じ速度)への試行は
+    // 抜き切るのに 46〜90m 必要で、直線の長さでは足りない。
+    // 対して遅い MPC は 42〜46m で足りる。
+    // 止まっている・壊れている相手(slow_leader)と、実績で明らかに遅い相手
+    // (clearly_slower)はこの足切りの対象外。
+    // 先頭車は 25km/h のハンデを受けており、2位以下(36km/h)から見ると
+    // 最高速で構造的に上回れる。瞬間の closing が小さくても抜きにいってよい
+    // (実測: 2位のとき先頭を「同速」と誤却下 60件/レース、抜けずに終了)。
+    const bool capped_leader = (rank_ >= 2) && !cur_leader_.empty() &&
+                               (name == cur_leader_);
+    const bool closing_ok = (closing_max * 3.6 >= min_closing_kmh_)
+                            && (pass_dist(t_accel) <= pass_dist_max_);
+    // --- 自分が1位でハンデを受けている間の足切り ---
+    //
+    // 1位の速度上限は 25km/h。前にいるのが周回遅れの 17〜24km/h の車でも
+    // closing は 1〜8km/h にしかならず、min_closing_kmh(12km/h)には
+    // 構造的に届かない。つまり「1位の間は誰も抜けない」設定になっていた。
+    // 実測(3レース・却下471件): 却下の 365件(77%)が rank=1。
+    // 直線手前 idx215-241 では却下53件のうち48件(91%)が
+    // 「zone=1・幅OK・側OK で、同速(closing不足)だけが理由」だった。
+    // ユーザー報告「220-240 でインから行けるのに相手の後ろを走っている」の正体。
+    //
+    // 速度差そのものが小さいのは事実なので、時間と距離では従来どおり縛る
+    // (pass_time <= t_limit / pass_dist <= usable は self_ok に残っている)。
+    // ここで見るのは「そもそも相手より速いか」と「抜き切る距離が現実的か」の2つ。
+    const bool capped_self = capped_self_enable_ && (rank_ == 1) &&
+                             (closing_max * 3.6 >= capped_self_closing_) &&
+                             (pass_dist(t_accel) <= capped_self_dist_);
+    const bool self_ok = width_ok
+                         && pass_time(t_accel) <= t_limit
+                         && pass_dist(t_accel) <= usable
+                         && (c.slow_leader || clearly_slower || capped_leader ||
+                             capped_self || closing_ok);
+
+    // ブーストで抜けるようになるか。
+    // 「自力では抜けない(self_ok が偽)」ときだけ見ると、pass_time_limit を
+    // 緩めた結果ほとんどが self_ok になり、ブーストが一切使われなくなった。
+    // 自力で抜ける場合でも、ゾーンの残りが足りずに距離条件で落ちるなら
+    // ブーストで間に合わせる価値がある。
+    bool boost_would_help = false;
+    if (width_ok && !c.slow_leader && boost_remaining_ > 0 &&
+        headroom > boost_min_headroom_) {
+      const bool ok_boost = pass_time(t_accel_boosted) <= pass_time_limit_
+                            && pass_dist(t_accel_boosted) <= usable;
+      // ブーストで初めて成立する場合のみ「役に立つ」と判断する。
+      // 自力でも成立するなら温存する(ユーザー方針: 使わなくても抜けるなら使わない)。
+      const double t_self = pass_time(t_accel);
+      const double t_bst = pass_time(t_accel_boosted);
+      boost_gain_time_ = ok_boost ? (t_self - t_bst) : 0.0;
+      // 「自力では抜けない場合だけ」に限ると、ぎりぎり抜ける計算に
+      // なった場面でブーストを温存し、直線の終わり(コーナー入口)で
+      // 並んだまま突っ込んで失敗していた。
+      // 自力で抜ける場合でも、ブーストで明確に短時間で抜けるなら使う。
+      // 並走時間が短いほど接触の危険も小さい。
+      boost_would_help = ok_boost &&
+                         (!self_ok || boost_gain_time_ > boost_gain_min_);
+    }
+
+    // 抜けると判断できたときだけ横に出る。
+    // 相手が極端に遅い(止まっている)場合は幅さえあれば抜きにいく。
+    const bool feasible = side_fits_ &&
+                         ((c.slow_leader && width_ok) || self_ok || boost_would_help);
+    // 速度差が十分大きければゾーン外でも抜く。
+    // ゾーンは「並走しても安全な区間」の目安だが、相手が明らかに遅ければ
+    // 並走時間そのものが短いのでゾーンで縛る必要がない。
+    // これが無いと周回遅れを直線で抜けない(実測: 試行47回 成功0回)。
+    // (clearly_slower は closing の足切り免除にも使うため、self_ok の前で算出済み)
+    // 明らかに遅い相手には、直線の手前(加速区間)からでも仕掛けてよい。
+    // ブーストを使わずに抜けるので、終盤まで温存する必要がない。
+    bool in_accel_zone = false;
+    for (const auto & z : boost_zones_) {
+      const bool inside = (z.first <= z.second)
+                            ? (ei >= z.first && ei <= z.second)
+                            : (ei >= z.first || ei <= z.second);
+      if (inside) { in_accel_zone = true; break; }
+    }
+    // --- 追い越し禁止区間 ---
+    // 実測: idx78-92 は幅 2.3m しかなく、必要幅 2.7m を満たせない。
+    // 「側の余地あり」と「幅あり」が同時に成立しないので、ここで仕掛けても
+    // latch の時間と側の変更枠を食い潰すだけで終わる。
+    bool in_no_pass = false;
+    for (const auto & z : no_pass_zones_) {
+      const bool inside = (z.first <= z.second)
+                            ? (ei >= z.first && ei <= z.second)
+                            : (ei >= z.first || ei <= z.second);
+      if (inside) { in_no_pass = true; break; }
+    }
+    // 最下位なら、追い越し可能ゾーンの外でも仕掛けてよい
+    const bool zone_ok = c.in_zone || c.slow_leader || boost_would_help
+                         || (aggressive && in_accel_zone)
+                         || (clearly_slower && in_accel_zone)
+                         || (closing_max * 3.6 >= big_gap_closing_);
+    // 一度始めた試行は、条件が多少揺らいでも続行する。
+    // 揺らぐたびに追従制御が車間を詰め直すので、車間 4.1m のまま
+    // 12 秒粘って打切りになる、という現象が起きていた。
+    // 継続は「幅がある間だけ」。幅が無くなったら降りる。
+    // 幅を見ずに継続すると、狭い区間へ横オフセットを保ったまま進入して壁に当たる。
+    // ただし開始時と同じ厳しさで見ると、幅がわずかに揺らいだだけで
+    // 並走の途中で降りてしまう。並走中に急に戻るほうが危ないので、
+    // 継続中だけ latch_width_gain 分だけ緩める
+    // (実測: 試行15回すべて途中で降りて成功0回)。
+    const bool latch_width_ok = c.avail_width >= min_pass_width_ * latch_width_gain_;
+    const bool latched = attempt_active_ && latch_width_ok &&
+                         (now.seconds() - attempt_start_) < attempt_timeout_;
+    // 禁止区間では新しく仕掛けない。ただし既に並走している(latched)場合は
+    // そのまま続けさせる。狭い所で急にラインへ戻るほうが危ないため。
+    // 直前に「進展なし」で降りた相手には、しばらく仕掛け直さない。
+    // これが無いと降りた次の周期で条件が揃い直し、4秒ごとに横へ出ては
+    // 戻るだけになる(打切を早めた意味が無くなる)。
+    // ただし相手が明らかに遅くなったなら話が別なので、その場合は解除する。
+    const bool stall_block = !c.slow_leader && !clearly_slower &&
+                             name == attempt_stall_name_ &&
+                             now.seconds() < attempt_stall_until_;
+    const bool allow = (zone_ok && feasible && !in_no_pass && !stall_block) || latched;
+    // 追い越しが途中で降りる原因を追うため、判定の中身を残しておく。
+    dbg_allow_ = allow; dbg_width_ = c.avail_width; dbg_zone_ = c.in_zone;
+    dbg_latched_ = latched; dbg_feasible_ = feasible; dbg_zone_ok_ = zone_ok;
+
+    // 却下された理由を残す(パラメータ調整のため)
+    if (!allow && (now - last_reject_log_).seconds() > 2.0) {
+      last_reject_log_ = now;
+      // 側が理由の却下を直接読めるようにする。
+      // 実測(3レース)では却下の 83% が「幅・時間・距離は足りていて
+      // side_fits_ だけが偽」だったが、このログに側が出ていなかったため
+      // 幅や時間の不足を疑って対策を外し続けていた。
+      // 却下の「決め手」を1語で出す。従来は zone/側/幅/同速 の各フラグしか
+      // 出しておらず、capped_self や boost_would_help で救われたかどうかが
+      // 読めなかった。実測(5レース471件)を集計したとき、
+      // 「同速=1」が立っていても実際には別の条件で落ちている行が混ざり、
+      // 原因の切り分けを誤りかけた。
+      const char * why =
+          in_no_pass                     ? "禁止区間"
+        : stall_block                    ? "打切直後"
+        : !side_fits_                    ? "側の余地なし"
+        : !width_ok                      ? "幅不足"
+        : (pass_time(t_accel) > t_limit) ? "時間超過"
+        : (pass_dist(t_accel) > usable)  ? "ゾーン残距離不足"
+        : !(c.slow_leader || clearly_slower || capped_leader ||
+            capped_self || closing_ok)   ? "速度差不足"
+        : !zone_ok                       ? "ゾーン外"
+        :                                  "その他";
+      RCLCPP_INFO(get_logger(),
+        "追越却下 決め手=%s self_ok=%d capped自=%d capped先=%d 遅相手=%d ブ助=%d "
+        "gap=%.1f zone=%d %s 幅=%.1f(要%.1f) 残距離=%.0f "
+        "v_reach=%.1f 相手=%.1f closing=%.1f 所要=%.1fs 距離=%.0f rank=%d "
+        "側OK=%d 側=%s 相手横=%.2f 余地=[%.2f,%.2f] idx=%zu 同速=%d 禁止区=%d "
+        "枠=%d/%d 不成立=%.1fs 学習連続=[%.1f,%.1f]m/%d点",
+        why, self_ok ? 1 : 0, capped_self ? 1 : 0, capped_leader ? 1 : 0,
+        clearly_slower ? 1 : 0, boost_would_help ? 1 : 0,
+        gap, c.in_zone ? 1 : 0, inside ? "イン" : "アウト", c.avail_width, w_need, usable,
+        v_reach * 3.6, ospeed_for_gate * 3.6, closing_max * 3.6,
+        pass_time(t_accel), pass_dist(t_accel), rank_,
+        side_fits_ ? 1 : 0, (side_sign_ > 0.0) ? "左" : "右",
+        olat, room_lo_, room_hi_, ei,
+        (!c.slow_leader && !closing_ok) ? 1 : 0, in_no_pass ? 1 : 0,
+        side_flip_cnt_, side_flip_max_,
+        (side_unfit_since_ >= 0.0) ? (now.seconds() - side_unfit_since_) : -1.0,
+        dbg_map_l_, dbg_map_r_, dbg_map_n_);
+    }
+    c.target_offset =
+      allow ? std::clamp(olat + side_sign_ * pass_gap_, room_lo_, room_hi_) : 0.0;
+    // 追い越しが成立しているかは「走行ラインからどれだけ離れたか」ではなく
+    // 「相手からどれだけ横に離れたか」で見る。
+    // 相手がラインから外れている場合、正しい追い越し位置が
+    // ライン上(オフセット約0)になることがあり、
+    // |target_offset| で判定すると横に出た瞬間に失敗と数えてしまう
+    // (実測: 相手が +1.55m にいて目標 -0.15m、間隔は 1.7m 取れているのに失敗扱い)。
+    pass_sep_ = allow ? (c.target_offset - olat) : 0.0;
+    can_pass_now_ = allow;
+
+    // ブーストの発火判定。
+    // 使わなくても抜けるなら使わない。1個で足りなければ2個目を使うが、
+    // 最初から2個使いにいくことはしない(1個目の効果を見てから)。
+    // 真後ろにいる状態(オフセット0)でブーストを撃っても、下の追従制御が
+    // 前車速度で頭打ちにするので完全に無駄になる(実測で2個とも空撃ちした)。
+    // 実際に横へ出て並びかけているときだけ使う。
+    // 横へ出てから撃つと、直線を半分使ってから加速し始めることになり、
+    // 直線の終わり(コーナー入口)で並んだまま突っ込んで失敗する。
+    // 仕掛ける直前(まだ真後ろ)でも、これから直線に入るなら先に撃つ。
+    // --- 助走ブースト: 抜くために「手前から」加速しておく
+    //
+    // ユーザー方針: 「抜くために少し手前からどんどん加速していき、
+    // 相手が 25km/h しか出せないところを追い抜く」。
+    //
+    // 【なぜ手前から撃つのか】
+    // ブーストは **10秒持続**する。並んでから撃つ従来の条件
+    // (moved_out = 横に出てから / commit_boost_time = 並走2.5秒)では、
+    // 加速し始めた時点で既に相手の真横におり、10秒のうち有効に使えるのは
+    // ごく一部。実戦では並走の継続が中央値 0.9秒しかなく、
+    // 3個中1個を残したままレースが終わっていた。
+    // 追い越しゾーンが射程に入った時点で撃てば、ゾーンに入るときには
+    // すでに速度が乗っている。
+    //
+    // 【なぜ「相手が25km/hしか出せないところ」なのか】
+    // 1位は driveFadeSpeed が 25km/h に制限される(handicap)。
+    // 2位以下は 36km/h。**先頭を追うときだけ、構造的に 11km/h 速い。**
+    // 同じ速度の相手はコーナー速度でも差が出ないので、
+    // この速度上限の差が同格の相手を抜く唯一の確実な手段になる。
+    // 実測: 自コード同士(完全に同速)では 57回試行して成功 0回。
+    // 横間隔は 91% が車幅以上に達しているのに前へ出られない。
+    // 並走できても速度が同じなら永久に抜けないという当たり前の帰結。
+    if (boost_runup_enable_ && !want_boost_ && boost_remaining_ > 0 &&
+        !is_boosting_ && start_merge_done_ && my_speed > boost_min_speed_ &&
+        headroom > boost_min_headroom_ && c.in_zone &&
+        gap >= boost_runup_gap_min_ && gap < boost_runup_gap_ &&
+        (capped_leader || clearly_slower || c.slow_leader))
+    {
+      const double since = (now - last_boost_time_).seconds();
+      if (boost_used_ == 0 || since > boost_retry_sec_) {
+        want_boost_ = true;
+        RCLCPP_INFO(get_logger(),
+          "ブースト使用(助走) target=%s 車間=%.1fm 相手=%.1fkm/h "
+          "自車上限=%.1fkm/h 余地=%.1f 先頭ハンデ=%d 遅相手=%d "
+          "%d周目 残り%d rank=%d",
+          c.blocker.c_str(), gap, ospeed_for_gate * 3.6, v_reach * 3.6,
+          headroom, capped_leader ? 1 : 0, clearly_slower ? 1 : 0,
+          lap_ + 1, boost_remaining_, rank_);
+      }
+    }
+
+    const bool moved_out = std::abs(offset_) > pass_gap_ * 0.5 || straight_ahead_;
+    // スタート直後は全車が数m以内に密集しており、しかも追い越しゾーンが
+    // メインストレート(スタート/フィニッシュ直線)なので in_zone が真になる。
+    // 全員が加速中で誰も抜けないのに「抜ける」と誤判定してブーストを2個とも
+    // 撃ってしまっていた(実測: 開始直後に 10.1 秒間隔で2個消費)。
+    //  (1) スタートの合流が終わるまで撃たない
+    //  (2) 十分な速度が出ていないと撃たない(低速ではブーストの効果も薄い)
+    const bool start_phase_over = start_merge_done_;
+    const bool fast_enough = my_speed > boost_min_speed_;
+    // 序盤に使うと、抜いた後にまた抜き返されてブーストが無駄になる。
+    // 終盤まで温存して、そこで確実に仕掛ける。
+    // ただし最終ラップまで待つと失敗したときに取り返せないので、
+    // boost_hold_laps で「何周を終えたら使ってよいか」を決める。
+    // 終盤まで温存する制限は無効化した(boost_hold_laps=0)。
+    // 同ランク帯との勝負では、序盤に詰まって失う時間のほうが
+    // 「抜き返される」危険より大きい。実測でも 21:59版のレースで
+    // 序盤60秒を遅い車の後ろで潰し、その間に勝者は213m先へ行った。
+    // 温存が必要になったら boost_hold_laps を戻す。
+    const bool late_enough = lap_ >= boost_hold_laps_;
+    if (allow && moved_out && start_phase_over && fast_enough && late_enough &&
+        boost_remaining_ > 0 && !is_boosting_) {
+      // 加速余地が無い場面(既に目標速度に達している)では撃たない。
+      // 1位のときは 25 km/h で頭打ちなので直線ではまず余地が無い。
+      const bool has_headroom = headroom > boost_min_headroom_;
+      const bool need_boost = has_headroom && boost_would_help;
+      if (need_boost) {
+        const double since = (now - last_boost_time_).seconds();
+        // 1個目を使った直後は効果を見る。効かなければ 2個目を許す
+        if (boost_used_ == 0 || since > boost_retry_sec_) {
+          want_boost_ = true;
+          // この経路で撃てたことをログに残す。自由発射のログしか無かったため、
+          // 「追い越しのために撃った」のか「余ったから撃った」のかを
+          // 後から区別できなかった。
+          RCLCPP_INFO(get_logger(),
+            "ブースト使用(追い越し) target=%s 車間=%.1fm 短縮=%.1fs 自力=%d "
+            "余地=%.1f %d周目 残り%d rank=%d",
+            c.blocker.c_str(), gap, boost_gain_time_, self_ok ? 1 : 0,
+            headroom, lap_ + 1, boost_remaining_, rank_);
+        }
+      }
+    }
+
+    // 前車の速度（進行方向成分）
+    double tx, ty;
+    {
+      const auto & a = in.points[(oi + n - 1) % n].pose.position;
+      const auto & b = in.points[(oi + 1) % n].pose.position;
+      tx = b.x - a.x;
+      ty = b.y - a.y;
+      const double len = std::hypot(tx, ty);
+      if (len > 1e-9) {
+        tx /= len;
+        ty /= len;
+      }
+    }
+    double ospeed = o.vx * tx + o.vy * ty;
+
+    // --- 相手がこれから落とす速度を先読みする ---
+    //
+    // カーブでは相手はほぼ確実に減速する。それに気づかず今の速度だけを見て
+    // 追従すると、後ろから加速していって追突する(実測で頻発)。
+    // 相手の少し先の速度プロファイルを見て、そこまで落ちる前提で合わせる。
+    //
+    // ただし「遅く見積もる」方向にしか使わない。速く見積もると
+    // 追い越しの判定が甘くなって危険なため。
+    // また追い越し中(passing_now)には効かせない。効かせると
+    // 相手の減速に合わせて自分も落とし、並んだまま抜けなくなる。
+    double ospeed_pred = ospeed;
+    if (predict_enable_) {
+      double look = 0.0;
+      for (size_t k = 0; k < n && look < predict_ahead_; ++k) {
+        const size_t a = (oi + k) % n;
+        const size_t b = (oi + k + 1) % n;
+        look += std::hypot(in.points[b].pose.position.x - in.points[a].pose.position.x,
+                           in.points[b].pose.position.y - in.points[a].pose.position.y);
+        ospeed_pred = std::min<double>(ospeed_pred,
+                                       in.points[a].longitudinal_velocity_mps);
+      }
+      // 相手が今その速度を出せていないなら、それ以上は落ちないとみなす
+      ospeed_pred = std::max(ospeed_pred, ospeed * predict_floor_);
+    }
+    // 車間に比例した追従制御。前車速度をそのまま上限にすると、
+    // スタート直後のように全車が密集して止まっている場面で
+    // 全員が 0 km/h に張り付いて膠着する。
+    // 目標: 車間 safe_gap を保ちつつ、詰まっている分だけ減速する。
+    // 車間は速度に応じて変える。
+    // 低速でも一定の余裕を残しつつ、高速では前車が急停止しても止まれる距離を取る。
+    // 制動距離 = v^2 / (2*|a_min|) を目安にし、上限で頭打ちにする。
+    // 上限を設けるのは、開けすぎると追い越し機会を失い順位を落とすため。
+    const double v_now = std::max(my_speed_for_gap_, 0.0);
+    const double brake_dist = (v_now * v_now) / (2.0 * std::max(std::abs(a_min_), 0.5));
+    double dyn_safe = std::clamp(safe_gap_ + brake_dist * gap_brake_ratio_,
+                                 safe_gap_min_, safe_gap_max_);
+    // 並走できない区間は少し広めに(詰めても抜けないうえ追突する)
+    if (!can_pass_now_) {
+      dyn_safe = std::min(dyn_safe * 1.3, safe_gap_max_);
+    }
+    // --- 仕掛けどころに合わせて車間を詰める ---
+    //
+    // 追突(Crash)は 10 秒間 5km/h に固定される。通常 35km/h で走ることを
+    // 考えると 80m 以上の損失で、追い越し1回ぶんより遥かに重い。
+    // だから普段は widely 空けておきたい。
+    // 一方で、仕掛ける瞬間に車間が空いていては抜けない。
+    //
+    // 幸い最高速度は順位で決まっており(1位 25km/h / 2位以下 36km/h)、
+    // 自分が2位なら前の1位より速い。この差で「いつでも詰められる」ので、
+    // **仕掛けどころに着いた瞬間に車間が縮まっている**ように逆算する。
+    //
+    //   仕掛けどころまでの距離 d、詰める速度差 closing、自車速度 v のとき
+    //   到達までの時間 t = d / v、その間に詰められる量 = closing * t
+    //   よって今保ってよい車間 = 目標車間 + closing * t
+    double eff_safe = dyn_safe;
+    // 助走モード。空けた車間を「目標車間の縮小を追いかける」だけでは
+    // 実際の加速が始まらない(実測: ゾーン入口で車間 9m 残り、所要9秒級の
+    // 失敗が多発)。車間が目標より大きい間は追従キャップ自体を外し、
+    // 速度プロファイルどおり加速して詰める。TTC・緊急減速は別段で効く。
+    bool charge_now = false;
+    if (approach_enable_ && !can_pass_now_) {
+      // 次に仕掛けられる場所までの距離を測る
+      double d_zone = -1.0;
+      {
+        double acc = 0.0;
+        for (size_t k = 1; k < n; ++k) {
+          const size_t a = (ei + k - 1) % n, b = (ei + k) % n;
+          acc += std::hypot(in.points[b].pose.position.x - in.points[a].pose.position.x,
+                            in.points[b].pose.position.y - in.points[a].pose.position.y);
+          if (acc > approach_range_) { break; }
+          bool zone_here = (corridor_.pass_ok.size() == n && corridor_.pass_ok[b]);
+          if (!zone_here) {
+            for (const auto & z : boost_zones_) {
+              const bool inside = (z.first <= z.second)
+                                    ? (b >= z.first && b <= z.second)
+                                    : (b >= z.first || b <= z.second);
+              if (inside) { zone_here = true; break; }
+            }
+          }
+          if (zone_here) { d_zone = acc; break; }
+        }
+      }
+      if (d_zone > 0.0) {
+        const double rank_cap = ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
+        // 詰める速度差は相手の「その先の区間での実績」で見積もる。
+        // 相手の瞬間速度(コーナーで遅い)を使うと closing が過大になり、
+        // want が上限まで張り付いて空けすぎる(実測: 入口で 9m 残り)。
+        const int zsec = static_cast<int>(oi * OtherState::kSections / n);
+        const double o_zone_v = o.sectionSpeed(zsec);
+        const double o_ref = (o_zone_v > 0.0) ? std::max(ospeed, o_zone_v) : ospeed;
+        const double closing = std::max(rank_cap - o_ref, 0.0);
+        const double t_zone = d_zone / std::max(v_now, 1.0);
+        // 仕掛けどころで pass_gap になるように、今は余分に空けておく
+        const double want = pass_gap_ + closing * t_zone;
+        eff_safe = std::clamp(std::max(eff_safe, want), safe_gap_min_, approach_gap_max_);
+        // 車間が目標より大きければ助走(全開で詰める)。
+        charge_now = gap > eff_safe + 0.3;
+        // 入口が目前なら、逆算値ではなく「抜くのに要る車間」まで詰めきる。
+        // want は入口到達時に pass_gap になる想定だが、追従則の遅れで
+        // 実測では入口に 5-6m 残ったまま入っていた。ここだけ目標を
+        // pass_gap*k に下げ、追従キャップを外す時間を伸ばす。
+        // 追突(Crash)は前方接触のみ罰なので TTC・緊急減速(avoid_speed_cap)
+        // が最後の砦になる。これらはチャージ中も別段で効く。
+        if (d_zone < charge_close_dist_) {
+          charge_now = gap > pass_gap_ * charge_close_gap_k_;
+        }
+        // --- 助走は「止まれる距離」を割ったらやめる
+        //
+        // 【直したバグ(ユーザー報告「そもそもぶつかった原因は?」)】
+        // 打ち切り条件が **固定の車間**(pass_gap*1.2 = 2.28m)だけで、
+        // **接近速度を見ていなかった**。
+        // 実測(20260828-215915-s0 の d1):
+        //   gap=1.6m 相手=12.9km/h closing=23.1km/h v_reach=36.0km/h
+        // 接近 6.4m/s から a_min=2.5m/s^2 で止まるには **8.2m** 要る。
+        // 2.28m から減速を始めても間に合わず必ず当たる。
+        // 実際 `前方 d3 まで 1.6m -> 0.0m` と詰まって接触した。
+        //
+        // **相手が遅いほど接近速度が大きくなり助走が危険になる**という
+        // 逆説的な関係になっていた。制動距離で縛る。
+        const double closing_now = std::max(my_speed_for_gap_ - ospeed, 0.0);
+        const double brake_need =
+          closing_now * closing_now / (2.0 * std::max(std::abs(a_min_), 0.5));
+        if (gap < brake_need + charge_brake_margin_) {
+          charge_now = false;
+        }
+      }
+    }
+    const double eff_follow = std::min(dyn_safe * 1.8, safe_gap_max_ * 1.8);
+    // 横へ出て抜きにいっている最中は速度を抑えない。
+    // 抑えると前車と同じ速度に張り付いて永久に抜けない(ブーストも無駄になる)。
+    // 相手が遅い(止まりかけている)なら「追い越し中だから制限しない」を
+    // 適用しない。実測(3レース中2レース): 減速中の相手に対し passing_now が
+    // 立ち、車間 2.3〜4.0m で「上限=-1.0(制限なし)」のまま接触した。
+    bool passing_now = allow && std::abs(offset_) > pass_gap_ * 0.5;
+    if (ospeed_for_gate < slow_leader_speed_) { passing_now = false; }
+    // 追い越し中でなければ、相手がこれから落とす速度に合わせる。
+    // 追い越し中に効かせると、相手の減速に自分も付き合って並んだまま
+    // 抜けなくなるので、そのときは今の速度のまま扱う。
+    if (!passing_now) { ospeed = std::min(ospeed, ospeed_pred); }
+    // 追い越し中も追従を完全には切らない。切ると相手が止まっても
+    // 減速指令が一切出ないまま突っ込む。並走中は詰めてよいので、
+    // 目標車間を 0.6 倍に縮めたうえで同じ制御を掛ける。
+    // TTC・緊急の減速(avoid_speed_cap)はこれとは別に後段でかかる。
+    const double follow_safe = passing_now ? eff_safe * 0.6 : eff_safe;
+
+    // --- 横に出切ったら追従キャップを外し、加速して抜き切る ---
+    //
+    // 【原因】追従則は相手を最後まで「前の車」として扱う。横に並んでも
+    // 上限は ospeed + follow_kp*(gap - follow_safe) のままで、
+    // follow_safe = eff_safe*0.6 = 3.0m なので、車間が 3m を割った瞬間に
+    // 上限が相手より遅くなる。釣り合うのは「車間 3m・相手と同速」の点。
+    // つまり相手の斜め後ろ 3m に貼り付き、相手とぴったり同じ速度で
+    // 走り続ける。ユーザー報告「相手の横まで来たのにゆっくり並走している」
+    // はこの釣り合い点そのもので、自分から抜け出せる経路が無い。
+    // 実測(3レース): 試行228回のうち90回が 16.0s ちょうどの時間切れ。
+    //
+    // 【対策】横間隔が min_lat_sep 以上あるなら、前から当てる経路が無い。
+    // Crash(10秒・5km/h固定)は前方接触にしか付かないので、追従で
+    // 速度を抑える理由がそもそも無い。上限を外して速度プロファイルどおり
+    // 加速し、抜き切る。
+    //
+    // 外す条件は3つ。
+    //   (1) 追い越しが許可されている(allow / latch)
+    //   (2) 実測の横間隔が commit_sep(=min_lat_sep) 以上ある
+    //       ※ 目標値 pass_sep_ ではなく、いま実際に離れている量で見る
+    //   (3) 前後の車間が commit_gap 以内(本当に並びかけている)
+    // 相手が止まりかけているとき(slow_leader 相当)は対象外にする。
+    // 減速中の相手に上限なしで突っ込む過去の失敗を繰り返さないため。
+    const double lat_sep_now = my_lat_for_target_ - olat;
+    bool commit_now = false;
+    if (commit_pass_ && allow && ospeed_for_gate > slow_leader_speed_) {
+      // 解除側でも**車幅を下回らせない**。重なった状態で加速を続けないため。
+      const double need_sep = commit_now_
+        ? std::max(commit_sep_ * commit_release_, kCarWidth)
+        : commit_sep_;
+      const double need_gap = commit_now_ ? commit_gap_ * 1.5 : commit_gap_;
+      commit_now = (std::abs(lat_sep_now) >= need_sep) && (gap < need_gap);
+    }
+    if (commit_now && !commit_now_) {
+      commit_since_ = now.seconds();
+      RCLCPP_INFO(get_logger(),
+                  "並走から抜き切りへ target=%s 車間=%.1fm 横間隔=%.2fm "
+                  "相手=%.1fkm/h 上限解除 rank=%d idx=%zu",
+                  c.blocker.c_str(), gap, lat_sep_now, ospeed * 3.6, rank_, ei);
+    }
+    if (!commit_now) { commit_since_ = -1.0; }
+    commit_now_ = commit_now;
+
+    // --- 並走が続いているのにに抜き切れないならブーストを使う
+    //
+    // 実測(2レース・自コード4台): 打切36件のうち **33件がブースト0個**。
+    // しかも1台2個持ちで4台=8個あるうち、レース中に使われたのは **4個だけ**。
+    // 横間隔の中央値は 1.96m あり(要1.15m)、**ちゃんと横には出ている**。
+    // つまり「並んだのに抜けないまま16秒使い、ブーストは温存したまま
+    // レースが終わる」という最悪の形になっていた。
+    // ブーストは持ち越せないので、使わずに終わるのは丸損。
+    //
+    // 従来の発動条件 boost_would_help は「自力で抜けないと判断できるとき」で、
+    // 仕掛ける前の見積りに基づく。見積りで「抜ける」と出ていても実際に
+    // 抜けないのがここで見えているので、**実際に並走が続いた事実**を根拠に撃つ。
+    if (commit_now && commit_boost_time_ > 0.0 && commit_since_ > 0.0 &&
+        (now.seconds() - commit_since_) >= commit_boost_time_ &&
+        boost_remaining_ > 0 && !is_boosting_ && !want_boost_)
+    {
+      const double since_last = (now - last_boost_time_).seconds();
+      if (boost_used_ == 0 || since_last > boost_retry_sec_) {
+        want_boost_ = true;
+        RCLCPP_INFO(get_logger(),
+                    "ブースト要求(並走%.1fs 抜き切れず) target=%s 横間隔=%.2fm "
+                    "車間=%.1fm 相手=%.1fkm/h 残り%d rank=%d",
+                    now.seconds() - commit_since_, c.blocker.c_str(),
+                    lat_sep_now, gap, ospeed * 3.6, boost_remaining_, rank_);
+      }
+    }
+    // 試行中に実際どこまで横に離れられたかを覚える。
+    // 打切の原因を「並走したが抜けなかった」と
+    // 「そもそも横に出られなかった」に分けるために要る。
+    if (attempt_active_ && std::abs(lat_sep_now) > attempt_max_sep_) {
+      attempt_max_sep_ = std::abs(lat_sep_now);
+    }
+    if (gap < eff_follow && !charge_now && !commit_now) {
+      const double v_target = ospeed + follow_kp_ * (gap - follow_safe);
+      // 完全に止まらないよう下限を設ける。本当に近い(接触寸前)ときは 0 まで許すが、
+      // それは相手が動いている場合に限る。
+      // 実測(3レース中2レース): 止まっている車の後ろで
+      // 「車間 < follow_safe*0.5 -> 下限 0」となり、上の停止車両ブロックが
+      // 横へよける目標を出しても速度が 0 のままで 24〜28 秒膠着した。
+      // 相手が止まっているなら止まっても解決しないので、下限を残す。
+      // 下限速度の扱い。
+      //
+      // 【元の実装】相手が止まっているときは下限を min_follow_speed(2.2m/s)に
+      // 残していた。理由は「止まっている車の後ろで下限0にすると
+      // 24〜28秒膠着した。相手が止まっているなら止まっても解決しない」。
+      //
+      // 【それが起こしていた問題(ユーザー報告)】
+      // **スタート直後は全車が停止している**ので必ずこの分岐に入り、
+      // 車間 1.2m で前車が完全停止していても 2.2m/s (8km/h) を出せと指令する。
+      // その結果、スタートした瞬間に前の車へ追突していた。
+      // 実測ログ: `停止車両 2台 先頭 d2 まで 1.2m 空き幅 0.62m -> 通過
+      // (上限 10.8km/h)` のまま前進し、`膠着 ... 1.2m` に至る。
+      //
+      // 【直し方】膠着対策の下限は「詰まった状態がしばらく続いてから」
+      // 効かせれば足りる。ぶつかる距離にいる間は止まってよい。
+      // 近すぎる(stop_hold_gap 未満)ときは、詰まりが
+      // stop_hold_sec 続くまで下限を 0 にする。
+      double floor = min_follow_speed_;
+      if (gap < follow_safe * 0.5 && ospeed > stopped_speed_) {
+        floor = 0.0;                       // 相手は動いている。従来どおり
+      } else if (ospeed <= stopped_speed_ && wouldRearEnd(gap, ospeed)) {
+        // 相手が止まっていて、ぶつかる距離にいる
+        if (stop_hold_since_ < 0.0) { stop_hold_since_ = now.seconds(); }
+        if ((now.seconds() - stop_hold_since_) < stop_hold_sec_) {
+          floor = 0.0;                     // まだ待つ。突っ込まない
+        }
+      } else {
+        stop_hold_since_ = -1.0;
+      }
+      // 後ろから詰められているときは、前車の速度を下回るまで落とさない。
+      // 落とすと車間が開いて仕掛けられないまま、後ろの車に抜かれる。
+      // 接触寸前(gap < follow_safe*0.5)では従来どおり 0 まで落とす。
+      if (c.pressed_from_behind && gap >= follow_safe * 0.5) {
+        floor = std::max(floor, std::max(ospeed, 0.0));
+      }
+      c.speed_cap = std::max(floor, v_target);
+    }
+  }
+
+
   // 溜めた走行データの要約を定期的に出す。
   void logDrivingStats(const Frame & f)
   {
@@ -1435,884 +2320,9 @@ private:
   // 追従の車間制御・追い越しの可否判定・側の選択・助走ブーストを含む。
   void planOvertake(const Frame & f, PlanCtx & c)
   {
-    const Trajectory & in = f.in;
-    const std::vector<double> & s = f.s;
-    const size_t n = f.n;
-    const double total = f.total;
-    const double ex = f.ex;
-    const double ey = f.ey;
-    const size_t ei = f.ei;
-    const rclcpp::Time now = f.now;
-
     if (enable_) {
       for (const auto & kv : others_) {
-        const OtherState & o = kv.second;
-        if (!o.valid) {
-          continue;
-        }
-        if ((now - o.stamp).seconds() > v2x_timeout_) {
-          continue;   // 情報が古い。信用しない
-        }
-        const size_t oi = nearest(in, o.x, o.y);
-        double gap = s[oi] - s[ei];
-        if (gap < 0) {
-          gap += total;      // 周回をまたぐ
-        }
-        // 進行度差だけで前後を判定すると、スタートのグリッドのように
-        // 横に並んでいる車が「差ほぼ0」となって前車として検出されず、
-        // 速度制限が掛からないまま加速して追突する。
-        // 車体の向きから見た実際の前方距離でも判定する。
-        double fwd_real = 1e9;
-        {
-          const auto & qq = odom_->pose.pose.orientation;
-          const double yaw = std::atan2(2.0 * (qq.w * qq.z + qq.x * qq.y),
-                                        1.0 - 2.0 * (qq.y * qq.y + qq.z * qq.z));
-          const double dxr = o.x - ex, dyr = o.y - ey;
-          const double f = dxr * std::cos(yaw) + dyr * std::sin(yaw);
-          const double sd = std::abs(-dxr * std::sin(yaw) + dyr * std::cos(yaw));
-          if (f > 0.0 && sd < front_lane_half_) {
-            fwd_real = f;      // 自分の進路上の前方にいる
-          }
-        }
-        const bool ahead_by_prog = (gap > 0.5 && gap < detect_range_);
-        const bool ahead_by_geom = (fwd_real < detect_range_);
-        if (!ahead_by_prog && !ahead_by_geom) {
-          continue;
-        }
-        // 距離は小さい方を採用する(横並びでも実距離で反応できる)
-        gap = std::min(gap, fwd_real);
-        if (gap >= c.best_gap) {
-          continue;
-        }
-        c.best_gap = gap;
-        c.blocker = kv.first;
-
-        // 相手の横位置（ライン基準の符号付き）
-        double nx, ny;
-        normalAt(in, oi, nx, ny);
-        const auto & lp = in.points[oi].pose.position;
-        const double olat = (o.x - lp.x) * nx + (o.y - lp.y) * ny;
-
-        // 前車の進行方向速度を先に求める(抜くかどうかの判定に使う)
-        double ospeed_for_gate;
-        {
-          const auto & a2 = in.points[(oi + n - 1) % n].pose.position;
-          const auto & b2 = in.points[(oi + 1) % n].pose.position;
-          double tx2 = b2.x - a2.x, ty2 = b2.y - a2.y;
-          const double l2 = std::hypot(tx2, ty2);
-          if (l2 > 1e-9) {
-            tx2 /= l2;
-            ty2 /= l2;
-          }
-          ospeed_for_gate = o.vx * tx2 + o.vy * ty2;
-        }
-
-        // 相手と反対側へ、必要な間隔ぶん寄せる。
-        // ただし相手の横位置は揺れるので、毎周期で左右を決め直すと目標が反転し続ける。
-        // 一度どちらに抜けるか決めたら、対象車が変わるか一定時間経つまで側を保持する。
-        // 側は対象車が変わったときだけ決め直す。時間で決め直すと
-        // 追い越し中に左右が反転して危険なため。
-        // 相手と反対側が基本だが、その側にコリドアの余地が無いなら反対へ回る。
-        // どちらにも余地が無ければ side_fits_ を偽にして追い越し自体をやめる。
-        // 「pass_gap ぶん丸ごと寄れるか」で判定すると厳しすぎる。
-        // pass_gap=1.7m に対しコリドアの片側の余地が 1.35〜1.85m しかなく、
-        // 幅も時間も足りている場面が side_fits_=false で全部却下されていた
-        // (実測: zone=1 幅=4.0(要3.4) 所要=6.1s なのに feasible=0)。
-        // 実際に必要なのは「並んだときに車体が当たらない横間隔」なので、
-        // 寄れる範囲まで寄った結果の間隔が min_pass_sep 以上あれば良しとする。
-        const double reach_left = std::min(olat + pass_gap_, room_hi_);
-        const double reach_right = std::max(olat - pass_gap_, room_lo_);
-        bool fit_left = (reach_left - olat) >= min_pass_sep_;
-        bool fit_right = (olat - reach_right) >= min_pass_sep_;
-        // 学習した相手のラインで、抜き切るまでの区間を丸ごと見て側を決める。
-        // 瞬間値だけだと、相手がラインを横切っている最中の一瞬を見て
-        // 余地の無い側を選んでしまう(実測: 側OK=0 の 48% は反対側なら成立)。
-        double map_left = 0.0, map_right = 0.0;
-        int map_known = 0;
-        if (lane_map_side_) {
-          sideRoomMap(o, in, n, oi, lane_map_stretch_, olat, map_left, map_right, map_known);
-          // 学習データが区間の大半にある場合だけ信用する。
-          // map_left/right は「足りている区間が連続で何m続くか」。
-          // 抜き切るのに要る長さ(pass_len)を満たしていれば、その側は成立。
-          const double need = pass_len_ * lane_map_need_gain_;
-          if (map_known >= lane_map_min_pts_) {
-            fit_left = fit_left || (map_left >= need);
-            fit_right = fit_right || (map_right >= need);
-          }
-        }
-        dbg_map_l_ = map_left; dbg_map_r_ = map_right; dbg_map_n_ = map_known;
-        if (c.blocker != side_blocker_) {
-          side_blocker_ = c.blocker;
-          side_decided_at_ = now.seconds();
-          side_flip_cnt_ = 0;           // 対象車が変わったら側の変更枠を戻す
-          side_flip_at_ = now.seconds();
-          side_unfit_since_ = -1.0;
-          // 側の優先順位: イン > 相手の反対側。
-          // イン側を先に押さえると相手は避けざるを得ず、アウトから被せるより
-          // 成立しやすい(ユーザー方針: 攻められるならイン、無理なら反対側)。
-          // 直線(curve_sign_=0)では従来どおり相手の反対側。
-          double want = (olat >= 0.0) ? -1.0 : +1.0;   // 相手が左なら右へ
-          // --- 右側から抜くと決めている区間(ユーザー指示)
-          // メインストレート(idx220 -> 30)は右から抜く。
-          // side_sign_ は +1 が左、-1 が右(ログの表記と同じ)。
-          bool in_right_zone = false;
-          for (const auto & z : right_zones_) {
-            const bool inside = (z.first <= z.second)
-                                  ? (ei >= z.first && ei <= z.second)
-                                  : (ei >= z.first || ei <= z.second);
-            if (inside) { in_right_zone = true; break; }
-          }
-          if (in_right_zone) { want = -1.0; }
-          if (curve_sign_ != 0.0) {
-            const double inside_sign = (curve_sign_ > 0.0) ? +1.0 : -1.0;
-            const bool inside_fit = (inside_sign > 0.0) ? fit_left : fit_right;
-            if (inside_fit) { want = inside_sign; }
-          }
-          if (want < 0.0) {
-            side_sign_ = fit_right ? -1.0 : (fit_left ? +1.0 : -1.0);
-          } else {
-            side_sign_ = fit_left ? +1.0 : (fit_right ? -1.0 : +1.0);
-          }
-          // 両側とも成立するなら、並走できる区間が長いほうを選ぶ。
-          // イン優先は「相手が避けざるを得ない」ための策だが、
-          // 抜き切るまでの区間で明らかに狭ければ意味がない。
-          if (!in_right_zone && lane_map_side_ && map_known >= lane_map_min_pts_ &&
-              fit_left && fit_right) {
-            if (std::abs(map_left - map_right) > lane_map_margin_) {
-              side_sign_ = (map_left > map_right) ? +1.0 : -1.0;
-            }
-          }
-        }
-        side_fits_ = (side_sign_ > 0.0) ? fit_left : fit_right;
-
-        // --- 選んだ側に余地が無いままなら、一度だけ反対側へ回り直す
-        //
-        // 側は対象車が変わったときしか決め直していなかった。実測(3レース)では
-        // side_sign_ が t=0.04s に決まったきり最後まで変わらず、
-        // 却下の 83% が「幅・時間・距離は足りているのに side_fits_=false」だった。
-        //
-        // 【試して却下した版】無制限に回り直す実装は3台走行で悪化した
-        // (側の変更12回・追越成功0・stuck 2->7・復帰タイムアウト 1->6)。
-        // 左右に振られて壁に当たっていた。そこで制限を3つ入れてある。
-        //   (1) 対象車1台につき変更は side_flip_max 回まで
-        //   (2) 余地なしが side_flip_hold 秒連続で続いたときだけ
-        //   (3) まだ本当に踏み切っていない(|offset| < pass_gap*0.8)ときだけ
-        //
-        // 実測(3レース): 1台1回の枠は却下 128 件のうち 98 件(77%)が
-        // 「反対側なら成立していた」場面で使い果たされていた。枠を 4 回に増やし、
-        // 保持時間も 0.6s に縮めてある。左右に振られないための担保は
-        // side_room_ahead=15m(先読みを伸ばして側の判断が古くならないようにした)と
-        // 上の(3)。committed の判定を pass_gap*0.8(約1.4m)にしたので、
-        // 「まだ寄り始めただけ」の段階なら側を直せる。
-        if (!side_fits_) {
-          if (side_unfit_since_ < 0.0) { side_unfit_since_ = now.seconds(); }
-        } else {
-          side_unfit_since_ = -1.0;
-        }
-        // 使った枠を時間で戻す。総量制のままでは、同じ相手が長く前にいる間に
-        // 枠を使い切って「余地の無い側に張り付いたまま」になる。
-        if (side_flip_regen_ > 0.0 && side_flip_cnt_ > 0) {
-          const double dt = now.seconds() - side_flip_at_;
-          const int credit = static_cast<int>(dt / side_flip_regen_);
-          if (credit > 0) {
-            side_flip_cnt_ = std::max(0, side_flip_cnt_ - credit);
-            side_flip_at_ += credit * side_flip_regen_;
-          }
-        }
-        const bool other_fits = (side_sign_ > 0.0) ? fit_right : fit_left;
-        // 試行開始後に側を反転すると、横目標が左右へ1〜3秒周期で振られ、
-        // どちら側にも必要な横間隔を作れない。実測3レースでは側変更38/31/61回、
-        // 失敗66件中36件が allow/feasible/latch 全成立なのに横間隔0.34m未満だった。
-        // 狭区間では後段の latch_width_ok が試行を終了させるので、ここでは
-        // 試行が失敗・終了するまで選んだ側を固定する。
-        const bool committed = attempt_active_;
-        if (!side_fits_ && side_flip_cnt_ < side_flip_max_ && other_fits && !committed &&
-            side_unfit_since_ >= 0.0 &&
-            (now.seconds() - side_unfit_since_) >= side_flip_hold_)
-        {
-          side_sign_ = -side_sign_;
-          side_fits_ = true;            // 回った先は余地があると確認済み
-          side_flip_cnt_++;
-          side_flip_at_ = now.seconds();
-          side_unfit_since_ = -1.0;
-          side_decided_at_ = now.seconds();
-          RCLCPP_INFO(get_logger(),
-            "追越 側を変更(%d/%d) target=%s 側=%s 相手横=%.2f 余地=[%.2f,%.2f] offset=%.2f",
-            side_flip_cnt_, side_flip_max_,
-            c.blocker.c_str(), (side_sign_ > 0.0) ? "左" : "右",
-            olat, room_lo_, room_hi_, offset_);
-        }
-        // 抜いてよいかは「ゾーン内」または「相手が極端に遅い」場合。
-        // それに加えて「ブーストを使えば抜ける」と判断できるならゾーン外でも抜く。
-        c.slow_leader = (ospeed_for_gate < slow_leader_speed_);
-        const double my_speed = odom_->twist.twist.linear.x;
-
-        // 幅さえあれば、ブーストで詰められるかを見る。
-        // 速度差が小さくて自力では抜けないが、ブーストの上乗せがあれば
-        // 追い越しに要する距離を pass_len_ 以内に収められる場合に使う。
-        // ブーストの効果は「加速度 +0.5 m/s^2 を 10 秒」(parameter.md)。
-        // 最高速は上がらないので、既に頭打ちの速度域で撃っても無意味。
-        // 加速余地(目標速度との差)がある場面でのみ効く。
-        // --- 追い越せるかを「自車の性能」から判定する
-        //
-        // これまでは closing(今の速度差)だけを見ていたため、
-        // 自分が1位で 25 km/h 上限なのに、瞬間的に速度が出ている場面で
-        // 「抜ける」と誤判定して横に出て、抜けないまま並走して接触していた。
-        //
-        // 正しくは「自分がこれから到達できる速度」と「必要な加速時間」で判断する。
-        //   自車の速度上限 = 順位による handicap (1位:25km/h, 2位以下:36km/h)
-        //                    と、その地点の速度マップの小さい方
-        //   到達までの時間 = (目標速度 - 現在速度) / 実効加速度
-        const double v_target_here = in.points[ei].longitudinal_velocity_mps;
-        const double rank_cap = ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
-        const double v_reach = std::min(v_target_here, rank_cap);   // 自分が出せる上限
-        const double headroom = v_reach - my_speed;                 // まだ伸ばせる速度
-
-        // 相手を抜くのに必要な相対速度。相手より速くなれなければ抜けない。
-        const double closing_max = v_reach - ospeed_for_gate;
-
-        // 加速に要する時間を引いた「実際に使える時間」で距離を稼ぐ
-        const double accel_eff = std::max(vehicle_accel_, 0.05);
-        const double t_accel = std::max(headroom, 0.0) / accel_eff;
-        const double need = gap + pass_len_;             // 抜き切るのに詰める距離
-
-        // ブースト: 加速度 +0.5 m/s^2 を 10 秒。最高速は上げないので
-        // 加速余地がある場面でのみ効く(到達を早めるだけ)。
-        const double accel_boosted = accel_eff + boost_accel_;
-        const double t_accel_boosted = std::max(headroom, 0.0) / accel_boosted;
-
-        // 追い越しに要する時間の見積り。
-        // 加速中は平均的に closing_max/2 で詰め、到達後は closing_max で詰める。
-        auto pass_time = [&](double ta) {
-          if (closing_max <= 0.2) {
-            return 1e9;                                   // そもそも相手より速くなれない
-          }
-          const double d_accel = closing_max * 0.5 * ta;  // 加速中に詰まる距離
-          if (d_accel >= need) {
-            return ta * (need / std::max(d_accel, 1e-6));
-          }
-          return ta + (need - d_accel) / closing_max;
-        };
-
-        // --- 抜き切るのに必要な距離が、使える距離に収まるか
-        // 時間だけでなく距離でも見る。ゾーンが途中で終わるなら出ない。
-        auto pass_dist = [&](double ta) {
-          const double t = pass_time(ta);
-          if (t >= 1e8) {
-            return 1e9;
-          }
-          // その間に自車が進む距離
-          return my_speed * t + 0.5 * accel_eff * std::min(t, ta) * std::min(t, ta);
-        };
-
-        // 使える距離。
-        // ゾーン外だと zone_remain=0 になり、zone_exit_margin(25m) だけが使える距離になる。
-        // 周回遅れの遅い車を抜くには 34〜36m 必要なので、これでは却下されてしまう
-        // (実測: 相手12km/h で所要6.6s 距離36m が 25m 制限で却下されていた)。
-        // 速度差が十分大きい相手は、抜き切るまでの間ずっと有利なので距離を緩める。
-        const double closing_kmh = closing_max * 3.6;
-        double usable;
-        if (c.slow_leader || closing_kmh >= big_gap_closing_) {
-          usable = 1e9;                       // 相手が明らかに遅い。距離で縛らない
-        } else {
-          usable = c.zone_remain + zone_exit_margin_;
-        }
-
-        // イン(旋回内側)から抜く場合は判定を緩める。
-        // イン側を先に押さえられた相手は避ける動作を取らざるを得ないため、
-        // アウトから被せるより成立しやすい。
-        // 曲率の向きと抜こうとしている側が一致していればイン。
-        // ただし幅の割引はゾーン内に限る。
-        // ゾーンは幅を検証済みの区間なので割り引いても壁に寄らないが、
-        // ゾーン外で割り引くと 3.0m 幅の場所へ入り込んで壁に当たる
-        // (実測: 割引をゾーン外にも掛けたら d1 の壁接触が 3 -> 16 に増えた)。
-        const bool inside = (curve_sign_ != 0.0) && (side_sign_ * curve_sign_ > 0.0);
-        const bool inside_ok = inside && c.in_zone;
-        // --- 最下位のときは積極的に抜く ---
-        //
-        // 順位が下なら、抜かない限り結果は変わらない。多少の失敗より
-        // 「仕掛けないまま終わる」ほうが損。
-        // 実測(21:59版で2位だったレース): 3位スタートから 4倍遅い相手の
-        // 後ろで60秒を潰し、その間に勝者は 213m 先へ行った。
-        // 一方で1位・2位のときは、無理をして接触すると順位を落とすので
-        // 従来どおりの慎重さを保つ。
-        const bool aggressive = (rank_ >= 3);
-        const double t_limit = pass_time_limit_ * (inside ? inside_time_gain_ : 1.0)
-                               * (aggressive ? aggressive_time_gain_ : 1.0);
-        // 幅の割引は掛け合わせない。
-        // 両方が効くと 3.2 * 0.85 * 0.85 = 2.31m となり、カート2台ぶんの
-        // 物理的な下限(1.45 x 2 = 約2.9m)を割って必ず接触する。
-        // 効く条件のうち最も緩い1つだけを使う。
-        double w_gain = 1.0;
-        if (inside_ok) { w_gain = std::min(w_gain, inside_width_gain_); }
-        if (aggressive) { w_gain = std::min(w_gain, aggressive_width_gain_); }
-        const double w_need = min_pass_width_ * w_gain;
-        const bool width_ok = c.avail_width >= w_need;
-        // --- 実測データから「明らかに遅い相手」を判定する ---
-        // 溜めた走行データ(区間ごとの平均速度・ラップタイム)で相手の実力を見る。
-        // 瞬間の速度差(closing)ではなく実績で判定するのが重要:
-        // 自車が1位でハンデ(25km/h)を受けると、遅い MPC に対する closing が
-        // 12km/h を割って「同速」と誤分類され、周回67秒の相手を最後まで
-        // 抜けなくなる(実測: P1 のまま MPC の後ろで周回差を付けられた)。
-        bool clearly_slower = false;
-        {
-          const double om = o.meanSpeed();
-          const double mm = (my_speed_cnt_ > 20) ? my_speed_sum_ / my_speed_cnt_ : -1.0;
-          if (om > 0.0 && mm > 0.0 && om < mm * slow_rival_ratio_) {
-            clearly_slower = true;
-          }
-          // その区間での実績も見る。全体が遅くても、その場所だけ速いことがある。
-          if (clearly_slower && !line_x_.empty()) {
-            const int sec = static_cast<int>(oi * OtherState::kSections / n);
-            const double os = o.sectionSpeed(sec);
-            if (os > 0.0 && mm > 0.0 && os > mm * slow_rival_ratio_) {
-              clearly_slower = false;
-            }
-          }
-        }
-        // --- 同速の相手を攻めない ---
-        // 実測(3レース): 同じコードの僚車(自分と同じ速度)への試行は
-        // 抜き切るのに 46〜90m 必要で、直線の長さでは足りない。
-        // 対して遅い MPC は 42〜46m で足りる。
-        // 止まっている・壊れている相手(slow_leader)と、実績で明らかに遅い相手
-        // (clearly_slower)はこの足切りの対象外。
-        // 先頭車は 25km/h のハンデを受けており、2位以下(36km/h)から見ると
-        // 最高速で構造的に上回れる。瞬間の closing が小さくても抜きにいってよい
-        // (実測: 2位のとき先頭を「同速」と誤却下 60件/レース、抜けずに終了)。
-        const bool capped_leader = (rank_ >= 2) && !cur_leader_.empty() &&
-                                   (kv.first == cur_leader_);
-        const bool closing_ok = (closing_max * 3.6 >= min_closing_kmh_)
-                                && (pass_dist(t_accel) <= pass_dist_max_);
-        // --- 自分が1位でハンデを受けている間の足切り ---
-        //
-        // 1位の速度上限は 25km/h。前にいるのが周回遅れの 17〜24km/h の車でも
-        // closing は 1〜8km/h にしかならず、min_closing_kmh(12km/h)には
-        // 構造的に届かない。つまり「1位の間は誰も抜けない」設定になっていた。
-        // 実測(3レース・却下471件): 却下の 365件(77%)が rank=1。
-        // 直線手前 idx215-241 では却下53件のうち48件(91%)が
-        // 「zone=1・幅OK・側OK で、同速(closing不足)だけが理由」だった。
-        // ユーザー報告「220-240 でインから行けるのに相手の後ろを走っている」の正体。
-        //
-        // 速度差そのものが小さいのは事実なので、時間と距離では従来どおり縛る
-        // (pass_time <= t_limit / pass_dist <= usable は self_ok に残っている)。
-        // ここで見るのは「そもそも相手より速いか」と「抜き切る距離が現実的か」の2つ。
-        const bool capped_self = capped_self_enable_ && (rank_ == 1) &&
-                                 (closing_max * 3.6 >= capped_self_closing_) &&
-                                 (pass_dist(t_accel) <= capped_self_dist_);
-        const bool self_ok = width_ok
-                             && pass_time(t_accel) <= t_limit
-                             && pass_dist(t_accel) <= usable
-                             && (c.slow_leader || clearly_slower || capped_leader ||
-                                 capped_self || closing_ok);
-
-        // ブーストで抜けるようになるか。
-        // 「自力では抜けない(self_ok が偽)」ときだけ見ると、pass_time_limit を
-        // 緩めた結果ほとんどが self_ok になり、ブーストが一切使われなくなった。
-        // 自力で抜ける場合でも、ゾーンの残りが足りずに距離条件で落ちるなら
-        // ブーストで間に合わせる価値がある。
-        bool boost_would_help = false;
-        if (width_ok && !c.slow_leader && boost_remaining_ > 0 &&
-            headroom > boost_min_headroom_) {
-          const bool ok_boost = pass_time(t_accel_boosted) <= pass_time_limit_
-                                && pass_dist(t_accel_boosted) <= usable;
-          // ブーストで初めて成立する場合のみ「役に立つ」と判断する。
-          // 自力でも成立するなら温存する(ユーザー方針: 使わなくても抜けるなら使わない)。
-          const double t_self = pass_time(t_accel);
-          const double t_bst = pass_time(t_accel_boosted);
-          boost_gain_time_ = ok_boost ? (t_self - t_bst) : 0.0;
-          // 「自力では抜けない場合だけ」に限ると、ぎりぎり抜ける計算に
-          // なった場面でブーストを温存し、直線の終わり(コーナー入口)で
-          // 並んだまま突っ込んで失敗していた。
-          // 自力で抜ける場合でも、ブーストで明確に短時間で抜けるなら使う。
-          // 並走時間が短いほど接触の危険も小さい。
-          boost_would_help = ok_boost &&
-                             (!self_ok || boost_gain_time_ > boost_gain_min_);
-        }
-
-        // 抜けると判断できたときだけ横に出る。
-        // 相手が極端に遅い(止まっている)場合は幅さえあれば抜きにいく。
-        const bool feasible = side_fits_ &&
-                             ((c.slow_leader && width_ok) || self_ok || boost_would_help);
-        // 速度差が十分大きければゾーン外でも抜く。
-        // ゾーンは「並走しても安全な区間」の目安だが、相手が明らかに遅ければ
-        // 並走時間そのものが短いのでゾーンで縛る必要がない。
-        // これが無いと周回遅れを直線で抜けない(実測: 試行47回 成功0回)。
-        // (clearly_slower は closing の足切り免除にも使うため、self_ok の前で算出済み)
-        // 明らかに遅い相手には、直線の手前(加速区間)からでも仕掛けてよい。
-        // ブーストを使わずに抜けるので、終盤まで温存する必要がない。
-        bool in_accel_zone = false;
-        for (const auto & z : boost_zones_) {
-          const bool inside = (z.first <= z.second)
-                                ? (ei >= z.first && ei <= z.second)
-                                : (ei >= z.first || ei <= z.second);
-          if (inside) { in_accel_zone = true; break; }
-        }
-        // --- 追い越し禁止区間 ---
-        // 実測: idx78-92 は幅 2.3m しかなく、必要幅 2.7m を満たせない。
-        // 「側の余地あり」と「幅あり」が同時に成立しないので、ここで仕掛けても
-        // latch の時間と側の変更枠を食い潰すだけで終わる。
-        bool in_no_pass = false;
-        for (const auto & z : no_pass_zones_) {
-          const bool inside = (z.first <= z.second)
-                                ? (ei >= z.first && ei <= z.second)
-                                : (ei >= z.first || ei <= z.second);
-          if (inside) { in_no_pass = true; break; }
-        }
-        // 最下位なら、追い越し可能ゾーンの外でも仕掛けてよい
-        const bool zone_ok = c.in_zone || c.slow_leader || boost_would_help
-                             || (aggressive && in_accel_zone)
-                             || (clearly_slower && in_accel_zone)
-                             || (closing_max * 3.6 >= big_gap_closing_);
-        // 一度始めた試行は、条件が多少揺らいでも続行する。
-        // 揺らぐたびに追従制御が車間を詰め直すので、車間 4.1m のまま
-        // 12 秒粘って打切りになる、という現象が起きていた。
-        // 継続は「幅がある間だけ」。幅が無くなったら降りる。
-        // 幅を見ずに継続すると、狭い区間へ横オフセットを保ったまま進入して壁に当たる。
-        // ただし開始時と同じ厳しさで見ると、幅がわずかに揺らいだだけで
-        // 並走の途中で降りてしまう。並走中に急に戻るほうが危ないので、
-        // 継続中だけ latch_width_gain 分だけ緩める
-        // (実測: 試行15回すべて途中で降りて成功0回)。
-        const bool latch_width_ok = c.avail_width >= min_pass_width_ * latch_width_gain_;
-        const bool latched = attempt_active_ && latch_width_ok &&
-                             (now.seconds() - attempt_start_) < attempt_timeout_;
-        // 禁止区間では新しく仕掛けない。ただし既に並走している(latched)場合は
-        // そのまま続けさせる。狭い所で急にラインへ戻るほうが危ないため。
-        // 直前に「進展なし」で降りた相手には、しばらく仕掛け直さない。
-        // これが無いと降りた次の周期で条件が揃い直し、4秒ごとに横へ出ては
-        // 戻るだけになる(打切を早めた意味が無くなる)。
-        // ただし相手が明らかに遅くなったなら話が別なので、その場合は解除する。
-        const bool stall_block = !c.slow_leader && !clearly_slower &&
-                                 kv.first == attempt_stall_name_ &&
-                                 now.seconds() < attempt_stall_until_;
-        const bool allow = (zone_ok && feasible && !in_no_pass && !stall_block) || latched;
-        // 追い越しが途中で降りる原因を追うため、判定の中身を残しておく。
-        dbg_allow_ = allow; dbg_width_ = c.avail_width; dbg_zone_ = c.in_zone;
-        dbg_latched_ = latched; dbg_feasible_ = feasible; dbg_zone_ok_ = zone_ok;
-
-        // 却下された理由を残す(パラメータ調整のため)
-        if (!allow && (now - last_reject_log_).seconds() > 2.0) {
-          last_reject_log_ = now;
-          // 側が理由の却下を直接読めるようにする。
-          // 実測(3レース)では却下の 83% が「幅・時間・距離は足りていて
-          // side_fits_ だけが偽」だったが、このログに側が出ていなかったため
-          // 幅や時間の不足を疑って対策を外し続けていた。
-          // 却下の「決め手」を1語で出す。従来は zone/側/幅/同速 の各フラグしか
-          // 出しておらず、capped_self や boost_would_help で救われたかどうかが
-          // 読めなかった。実測(5レース471件)を集計したとき、
-          // 「同速=1」が立っていても実際には別の条件で落ちている行が混ざり、
-          // 原因の切り分けを誤りかけた。
-          const char * why =
-              in_no_pass                     ? "禁止区間"
-            : stall_block                    ? "打切直後"
-            : !side_fits_                    ? "側の余地なし"
-            : !width_ok                      ? "幅不足"
-            : (pass_time(t_accel) > t_limit) ? "時間超過"
-            : (pass_dist(t_accel) > usable)  ? "ゾーン残距離不足"
-            : !(c.slow_leader || clearly_slower || capped_leader ||
-                capped_self || closing_ok)   ? "速度差不足"
-            : !zone_ok                       ? "ゾーン外"
-            :                                  "その他";
-          RCLCPP_INFO(get_logger(),
-            "追越却下 決め手=%s self_ok=%d capped自=%d capped先=%d 遅相手=%d ブ助=%d "
-            "gap=%.1f zone=%d %s 幅=%.1f(要%.1f) 残距離=%.0f "
-            "v_reach=%.1f 相手=%.1f closing=%.1f 所要=%.1fs 距離=%.0f rank=%d "
-            "側OK=%d 側=%s 相手横=%.2f 余地=[%.2f,%.2f] idx=%zu 同速=%d 禁止区=%d "
-            "枠=%d/%d 不成立=%.1fs 学習連続=[%.1f,%.1f]m/%d点",
-            why, self_ok ? 1 : 0, capped_self ? 1 : 0, capped_leader ? 1 : 0,
-            clearly_slower ? 1 : 0, boost_would_help ? 1 : 0,
-            gap, c.in_zone ? 1 : 0, inside ? "イン" : "アウト", c.avail_width, w_need, usable,
-            v_reach * 3.6, ospeed_for_gate * 3.6, closing_max * 3.6,
-            pass_time(t_accel), pass_dist(t_accel), rank_,
-            side_fits_ ? 1 : 0, (side_sign_ > 0.0) ? "左" : "右",
-            olat, room_lo_, room_hi_, ei,
-            (!c.slow_leader && !closing_ok) ? 1 : 0, in_no_pass ? 1 : 0,
-            side_flip_cnt_, side_flip_max_,
-            (side_unfit_since_ >= 0.0) ? (now.seconds() - side_unfit_since_) : -1.0,
-            dbg_map_l_, dbg_map_r_, dbg_map_n_);
-        }
-        c.target_offset =
-          allow ? std::clamp(olat + side_sign_ * pass_gap_, room_lo_, room_hi_) : 0.0;
-        // 追い越しが成立しているかは「走行ラインからどれだけ離れたか」ではなく
-        // 「相手からどれだけ横に離れたか」で見る。
-        // 相手がラインから外れている場合、正しい追い越し位置が
-        // ライン上(オフセット約0)になることがあり、
-        // |target_offset| で判定すると横に出た瞬間に失敗と数えてしまう
-        // (実測: 相手が +1.55m にいて目標 -0.15m、間隔は 1.7m 取れているのに失敗扱い)。
-        pass_sep_ = allow ? (c.target_offset - olat) : 0.0;
-        can_pass_now_ = allow;
-
-        // ブーストの発火判定。
-        // 使わなくても抜けるなら使わない。1個で足りなければ2個目を使うが、
-        // 最初から2個使いにいくことはしない(1個目の効果を見てから)。
-        // 真後ろにいる状態(オフセット0)でブーストを撃っても、下の追従制御が
-        // 前車速度で頭打ちにするので完全に無駄になる(実測で2個とも空撃ちした)。
-        // 実際に横へ出て並びかけているときだけ使う。
-        // 横へ出てから撃つと、直線を半分使ってから加速し始めることになり、
-        // 直線の終わり(コーナー入口)で並んだまま突っ込んで失敗する。
-        // 仕掛ける直前(まだ真後ろ)でも、これから直線に入るなら先に撃つ。
-        // --- 助走ブースト: 抜くために「手前から」加速しておく
-        //
-        // ユーザー方針: 「抜くために少し手前からどんどん加速していき、
-        // 相手が 25km/h しか出せないところを追い抜く」。
-        //
-        // 【なぜ手前から撃つのか】
-        // ブーストは **10秒持続**する。並んでから撃つ従来の条件
-        // (moved_out = 横に出てから / commit_boost_time = 並走2.5秒)では、
-        // 加速し始めた時点で既に相手の真横におり、10秒のうち有効に使えるのは
-        // ごく一部。実戦では並走の継続が中央値 0.9秒しかなく、
-        // 3個中1個を残したままレースが終わっていた。
-        // 追い越しゾーンが射程に入った時点で撃てば、ゾーンに入るときには
-        // すでに速度が乗っている。
-        //
-        // 【なぜ「相手が25km/hしか出せないところ」なのか】
-        // 1位は driveFadeSpeed が 25km/h に制限される(handicap)。
-        // 2位以下は 36km/h。**先頭を追うときだけ、構造的に 11km/h 速い。**
-        // 同じ速度の相手はコーナー速度でも差が出ないので、
-        // この速度上限の差が同格の相手を抜く唯一の確実な手段になる。
-        // 実測: 自コード同士(完全に同速)では 57回試行して成功 0回。
-        // 横間隔は 91% が車幅以上に達しているのに前へ出られない。
-        // 並走できても速度が同じなら永久に抜けないという当たり前の帰結。
-        if (boost_runup_enable_ && !want_boost_ && boost_remaining_ > 0 &&
-            !is_boosting_ && start_merge_done_ && my_speed > boost_min_speed_ &&
-            headroom > boost_min_headroom_ && c.in_zone &&
-            gap >= boost_runup_gap_min_ && gap < boost_runup_gap_ &&
-            (capped_leader || clearly_slower || c.slow_leader))
-        {
-          const double since = (now - last_boost_time_).seconds();
-          if (boost_used_ == 0 || since > boost_retry_sec_) {
-            want_boost_ = true;
-            RCLCPP_INFO(get_logger(),
-              "ブースト使用(助走) target=%s 車間=%.1fm 相手=%.1fkm/h "
-              "自車上限=%.1fkm/h 余地=%.1f 先頭ハンデ=%d 遅相手=%d "
-              "%d周目 残り%d rank=%d",
-              c.blocker.c_str(), gap, ospeed_for_gate * 3.6, v_reach * 3.6,
-              headroom, capped_leader ? 1 : 0, clearly_slower ? 1 : 0,
-              lap_ + 1, boost_remaining_, rank_);
-          }
-        }
-
-        const bool moved_out = std::abs(offset_) > pass_gap_ * 0.5 || straight_ahead_;
-        // スタート直後は全車が数m以内に密集しており、しかも追い越しゾーンが
-        // メインストレート(スタート/フィニッシュ直線)なので in_zone が真になる。
-        // 全員が加速中で誰も抜けないのに「抜ける」と誤判定してブーストを2個とも
-        // 撃ってしまっていた(実測: 開始直後に 10.1 秒間隔で2個消費)。
-        //  (1) スタートの合流が終わるまで撃たない
-        //  (2) 十分な速度が出ていないと撃たない(低速ではブーストの効果も薄い)
-        const bool start_phase_over = start_merge_done_;
-        const bool fast_enough = my_speed > boost_min_speed_;
-        // 序盤に使うと、抜いた後にまた抜き返されてブーストが無駄になる。
-        // 終盤まで温存して、そこで確実に仕掛ける。
-        // ただし最終ラップまで待つと失敗したときに取り返せないので、
-        // boost_hold_laps で「何周を終えたら使ってよいか」を決める。
-        // 終盤まで温存する制限は無効化した(boost_hold_laps=0)。
-        // 同ランク帯との勝負では、序盤に詰まって失う時間のほうが
-        // 「抜き返される」危険より大きい。実測でも 21:59版のレースで
-        // 序盤60秒を遅い車の後ろで潰し、その間に勝者は213m先へ行った。
-        // 温存が必要になったら boost_hold_laps を戻す。
-        const bool late_enough = lap_ >= boost_hold_laps_;
-        if (allow && moved_out && start_phase_over && fast_enough && late_enough &&
-            boost_remaining_ > 0 && !is_boosting_) {
-          // 加速余地が無い場面(既に目標速度に達している)では撃たない。
-          // 1位のときは 25 km/h で頭打ちなので直線ではまず余地が無い。
-          const bool has_headroom = headroom > boost_min_headroom_;
-          const bool need_boost = has_headroom && boost_would_help;
-          if (need_boost) {
-            const double since = (now - last_boost_time_).seconds();
-            // 1個目を使った直後は効果を見る。効かなければ 2個目を許す
-            if (boost_used_ == 0 || since > boost_retry_sec_) {
-              want_boost_ = true;
-              // この経路で撃てたことをログに残す。自由発射のログしか無かったため、
-              // 「追い越しのために撃った」のか「余ったから撃った」のかを
-              // 後から区別できなかった。
-              RCLCPP_INFO(get_logger(),
-                "ブースト使用(追い越し) target=%s 車間=%.1fm 短縮=%.1fs 自力=%d "
-                "余地=%.1f %d周目 残り%d rank=%d",
-                c.blocker.c_str(), gap, boost_gain_time_, self_ok ? 1 : 0,
-                headroom, lap_ + 1, boost_remaining_, rank_);
-            }
-          }
-        }
-
-        // 前車の速度（進行方向成分）
-        double tx, ty;
-        {
-          const auto & a = in.points[(oi + n - 1) % n].pose.position;
-          const auto & b = in.points[(oi + 1) % n].pose.position;
-          tx = b.x - a.x;
-          ty = b.y - a.y;
-          const double len = std::hypot(tx, ty);
-          if (len > 1e-9) {
-            tx /= len;
-            ty /= len;
-          }
-        }
-        double ospeed = o.vx * tx + o.vy * ty;
-
-        // --- 相手がこれから落とす速度を先読みする ---
-        //
-        // カーブでは相手はほぼ確実に減速する。それに気づかず今の速度だけを見て
-        // 追従すると、後ろから加速していって追突する(実測で頻発)。
-        // 相手の少し先の速度プロファイルを見て、そこまで落ちる前提で合わせる。
-        //
-        // ただし「遅く見積もる」方向にしか使わない。速く見積もると
-        // 追い越しの判定が甘くなって危険なため。
-        // また追い越し中(passing_now)には効かせない。効かせると
-        // 相手の減速に合わせて自分も落とし、並んだまま抜けなくなる。
-        double ospeed_pred = ospeed;
-        if (predict_enable_) {
-          double look = 0.0;
-          for (size_t k = 0; k < n && look < predict_ahead_; ++k) {
-            const size_t a = (oi + k) % n;
-            const size_t b = (oi + k + 1) % n;
-            look += std::hypot(in.points[b].pose.position.x - in.points[a].pose.position.x,
-                               in.points[b].pose.position.y - in.points[a].pose.position.y);
-            ospeed_pred = std::min<double>(ospeed_pred,
-                                           in.points[a].longitudinal_velocity_mps);
-          }
-          // 相手が今その速度を出せていないなら、それ以上は落ちないとみなす
-          ospeed_pred = std::max(ospeed_pred, ospeed * predict_floor_);
-        }
-        // 車間に比例した追従制御。前車速度をそのまま上限にすると、
-        // スタート直後のように全車が密集して止まっている場面で
-        // 全員が 0 km/h に張り付いて膠着する。
-        // 目標: 車間 safe_gap を保ちつつ、詰まっている分だけ減速する。
-        // 車間は速度に応じて変える。
-        // 低速でも一定の余裕を残しつつ、高速では前車が急停止しても止まれる距離を取る。
-        // 制動距離 = v^2 / (2*|a_min|) を目安にし、上限で頭打ちにする。
-        // 上限を設けるのは、開けすぎると追い越し機会を失い順位を落とすため。
-        const double v_now = std::max(my_speed_for_gap_, 0.0);
-        const double brake_dist = (v_now * v_now) / (2.0 * std::max(std::abs(a_min_), 0.5));
-        double dyn_safe = std::clamp(safe_gap_ + brake_dist * gap_brake_ratio_,
-                                     safe_gap_min_, safe_gap_max_);
-        // 並走できない区間は少し広めに(詰めても抜けないうえ追突する)
-        if (!can_pass_now_) {
-          dyn_safe = std::min(dyn_safe * 1.3, safe_gap_max_);
-        }
-        // --- 仕掛けどころに合わせて車間を詰める ---
-        //
-        // 追突(Crash)は 10 秒間 5km/h に固定される。通常 35km/h で走ることを
-        // 考えると 80m 以上の損失で、追い越し1回ぶんより遥かに重い。
-        // だから普段は widely 空けておきたい。
-        // 一方で、仕掛ける瞬間に車間が空いていては抜けない。
-        //
-        // 幸い最高速度は順位で決まっており(1位 25km/h / 2位以下 36km/h)、
-        // 自分が2位なら前の1位より速い。この差で「いつでも詰められる」ので、
-        // **仕掛けどころに着いた瞬間に車間が縮まっている**ように逆算する。
-        //
-        //   仕掛けどころまでの距離 d、詰める速度差 closing、自車速度 v のとき
-        //   到達までの時間 t = d / v、その間に詰められる量 = closing * t
-        //   よって今保ってよい車間 = 目標車間 + closing * t
-        double eff_safe = dyn_safe;
-        // 助走モード。空けた車間を「目標車間の縮小を追いかける」だけでは
-        // 実際の加速が始まらない(実測: ゾーン入口で車間 9m 残り、所要9秒級の
-        // 失敗が多発)。車間が目標より大きい間は追従キャップ自体を外し、
-        // 速度プロファイルどおり加速して詰める。TTC・緊急減速は別段で効く。
-        bool charge_now = false;
-        if (approach_enable_ && !can_pass_now_) {
-          // 次に仕掛けられる場所までの距離を測る
-          double d_zone = -1.0;
-          {
-            double acc = 0.0;
-            for (size_t k = 1; k < n; ++k) {
-              const size_t a = (ei + k - 1) % n, b = (ei + k) % n;
-              acc += std::hypot(in.points[b].pose.position.x - in.points[a].pose.position.x,
-                                in.points[b].pose.position.y - in.points[a].pose.position.y);
-              if (acc > approach_range_) { break; }
-              bool zone_here = (corridor_.pass_ok.size() == n && corridor_.pass_ok[b]);
-              if (!zone_here) {
-                for (const auto & z : boost_zones_) {
-                  const bool inside = (z.first <= z.second)
-                                        ? (b >= z.first && b <= z.second)
-                                        : (b >= z.first || b <= z.second);
-                  if (inside) { zone_here = true; break; }
-                }
-              }
-              if (zone_here) { d_zone = acc; break; }
-            }
-          }
-          if (d_zone > 0.0) {
-            const double rank_cap = ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
-            // 詰める速度差は相手の「その先の区間での実績」で見積もる。
-            // 相手の瞬間速度(コーナーで遅い)を使うと closing が過大になり、
-            // want が上限まで張り付いて空けすぎる(実測: 入口で 9m 残り)。
-            const int zsec = static_cast<int>(oi * OtherState::kSections / n);
-            const double o_zone_v = o.sectionSpeed(zsec);
-            const double o_ref = (o_zone_v > 0.0) ? std::max(ospeed, o_zone_v) : ospeed;
-            const double closing = std::max(rank_cap - o_ref, 0.0);
-            const double t_zone = d_zone / std::max(v_now, 1.0);
-            // 仕掛けどころで pass_gap になるように、今は余分に空けておく
-            const double want = pass_gap_ + closing * t_zone;
-            eff_safe = std::clamp(std::max(eff_safe, want), safe_gap_min_, approach_gap_max_);
-            // 車間が目標より大きければ助走(全開で詰める)。
-            charge_now = gap > eff_safe + 0.3;
-            // 入口が目前なら、逆算値ではなく「抜くのに要る車間」まで詰めきる。
-            // want は入口到達時に pass_gap になる想定だが、追従則の遅れで
-            // 実測では入口に 5-6m 残ったまま入っていた。ここだけ目標を
-            // pass_gap*k に下げ、追従キャップを外す時間を伸ばす。
-            // 追突(Crash)は前方接触のみ罰なので TTC・緊急減速(avoid_speed_cap)
-            // が最後の砦になる。これらはチャージ中も別段で効く。
-            if (d_zone < charge_close_dist_) {
-              charge_now = gap > pass_gap_ * charge_close_gap_k_;
-            }
-            // --- 助走は「止まれる距離」を割ったらやめる
-            //
-            // 【直したバグ(ユーザー報告「そもそもぶつかった原因は?」)】
-            // 打ち切り条件が **固定の車間**(pass_gap*1.2 = 2.28m)だけで、
-            // **接近速度を見ていなかった**。
-            // 実測(20260828-215915-s0 の d1):
-            //   gap=1.6m 相手=12.9km/h closing=23.1km/h v_reach=36.0km/h
-            // 接近 6.4m/s から a_min=2.5m/s^2 で止まるには **8.2m** 要る。
-            // 2.28m から減速を始めても間に合わず必ず当たる。
-            // 実際 `前方 d3 まで 1.6m -> 0.0m` と詰まって接触した。
-            //
-            // **相手が遅いほど接近速度が大きくなり助走が危険になる**という
-            // 逆説的な関係になっていた。制動距離で縛る。
-            const double closing_now = std::max(my_speed_for_gap_ - ospeed, 0.0);
-            const double brake_need =
-              closing_now * closing_now / (2.0 * std::max(std::abs(a_min_), 0.5));
-            if (gap < brake_need + charge_brake_margin_) {
-              charge_now = false;
-            }
-          }
-        }
-        const double eff_follow = std::min(dyn_safe * 1.8, safe_gap_max_ * 1.8);
-        // 横へ出て抜きにいっている最中は速度を抑えない。
-        // 抑えると前車と同じ速度に張り付いて永久に抜けない(ブーストも無駄になる)。
-        // 相手が遅い(止まりかけている)なら「追い越し中だから制限しない」を
-        // 適用しない。実測(3レース中2レース): 減速中の相手に対し passing_now が
-        // 立ち、車間 2.3〜4.0m で「上限=-1.0(制限なし)」のまま接触した。
-        bool passing_now = allow && std::abs(offset_) > pass_gap_ * 0.5;
-        if (ospeed_for_gate < slow_leader_speed_) { passing_now = false; }
-        // 追い越し中でなければ、相手がこれから落とす速度に合わせる。
-        // 追い越し中に効かせると、相手の減速に自分も付き合って並んだまま
-        // 抜けなくなるので、そのときは今の速度のまま扱う。
-        if (!passing_now) { ospeed = std::min(ospeed, ospeed_pred); }
-        // 追い越し中も追従を完全には切らない。切ると相手が止まっても
-        // 減速指令が一切出ないまま突っ込む。並走中は詰めてよいので、
-        // 目標車間を 0.6 倍に縮めたうえで同じ制御を掛ける。
-        // TTC・緊急の減速(avoid_speed_cap)はこれとは別に後段でかかる。
-        const double follow_safe = passing_now ? eff_safe * 0.6 : eff_safe;
-
-        // --- 横に出切ったら追従キャップを外し、加速して抜き切る ---
-        //
-        // 【原因】追従則は相手を最後まで「前の車」として扱う。横に並んでも
-        // 上限は ospeed + follow_kp*(gap - follow_safe) のままで、
-        // follow_safe = eff_safe*0.6 = 3.0m なので、車間が 3m を割った瞬間に
-        // 上限が相手より遅くなる。釣り合うのは「車間 3m・相手と同速」の点。
-        // つまり相手の斜め後ろ 3m に貼り付き、相手とぴったり同じ速度で
-        // 走り続ける。ユーザー報告「相手の横まで来たのにゆっくり並走している」
-        // はこの釣り合い点そのもので、自分から抜け出せる経路が無い。
-        // 実測(3レース): 試行228回のうち90回が 16.0s ちょうどの時間切れ。
-        //
-        // 【対策】横間隔が min_lat_sep 以上あるなら、前から当てる経路が無い。
-        // Crash(10秒・5km/h固定)は前方接触にしか付かないので、追従で
-        // 速度を抑える理由がそもそも無い。上限を外して速度プロファイルどおり
-        // 加速し、抜き切る。
-        //
-        // 外す条件は3つ。
-        //   (1) 追い越しが許可されている(allow / latch)
-        //   (2) 実測の横間隔が commit_sep(=min_lat_sep) 以上ある
-        //       ※ 目標値 pass_sep_ ではなく、いま実際に離れている量で見る
-        //   (3) 前後の車間が commit_gap 以内(本当に並びかけている)
-        // 相手が止まりかけているとき(slow_leader 相当)は対象外にする。
-        // 減速中の相手に上限なしで突っ込む過去の失敗を繰り返さないため。
-        const double lat_sep_now = my_lat_for_target_ - olat;
-        bool commit_now = false;
-        if (commit_pass_ && allow && ospeed_for_gate > slow_leader_speed_) {
-          // 解除側でも**車幅を下回らせない**。重なった状態で加速を続けないため。
-          const double need_sep = commit_now_
-            ? std::max(commit_sep_ * commit_release_, kCarWidth)
-            : commit_sep_;
-          const double need_gap = commit_now_ ? commit_gap_ * 1.5 : commit_gap_;
-          commit_now = (std::abs(lat_sep_now) >= need_sep) && (gap < need_gap);
-        }
-        if (commit_now && !commit_now_) {
-          commit_since_ = now.seconds();
-          RCLCPP_INFO(get_logger(),
-                      "並走から抜き切りへ target=%s 車間=%.1fm 横間隔=%.2fm "
-                      "相手=%.1fkm/h 上限解除 rank=%d idx=%zu",
-                      c.blocker.c_str(), gap, lat_sep_now, ospeed * 3.6, rank_, ei);
-        }
-        if (!commit_now) { commit_since_ = -1.0; }
-        commit_now_ = commit_now;
-
-        // --- 並走が続いているのにに抜き切れないならブーストを使う
-        //
-        // 実測(2レース・自コード4台): 打切36件のうち **33件がブースト0個**。
-        // しかも1台2個持ちで4台=8個あるうち、レース中に使われたのは **4個だけ**。
-        // 横間隔の中央値は 1.96m あり(要1.15m)、**ちゃんと横には出ている**。
-        // つまり「並んだのに抜けないまま16秒使い、ブーストは温存したまま
-        // レースが終わる」という最悪の形になっていた。
-        // ブーストは持ち越せないので、使わずに終わるのは丸損。
-        //
-        // 従来の発動条件 boost_would_help は「自力で抜けないと判断できるとき」で、
-        // 仕掛ける前の見積りに基づく。見積りで「抜ける」と出ていても実際に
-        // 抜けないのがここで見えているので、**実際に並走が続いた事実**を根拠に撃つ。
-        if (commit_now && commit_boost_time_ > 0.0 && commit_since_ > 0.0 &&
-            (now.seconds() - commit_since_) >= commit_boost_time_ &&
-            boost_remaining_ > 0 && !is_boosting_ && !want_boost_)
-        {
-          const double since_last = (now - last_boost_time_).seconds();
-          if (boost_used_ == 0 || since_last > boost_retry_sec_) {
-            want_boost_ = true;
-            RCLCPP_INFO(get_logger(),
-                        "ブースト要求(並走%.1fs 抜き切れず) target=%s 横間隔=%.2fm "
-                        "車間=%.1fm 相手=%.1fkm/h 残り%d rank=%d",
-                        now.seconds() - commit_since_, c.blocker.c_str(),
-                        lat_sep_now, gap, ospeed * 3.6, boost_remaining_, rank_);
-          }
-        }
-        // 試行中に実際どこまで横に離れられたかを覚える。
-        // 打切の原因を「並走したが抜けなかった」と
-        // 「そもそも横に出られなかった」に分けるために要る。
-        if (attempt_active_ && std::abs(lat_sep_now) > attempt_max_sep_) {
-          attempt_max_sep_ = std::abs(lat_sep_now);
-        }
-        if (gap < eff_follow && !charge_now && !commit_now) {
-          const double v_target = ospeed + follow_kp_ * (gap - follow_safe);
-          // 完全に止まらないよう下限を設ける。本当に近い(接触寸前)ときは 0 まで許すが、
-          // それは相手が動いている場合に限る。
-          // 実測(3レース中2レース): 止まっている車の後ろで
-          // 「車間 < follow_safe*0.5 -> 下限 0」となり、上の停止車両ブロックが
-          // 横へよける目標を出しても速度が 0 のままで 24〜28 秒膠着した。
-          // 相手が止まっているなら止まっても解決しないので、下限を残す。
-          // 下限速度の扱い。
-          //
-          // 【元の実装】相手が止まっているときは下限を min_follow_speed(2.2m/s)に
-          // 残していた。理由は「止まっている車の後ろで下限0にすると
-          // 24〜28秒膠着した。相手が止まっているなら止まっても解決しない」。
-          //
-          // 【それが起こしていた問題(ユーザー報告)】
-          // **スタート直後は全車が停止している**ので必ずこの分岐に入り、
-          // 車間 1.2m で前車が完全停止していても 2.2m/s (8km/h) を出せと指令する。
-          // その結果、スタートした瞬間に前の車へ追突していた。
-          // 実測ログ: `停止車両 2台 先頭 d2 まで 1.2m 空き幅 0.62m -> 通過
-          // (上限 10.8km/h)` のまま前進し、`膠着 ... 1.2m` に至る。
-          //
-          // 【直し方】膠着対策の下限は「詰まった状態がしばらく続いてから」
-          // 効かせれば足りる。ぶつかる距離にいる間は止まってよい。
-          // 近すぎる(stop_hold_gap 未満)ときは、詰まりが
-          // stop_hold_sec 続くまで下限を 0 にする。
-          double floor = min_follow_speed_;
-          if (gap < follow_safe * 0.5 && ospeed > stopped_speed_) {
-            floor = 0.0;                       // 相手は動いている。従来どおり
-          } else if (ospeed <= stopped_speed_ && wouldRearEnd(gap, ospeed)) {
-            // 相手が止まっていて、ぶつかる距離にいる
-            if (stop_hold_since_ < 0.0) { stop_hold_since_ = now.seconds(); }
-            if ((now.seconds() - stop_hold_since_) < stop_hold_sec_) {
-              floor = 0.0;                     // まだ待つ。突っ込まない
-            }
-          } else {
-            stop_hold_since_ = -1.0;
-          }
-          // 後ろから詰められているときは、前車の速度を下回るまで落とさない。
-          // 落とすと車間が開いて仕掛けられないまま、後ろの車に抜かれる。
-          // 接触寸前(gap < follow_safe*0.5)では従来どおり 0 まで落とす。
-          if (c.pressed_from_behind && gap >= follow_safe * 0.5) {
-            floor = std::max(floor, std::max(ospeed, 0.0));
-          }
-          c.speed_cap = std::max(floor, v_target);
-        }
+        evaluateOpponent(f, c, kv.first, kv.second);
       }
       // 前方車が1台も見つからなかった周期では、追い越し状態も明示的に落とす。
       // これらは前方車のループの中でしか更新しないので、V2X が切れて相手が
