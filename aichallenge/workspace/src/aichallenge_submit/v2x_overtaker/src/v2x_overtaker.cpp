@@ -771,6 +771,89 @@ private:
     }
   }
 
+  // ===================================================================
+  // onTimer() が使う文脈
+  //
+  // もともと onTimer() は 2,500 行の単一関数で、22 のブロックが 18 個の
+  // ローカル変数を共有して上書きし合っていた。どの層がどれを書き換えるのかが
+  // 読めず、実際に「停止車回避が出した横目標を壁回避が黙って潰す」
+  // 「同じ意図の対策が 2 箇所にあり片方を直しても効かない」という不具合を生んだ。
+  //
+  // そこで状態を 2 つに分ける。
+  //   Frame   : その周期の観測。**読むだけ**。層は書き換えない。
+  //   PlanCtx : 層が積み上げていく指令と中間結果。**書き換わる**。
+  //
+  // 層のシグネチャを見れば、その層が観測だけ使うのか指令を触るのかが分かる。
+  // ===================================================================
+
+  // その周期の観測。全層で共通、書き換えない。
+  struct Frame
+  {
+    const Trajectory & in;          // 入力軌道
+    const std::vector<double> & s;  // 各点までの累積距離[m]
+    size_t n;                       // 点数
+    double total;                   // 周回長[m]
+    double ex, ey;                  // 自車位置
+    double ev;                      // 自車速度[m/s]
+    size_t ei;                      // 自車に最も近い点の添字
+    rclcpp::Time now;
+  };
+
+  // 層が積み上げる指令と中間結果。
+  struct PlanCtx
+  {
+    // --- 最終的な指令。各層がこの 2 つを詰めていく
+    double target_offset{0.0};   // 走行ラインからの横オフセット目標[m]
+    double speed_cap{-1.0};      // 速度上限[m/s]。負なら制限なし
+
+    // --- 前方の状況
+    std::string blocker;         // 前をふさいでいる相手の名前。空なら前は空き
+    double best_gap{0.0};        // その相手までの車間[m]
+    bool slow_leader{false};     // 前の相手が明らかに遅い
+    bool pressed_from_behind{false};  // 後ろから詰められている
+
+    // --- この地点で並走できるか
+    bool in_zone{true};
+    double avail_width{1e9};
+    double zone_remain{1e9};
+
+    // --- 層ごとの中間結果。次の層が判断に使う
+    bool stop_avoid_active{false};  // 停止車を避けようとしている
+    double stop_avoid_v_stop{0.0};  // 避けられないときに落とす速度[m/s]
+    double avoid_offset{0.0};       // 衝突回避層が出した横オフセット
+    double avoid_speed_cap{-1.0};   // 衝突回避層が出した速度上限
+    double repulse{0.0};            // 近接車からの横方向の反発
+
+    // publishTrajectory が作った最終軌道の、自車地点での目標速度[m/s]。
+    // ブーストの判断が「速度上限とハンデを掛けたあとの目標」を必要とするため、
+    // 軌道そのものではなくこの 1 点だけを次の層へ渡す。
+    double ego_target_speed{0.0};
+  };
+
+  // ===================================================================
+  // 20Hz の本体。
+  //
+  // やることは「観測(Frame)を作り、層を順に呼んで指令(PlanCtx)を積み上げ、
+  // 最後に publish する」だけ。層の順序がそのまま優先順位になっている。
+  //
+  //   観測と記録   logDrivingStats / estimateRank / evaluateZone
+  //                checkPressedFromBehind / logStopCause / findFrontCar
+  //                learnOpponentLine
+  //   走り方を決める planOvertake            追う / 抜く
+  //   当たらないようにする
+  //                avoidStoppedCars         止まっている車の脇を通す
+  //                avoidCollision           他車と壁の回避
+  //                repulseFromNearCars      近接車から離れる
+  //   横位置を保つ  holdStartLane            スタートのレーン
+  //                holdSideBySide           並走中
+  //                holdAttemptSide          寄ると決めた側
+  //   最終判断     avoidWall                壁が最優先。ここが最後の砦
+  //   出力         applyOffsetRateLimit / publishTrajectory / manageBoost
+  //
+  // **後の層ほど強い。** avoidWall が横目標を潰したら、それが最終指令になる。
+  // 潰されたことを前の層へ知らせないと「避けられない位置で全開前進」になるので、
+  // 必要なものは PlanCtx を通して受け渡すこと(stop_avoid_active がその例)。
+  // ===================================================================
   void onTimer()
   {
     if (!traj_ || traj_->points.size() < 3 || !odom_) {
@@ -796,6 +879,59 @@ private:
     const double ey = odom_->pose.pose.position.y;
     const double ev = odom_->twist.twist.linear.x;
     const size_t ei = nearest(in, ex, ey);
+
+    const rclcpp::Time now = this->now();
+
+    // その周期の観測。以降の層は読むだけで書き換えない。
+    const Frame f{in, s, n, total, ex, ey, ev, ei, now};
+    // その周期の指令と中間結果。以降の層がこれを積み上げていく。
+    PlanCtx c;
+    c.best_gap = detect_range_;
+
+    logDrivingStats(f);
+    estimateRank(f);
+    evaluateZone(f, c);
+    checkPressedFromBehind(f, c);
+    logStopCause(f);
+    findFrontCar(f);
+
+    learnOpponentLine(f);
+
+    planOvertake(f, c);
+
+    avoidStoppedCars(f, c);
+
+    avoidCollision(f, c);
+
+    repulseFromNearCars(f, c);
+
+    holdStartLane(f, c);
+
+    holdSideBySide(f, c);
+
+    recordAttempt(f, c);
+    applyAvoidance(f, c);
+
+    holdAttemptSide(c);
+
+    avoidWall(f, c);
+    applyOffsetRateLimit(c);
+    publishTrajectory(f, c);
+
+    manageBoost(f, c);
+
+    logBlocker(f, c);
+  }
+
+  // ---- ここから onTimer から切り出した層 ----
+
+  // 溜めた走行データの要約を定期的に出す。
+  void logDrivingStats(const Frame & f)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 溜めた走行データの要約を定期的に出す ---
     // 「遅い相手かどうか」を推測ではなく実測で判断できるようにする。
@@ -852,12 +988,12 @@ private:
       for (size_t k = k0; k + 4 < n && travelled < 25.0; ++k) {
         const auto & a = in.points[(ei + k) % n].pose.position;
         const auto & b = in.points[(ei + k + 2) % n].pose.position;
-        const auto & c = in.points[(ei + k + 4) % n].pose.position;
+        const auto & p3 = in.points[(ei + k + 4) % n].pose.position;
         travelled += std::hypot(b.x - a.x, b.y - a.y);
         const double ab = std::hypot(b.x - a.x, b.y - a.y);
-        const double bc = std::hypot(c.x - b.x, c.y - b.y);
-        const double ca = std::hypot(a.x - c.x, a.y - c.y);
-        const double cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        const double bc = std::hypot(p3.x - b.x, p3.y - b.y);
+        const double ca = std::hypot(a.x - p3.x, a.y - p3.y);
+        const double cross = (b.x - a.x) * (p3.y - a.y) - (b.y - a.y) * (p3.x - a.x);
         if (std::abs(cross) < 1e-9) { continue; }
         if (ab * bc * ca / (2.0 * std::abs(cross)) < free_boost_straight_) {
           straight_ahead_ = false;
@@ -866,6 +1002,16 @@ private:
       }
     }
 
+  }
+
+  // 現在の順位を推定する。
+  void estimateRank(const Frame & f)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const double total = f.total;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 現在の順位を推定する
     // AWSIM は順位をトピックに出さないので、V2X の他車位置をレースラインに投影し、
@@ -961,6 +1107,16 @@ private:
       }
     }
 
+  }
+
+  // この区間で並走できるかを判定する(使える幅と、その区間の残り距離)。
+  void evaluateZone(const Frame & f, PlanCtx & c)
+  {
+    const std::vector<double> & s = f.s;
+    const size_t n = f.n;
+    const double total = f.total;
+    const size_t ei = f.ei;
+
     // --- この区間で並走できるか判定する
     // ヘアピン(左右合計 2.90 m)ではカート2台(1.45 m x2)で隙間ゼロ。
     // 物理的に並べない場所で横間隔を取ろうとすると、互いを壁へ押し込んで両方詰まる。
@@ -969,18 +1125,15 @@ private:
     // 抜けない場所で試みると、横に出ても抜けずに減速するだけで遅くなる。
     // ゾーンは make_corridor.py が幅(>=5m)と曲率半径(>=12m)から算出して
     // corridor CSV の pass_ok 列に入れてある。
-    bool in_zone = true;
-    double avail_width = 1e9;
     // 追い越しに使える残り距離。ゾーンが尽きるまでに抜き切れないなら出ない。
-    double zone_remain = 1e9;
     if (corridor_.pass_ok.size() == n) {
-      in_zone = false;
-      avail_width = 0.0;
+      c.in_zone = false;
+      c.avail_width = 0.0;
       room_hi_ = 1e9;
       room_lo_ = -1e9;
       bool first = true;
       bool zone_started = false;
-      zone_remain = 0.0;
+      c.zone_remain = 0.0;
       for (size_t k = 0; k < n; ++k) {
         const size_t i = (ei + k) % n;
         double g = s[i] - s[ei];
@@ -997,9 +1150,9 @@ private:
         // (ユーザー報告:「直線で抜き始める判断が遅く、ぎりぎりで抜かすことになっている」)。
         if (g <= zone_look_ahead_) {
           if (corridor_.pass_ok[i]) {
-            in_zone = true;
+            c.in_zone = true;
             zone_started = true;
-            zone_remain = g;        // ゾーンが続く限り伸ばす
+            c.zone_remain = g;        // ゾーンが続く限り伸ばす
           } else if (zone_started) {
             break;                  // ゾーンが途切れたらそこまで
           }
@@ -1010,8 +1163,8 @@ private:
           continue;
         }
         const double w = corridor_.hi[i] - corridor_.lo[i];
-        if (first || w < avail_width) {
-          avail_width = w;
+        if (first || w < c.avail_width) {
+          c.avail_width = w;
           first = false;
         }
         // 「幅の合計」だけ見ても、走行ラインが片側に寄っている区間では
@@ -1041,14 +1194,23 @@ private:
     }
     // 相手が極端に遅い(止まっている・壁に当たっている)ときは、
     // ゾーン外でも幅さえあれば抜く。壊れた車の後ろで待ち続けるのは損なので。
-    bool slow_leader = false;
 
     my_speed_for_gap_ = odom_->twist.twist.linear.x;
+
+  }
+
+  // 後ろから詰められているかを1周期に1回だけ求める。
+  void checkPressedFromBehind(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
 
     // --- 後ろから詰められているか(1周期に1回だけ求める)
     // 追従の減速とブーストの両方で使う。後ろに車がいるのに前車より遅くまで
     // 落ちると、抜けないうえに自分が抜かれる。
-    bool pressed_from_behind = false;
     {
       const auto & pa = in.points[ei].pose.position;
       const auto & pb = in.points[(ei + 2) % n].pose.position;
@@ -1061,11 +1223,23 @@ private:
         const double b = -(dx * fx + dy * fy);          // 正なら後方
         const double side = std::abs(-dx * fy + dy * fx);
         if (b > 0.0 && b < free_boost_defend_dist_ && side < front_lane_half_ * 2.0) {
-          pressed_from_behind = true;
+          c.pressed_from_behind = true;
           break;
         }
       }
     }
+
+  }
+
+  // 停止したとき、原因が壁か他車かを判定してログに出す。
+  // 【注意】これは自作の推定であって公式ペナルティではない(開発メモ)。
+  void logStopCause(const Frame & f)
+  {
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 停止したとき、原因が壁か他車かを判定してログに出す
     // 壁(Wall 5秒)と車両接触(Crash 10秒)は罰則も対策も違うので分けて数える。
@@ -1147,8 +1321,18 @@ private:
       }
     }
 
+  }
+
+  // 前方の他車を探し、現在地点の曲率の向きを求める。スタート前は何もしない。
+  void findFrontCar(const Frame & f)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+
     // --- 前方の他車を探す
-    double target_offset = 0.0;
     // スタート前は何もしない。
     // 準備段階(Ready)で回避や追い越しが動くと、無意味に横へ出た状態で
     // グリッドに並ぶことになり、スタート直後の接触につながる。
@@ -1158,7 +1342,6 @@ private:
       return;
     }
 
-    double speed_cap = -1.0;
     // 反発計算で使う自車の横位置
     {
       double nx0, ny0;
@@ -1170,14 +1353,21 @@ private:
       if (n > 20) {
         const auto & a = in.points[ei].pose.position;
         const auto & b = in.points[(ei + 8) % n].pose.position;
-        const auto & c = in.points[(ei + 16) % n].pose.position;
-        const double cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        const auto & p3 = in.points[(ei + 16) % n].pose.position;
+        const double cross = (b.x - a.x) * (p3.y - b.y) - (b.y - a.y) * (p3.x - b.x);
         curve_sign_ = (std::abs(cross) < 0.5) ? 0.0 : ((cross > 0) ? 1.0 : -1.0);
       }
     }
-    std::string blocker;
-    double best_gap = detect_range_;
-    const rclcpp::Time now = this->now();
+  }
+
+  // 相手の走行ラインを学習する(前方かどうかに関係なく毎周期)。
+  // あわせてブースト要求を毎周期作り直す。
+  void learnOpponentLine(const Frame & f)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double total = f.total;
+    const rclcpp::Time now = f.now;
 
     // --- 相手の走行ラインを学習する(前方かどうかに関係なく毎周期)
     // 相手がどの地点でどれだけ横にいるかを覚えておき、側の判断に使う。
@@ -1239,6 +1429,20 @@ private:
     // 「armする周期 -> 撃つ周期」の2周期はそのまま成立する。
     want_boost_ = false;
     start_boost_pending_ = false;
+  }
+
+  // 前方の相手を追う / 抜くかを決める中心の層。
+  // 追従の車間制御・追い越しの可否判定・側の選択・助走ブーストを含む。
+  void planOvertake(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const size_t n = f.n;
+    const double total = f.total;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     if (enable_) {
       for (const auto & kv : others_) {
@@ -1277,11 +1481,11 @@ private:
         }
         // 距離は小さい方を採用する(横並びでも実距離で反応できる)
         gap = std::min(gap, fwd_real);
-        if (gap >= best_gap) {
+        if (gap >= c.best_gap) {
           continue;
         }
-        best_gap = gap;
-        blocker = kv.first;
+        c.best_gap = gap;
+        c.blocker = kv.first;
 
         // 相手の横位置（ライン基準の符号付き）
         double nx, ny;
@@ -1337,8 +1541,8 @@ private:
           }
         }
         dbg_map_l_ = map_left; dbg_map_r_ = map_right; dbg_map_n_ = map_known;
-        if (blocker != side_blocker_) {
-          side_blocker_ = blocker;
+        if (c.blocker != side_blocker_) {
+          side_blocker_ = c.blocker;
           side_decided_at_ = now.seconds();
           side_flip_cnt_ = 0;           // 対象車が変わったら側の変更枠を戻す
           side_flip_at_ = now.seconds();
@@ -1435,14 +1639,13 @@ private:
           RCLCPP_INFO(get_logger(),
             "追越 側を変更(%d/%d) target=%s 側=%s 相手横=%.2f 余地=[%.2f,%.2f] offset=%.2f",
             side_flip_cnt_, side_flip_max_,
-            blocker.c_str(), (side_sign_ > 0.0) ? "左" : "右",
+            c.blocker.c_str(), (side_sign_ > 0.0) ? "左" : "右",
             olat, room_lo_, room_hi_, offset_);
         }
         // 抜いてよいかは「ゾーン内」または「相手が極端に遅い」場合。
         // それに加えて「ブーストを使えば抜ける」と判断できるならゾーン外でも抜く。
-        slow_leader = (ospeed_for_gate < slow_leader_speed_);
+        c.slow_leader = (ospeed_for_gate < slow_leader_speed_);
         const double my_speed = odom_->twist.twist.linear.x;
-        const double closing = my_speed - ospeed_for_gate;   // 接近速度
 
         // 幅さえあれば、ブーストで詰められるかを見る。
         // 速度差が小さくて自力では抜けないが、ブーストの上乗せがあれば
@@ -1509,10 +1712,10 @@ private:
         // 速度差が十分大きい相手は、抜き切るまでの間ずっと有利なので距離を緩める。
         const double closing_kmh = closing_max * 3.6;
         double usable;
-        if (slow_leader || closing_kmh >= big_gap_closing_) {
+        if (c.slow_leader || closing_kmh >= big_gap_closing_) {
           usable = 1e9;                       // 相手が明らかに遅い。距離で縛らない
         } else {
-          usable = zone_remain + zone_exit_margin_;
+          usable = c.zone_remain + zone_exit_margin_;
         }
 
         // イン(旋回内側)から抜く場合は判定を緩める。
@@ -1524,7 +1727,7 @@ private:
         // ゾーン外で割り引くと 3.0m 幅の場所へ入り込んで壁に当たる
         // (実測: 割引をゾーン外にも掛けたら d1 の壁接触が 3 -> 16 に増えた)。
         const bool inside = (curve_sign_ != 0.0) && (side_sign_ * curve_sign_ > 0.0);
-        const bool inside_ok = inside && in_zone;
+        const bool inside_ok = inside && c.in_zone;
         // --- 最下位のときは積極的に抜く ---
         //
         // 順位が下なら、抜かない限り結果は変わらない。多少の失敗より
@@ -1544,7 +1747,7 @@ private:
         if (inside_ok) { w_gain = std::min(w_gain, inside_width_gain_); }
         if (aggressive) { w_gain = std::min(w_gain, aggressive_width_gain_); }
         const double w_need = min_pass_width_ * w_gain;
-        const bool width_ok = avail_width >= w_need;
+        const bool width_ok = c.avail_width >= w_need;
         // --- 実測データから「明らかに遅い相手」を判定する ---
         // 溜めた走行データ(区間ごとの平均速度・ラップタイム)で相手の実力を見る。
         // 瞬間の速度差(closing)ではなく実績で判定するのが重要:
@@ -1599,7 +1802,7 @@ private:
         const bool self_ok = width_ok
                              && pass_time(t_accel) <= t_limit
                              && pass_dist(t_accel) <= usable
-                             && (slow_leader || clearly_slower || capped_leader ||
+                             && (c.slow_leader || clearly_slower || capped_leader ||
                                  capped_self || closing_ok);
 
         // ブーストで抜けるようになるか。
@@ -1608,7 +1811,7 @@ private:
         // 自力で抜ける場合でも、ゾーンの残りが足りずに距離条件で落ちるなら
         // ブーストで間に合わせる価値がある。
         bool boost_would_help = false;
-        if (width_ok && !slow_leader && boost_remaining_ > 0 &&
+        if (width_ok && !c.slow_leader && boost_remaining_ > 0 &&
             headroom > boost_min_headroom_) {
           const bool ok_boost = pass_time(t_accel_boosted) <= pass_time_limit_
                                 && pass_dist(t_accel_boosted) <= usable;
@@ -1629,7 +1832,7 @@ private:
         // 抜けると判断できたときだけ横に出る。
         // 相手が極端に遅い(止まっている)場合は幅さえあれば抜きにいく。
         const bool feasible = side_fits_ &&
-                             ((slow_leader && width_ok) || self_ok || boost_would_help);
+                             ((c.slow_leader && width_ok) || self_ok || boost_would_help);
         // 速度差が十分大きければゾーン外でも抜く。
         // ゾーンは「並走しても安全な区間」の目安だが、相手が明らかに遅ければ
         // 並走時間そのものが短いのでゾーンで縛る必要がない。
@@ -1656,7 +1859,7 @@ private:
           if (inside) { in_no_pass = true; break; }
         }
         // 最下位なら、追い越し可能ゾーンの外でも仕掛けてよい
-        const bool zone_ok = in_zone || slow_leader || boost_would_help
+        const bool zone_ok = c.in_zone || c.slow_leader || boost_would_help
                              || (aggressive && in_accel_zone)
                              || (clearly_slower && in_accel_zone)
                              || (closing_max * 3.6 >= big_gap_closing_);
@@ -1669,7 +1872,7 @@ private:
         // 並走の途中で降りてしまう。並走中に急に戻るほうが危ないので、
         // 継続中だけ latch_width_gain 分だけ緩める
         // (実測: 試行15回すべて途中で降りて成功0回)。
-        const bool latch_width_ok = avail_width >= min_pass_width_ * latch_width_gain_;
+        const bool latch_width_ok = c.avail_width >= min_pass_width_ * latch_width_gain_;
         const bool latched = attempt_active_ && latch_width_ok &&
                              (now.seconds() - attempt_start_) < attempt_timeout_;
         // 禁止区間では新しく仕掛けない。ただし既に並走している(latched)場合は
@@ -1678,12 +1881,12 @@ private:
         // これが無いと降りた次の周期で条件が揃い直し、4秒ごとに横へ出ては
         // 戻るだけになる(打切を早めた意味が無くなる)。
         // ただし相手が明らかに遅くなったなら話が別なので、その場合は解除する。
-        const bool stall_block = !slow_leader && !clearly_slower &&
+        const bool stall_block = !c.slow_leader && !clearly_slower &&
                                  kv.first == attempt_stall_name_ &&
                                  now.seconds() < attempt_stall_until_;
         const bool allow = (zone_ok && feasible && !in_no_pass && !stall_block) || latched;
         // 追い越しが途中で降りる原因を追うため、判定の中身を残しておく。
-        dbg_allow_ = allow; dbg_width_ = avail_width; dbg_zone_ = in_zone;
+        dbg_allow_ = allow; dbg_width_ = c.avail_width; dbg_zone_ = c.in_zone;
         dbg_latched_ = latched; dbg_feasible_ = feasible; dbg_zone_ok_ = zone_ok;
 
         // 却下された理由を残す(パラメータ調整のため)
@@ -1705,7 +1908,7 @@ private:
             : !width_ok                      ? "幅不足"
             : (pass_time(t_accel) > t_limit) ? "時間超過"
             : (pass_dist(t_accel) > usable)  ? "ゾーン残距離不足"
-            : !(slow_leader || clearly_slower || capped_leader ||
+            : !(c.slow_leader || clearly_slower || capped_leader ||
                 capped_self || closing_ok)   ? "速度差不足"
             : !zone_ok                       ? "ゾーン外"
             :                                  "その他";
@@ -1717,17 +1920,17 @@ private:
             "枠=%d/%d 不成立=%.1fs 学習連続=[%.1f,%.1f]m/%d点",
             why, self_ok ? 1 : 0, capped_self ? 1 : 0, capped_leader ? 1 : 0,
             clearly_slower ? 1 : 0, boost_would_help ? 1 : 0,
-            gap, in_zone ? 1 : 0, inside ? "イン" : "アウト", avail_width, w_need, usable,
+            gap, c.in_zone ? 1 : 0, inside ? "イン" : "アウト", c.avail_width, w_need, usable,
             v_reach * 3.6, ospeed_for_gate * 3.6, closing_max * 3.6,
             pass_time(t_accel), pass_dist(t_accel), rank_,
             side_fits_ ? 1 : 0, (side_sign_ > 0.0) ? "左" : "右",
             olat, room_lo_, room_hi_, ei,
-            (!slow_leader && !closing_ok) ? 1 : 0, in_no_pass ? 1 : 0,
+            (!c.slow_leader && !closing_ok) ? 1 : 0, in_no_pass ? 1 : 0,
             side_flip_cnt_, side_flip_max_,
             (side_unfit_since_ >= 0.0) ? (now.seconds() - side_unfit_since_) : -1.0,
             dbg_map_l_, dbg_map_r_, dbg_map_n_);
         }
-        target_offset =
+        c.target_offset =
           allow ? std::clamp(olat + side_sign_ * pass_gap_, room_lo_, room_hi_) : 0.0;
         // 追い越しが成立しているかは「走行ラインからどれだけ離れたか」ではなく
         // 「相手からどれだけ横に離れたか」で見る。
@@ -1735,7 +1938,7 @@ private:
         // ライン上(オフセット約0)になることがあり、
         // |target_offset| で判定すると横に出た瞬間に失敗と数えてしまう
         // (実測: 相手が +1.55m にいて目標 -0.15m、間隔は 1.7m 取れているのに失敗扱い)。
-        pass_sep_ = allow ? (target_offset - olat) : 0.0;
+        pass_sep_ = allow ? (c.target_offset - olat) : 0.0;
         can_pass_now_ = allow;
 
         // ブーストの発火判定。
@@ -1771,9 +1974,9 @@ private:
         // 並走できても速度が同じなら永久に抜けないという当たり前の帰結。
         if (boost_runup_enable_ && !want_boost_ && boost_remaining_ > 0 &&
             !is_boosting_ && start_merge_done_ && my_speed > boost_min_speed_ &&
-            headroom > boost_min_headroom_ && in_zone &&
+            headroom > boost_min_headroom_ && c.in_zone &&
             gap >= boost_runup_gap_min_ && gap < boost_runup_gap_ &&
-            (capped_leader || clearly_slower || slow_leader))
+            (capped_leader || clearly_slower || c.slow_leader))
         {
           const double since = (now - last_boost_time_).seconds();
           if (boost_used_ == 0 || since > boost_retry_sec_) {
@@ -1782,7 +1985,7 @@ private:
               "ブースト使用(助走) target=%s 車間=%.1fm 相手=%.1fkm/h "
               "自車上限=%.1fkm/h 余地=%.1f 先頭ハンデ=%d 遅相手=%d "
               "%d周目 残り%d rank=%d",
-              blocker.c_str(), gap, ospeed_for_gate * 3.6, v_reach * 3.6,
+              c.blocker.c_str(), gap, ospeed_for_gate * 3.6, v_reach * 3.6,
               headroom, capped_leader ? 1 : 0, clearly_slower ? 1 : 0,
               lap_ + 1, boost_remaining_, rank_);
           }
@@ -1824,7 +2027,7 @@ private:
               RCLCPP_INFO(get_logger(),
                 "ブースト使用(追い越し) target=%s 車間=%.1fm 短縮=%.1fs 自力=%d "
                 "余地=%.1f %d周目 残り%d rank=%d",
-                blocker.c_str(), gap, boost_gain_time_, self_ok ? 1 : 0,
+                c.blocker.c_str(), gap, boost_gain_time_, self_ok ? 1 : 0,
                 headroom, lap_ + 1, boost_remaining_, rank_);
             }
           }
@@ -2028,7 +2231,7 @@ private:
           RCLCPP_INFO(get_logger(),
                       "並走から抜き切りへ target=%s 車間=%.1fm 横間隔=%.2fm "
                       "相手=%.1fkm/h 上限解除 rank=%d idx=%zu",
-                      blocker.c_str(), gap, lat_sep_now, ospeed * 3.6, rank_, ei);
+                      c.blocker.c_str(), gap, lat_sep_now, ospeed * 3.6, rank_, ei);
         }
         if (!commit_now) { commit_since_ = -1.0; }
         commit_now_ = commit_now;
@@ -2055,7 +2258,7 @@ private:
             RCLCPP_INFO(get_logger(),
                         "ブースト要求(並走%.1fs 抜き切れず) target=%s 横間隔=%.2fm "
                         "車間=%.1fm 相手=%.1fkm/h 残り%d rank=%d",
-                        now.seconds() - commit_since_, blocker.c_str(),
+                        now.seconds() - commit_since_, c.blocker.c_str(),
                         lat_sep_now, gap, ospeed * 3.6, boost_remaining_, rank_);
           }
         }
@@ -2105,10 +2308,10 @@ private:
           // 後ろから詰められているときは、前車の速度を下回るまで落とさない。
           // 落とすと車間が開いて仕掛けられないまま、後ろの車に抜かれる。
           // 接触寸前(gap < follow_safe*0.5)では従来どおり 0 まで落とす。
-          if (pressed_from_behind && gap >= follow_safe * 0.5) {
+          if (c.pressed_from_behind && gap >= follow_safe * 0.5) {
             floor = std::max(floor, std::max(ospeed, 0.0));
           }
-          speed_cap = std::max(floor, v_target);
+          c.speed_cap = std::max(floor, v_target);
         }
       }
       // 前方車が1台も見つからなかった周期では、追い越し状態も明示的に落とす。
@@ -2119,16 +2322,29 @@ private:
       // 「成功した瞬間に blocker が空になり pass_sep_ が 0 になる」。
       // 下の記録では失敗条件(|pass_sep_| 小)が先に成立するため、
       // 成功した追い越しがそのまま失敗として記録されていた。
-      if (blocker.empty()) {
+      if (c.blocker.empty()) {
         // 相手が居ない周期では抜き切りモードのヒステリシスも落とす。
         // 残したままだと、次に別の相手へ近づいたとき緩い側の閾値で始まる。
         commit_now_ = false;
       }
-      if (blocker.empty() && !attempt_active_) {
+      if (c.blocker.empty() && !attempt_active_) {
         pass_sep_ = 0.0;
         can_pass_now_ = false;
       }
     }
+  }
+
+  // 停止車両への突入を防ぐ。複数台が同じ場所で止まっている場合を含む。
+  // 止まっている車の集団に対して空いている横位置の区間を求め、
+  // 通れる区間があればそこへ、無ければ手前で止まる。
+  void avoidStoppedCars(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const size_t n = f.n;
+    const double total = f.total;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 停止車両への突入防止(複数台が同じ場所で止まっている場合を含む)
     // 大会での実測: 相手がスタックして止まっていると、そこへ突っ込んでいた。
@@ -2155,8 +2371,6 @@ private:
     // 潰されたかの判定には、壁回避の時点での横目標(want)をそのまま使う。
     // 停止車回避の答えを別に持ち回るより、「最終的に出したい横位置が壁で
     // 潰されたか」を見るほうが、途中の層が書き換えた場合も正しく効く。
-    bool stop_avoid_active = false;     // 前方に停止車がいて避けようとしている
-    double stop_avoid_v_stop = 0.0;     // 避けられないときに落とす速度[m/s]
     {
       const double brake_a = std::max(std::abs(a_min_), 0.5);
       struct StoppedCar
@@ -2267,9 +2481,9 @@ private:
         std::string act;
         if (best_w >= stopped_slack_) {
           // 余裕をもって通れる。帯の中央へ寄せる。
-          target_offset = band_center;
-          stop_avoid_active = true;
-          stop_avoid_v_stop = v_stop;
+          c.target_offset = band_center;
+          c.stop_avoid_active = true;
+          c.stop_avoid_v_stop = v_stop;
           // 横へよける目標を出しても、上の追従制御が「相手が止まっている =
           // 車間が近い」で上限 0 を出していると一歩も動けない。
           // 実測(3レース中2レース): この状態で 24〜28 秒膠着した。
@@ -2304,21 +2518,21 @@ private:
           } else {
             stop_hold_since_ = -1.0;
           }
-          if (speed_cap >= 0.0 && !hold_now) {
-            speed_cap = std::max(speed_cap, stopped_thread_speed_);
+          if (c.speed_cap >= 0.0 && !hold_now) {
+            c.speed_cap = std::max(c.speed_cap, stopped_thread_speed_);
           }
           act = hold_now ? "通過(近いので待つ)" : "通過";
         } else if (best_w > 0.0) {
           // かろうじて通れる。速度を落として通す。ここも帯の中央を狙う。
-          target_offset = band_center;
-          stop_avoid_active = true;
-          stop_avoid_v_stop = v_stop;
-          speed_cap = (speed_cap < 0.0) ? stopped_thread_speed_
-                                        : std::min(speed_cap, stopped_thread_speed_);
+          c.target_offset = band_center;
+          c.stop_avoid_active = true;
+          c.stop_avoid_v_stop = v_stop;
+          c.speed_cap = (c.speed_cap < 0.0) ? stopped_thread_speed_
+                                        : std::min(c.speed_cap, stopped_thread_speed_);
           act = "徐行通過";
         } else {
           // 通れない。手前で止まる。
-          speed_cap = (speed_cap < 0.0) ? v_stop : std::min(speed_cap, v_stop);
+          c.speed_cap = (c.speed_cap < 0.0) ? v_stop : std::min(c.speed_cap, v_stop);
           act = "停止";
         }
         // --- 膠着の検出(警告のみ)
@@ -2338,7 +2552,7 @@ private:
                         "空き幅 %.2fm 上限 %.1fkm/h 横目標 %.2f",
                         stopped.front().name.c_str(), base, my_speed_for_gap_,
                         now.seconds() - deadlock_since_, best_w,
-                        (speed_cap < 0.0 ? 99.0 : speed_cap) * 3.6, target_offset);
+                        (c.speed_cap < 0.0 ? 99.0 : c.speed_cap) * 3.6, c.target_offset);
           }
         } else {
           deadlock_since_ = -1.0;
@@ -2348,18 +2562,27 @@ private:
           RCLCPP_INFO(get_logger(),
                       "停止車両 %d台 先頭 %s まで %.1fm 空き幅 %.2fm -> %s (上限 %.1fkm/h)",
                       group, stopped.front().name.c_str(), base, best_w, act.c_str(),
-                      (speed_cap < 0.0 ? 99.0 : speed_cap) * 3.6);
+                      (c.speed_cap < 0.0 ? 99.0 : c.speed_cap) * 3.6);
         }
       }
     }
+  }
+
+  // 衝突回避層。他車と壁の両方を見て、横へよける量と速度上限を出す。
+  void avoidCollision(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 衝突回避層(他車 + 壁)
     // 追い越しロジックとは独立に、常に働く。追い越し中かどうかに関係なく
     // 「当たりそうなら必ず避ける/減速する」を最優先で行う。
     // 従来は追い越し可能な区間でしか反発が働かず、狭い区間や複数台、
     // 後方からの接近に対して無防備だった。
-    double avoid_offset = 0.0;
-    double avoid_speed_cap = -1.0;
     {
       const auto & q = odom_->pose.pose.orientation;
       const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -2443,11 +2666,11 @@ private:
         const double want = std::min(avail, min_lat_sep_);
         if (want > std::abs(push)) {
           push = want * dir;
-          avoid_offset = std::clamp(my_lat_for_target_ + push, lo, hi);
+          c.avoid_offset = std::clamp(my_lat_for_target_ + push, lo, hi);
           wedge_active_ = true;
           // ここでは減速しない。止まれないのだから、
           // 落とすほど相手の正面に居座る時間が延びるだけになる。
-          avoid_speed_cap = -1.0;
+          c.avoid_speed_cap = -1.0;
           if ((this->now() - last_wedge_log_).seconds() > 1.0) {
             last_wedge_log_ = this->now();
             RCLCPP_INFO(get_logger(),
@@ -2462,7 +2685,7 @@ private:
       if (worst_ttc < ttc_threshold_ && std::abs(push) < 1e-3) {
         // 迫っているなら減速する。TTC が短いほど強く落とす
         const double ratio = std::clamp(worst_ttc / ttc_threshold_, 0.0, 1.0);
-        avoid_speed_cap = std::max(my_speed_for_gap_ * ratio, min_follow_speed_);
+        c.avoid_speed_cap = std::max(my_speed_for_gap_ * ratio, min_follow_speed_);
       }
 
       dbg_avoid_ttc_ = (worst_ttc < 1e8) ? worst_ttc : -1.0;
@@ -2486,19 +2709,28 @@ private:
         const double got = cand - my_lat_for_target_;
         if (std::abs(got) < std::abs(push) * 0.5) {
           // 半分も寄れないなら、横移動だけでは足りない。減速も併用する。
-          avoid_speed_cap = std::max(my_speed_for_gap_ * 0.5, min_follow_speed_);
+          c.avoid_speed_cap = std::max(my_speed_for_gap_ * 0.5, min_follow_speed_);
         }
         push = got;
         if (std::abs(push) > 1e-3) {
-          avoid_offset = cand;
+          c.avoid_offset = cand;
         }
       }
     }
+  }
+
+  // 近接車から横方向へ反発する。
+  void repulseFromNearCars(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 近接車からの横方向の反発
     // 「前方の車」だけを見ていると、真横に並んだ車を無視して寄っていき接触する。
     // 前後方向の距離に関係なく、一定半径内の車とは横方向の間隔を確保する。
-    double repulse = 0.0;
     {
       double my_lat;
       {
@@ -2528,21 +2760,32 @@ private:
           const double dir = (std::abs(sep) > 0.15) ? ((sep > 0) ? 1.0 : -1.0) : side_sign_;
           const double need = (min_lat_sep_ - std::abs(sep)) * dir;
           // 最も強い反発を採用する(複数車に囲まれても発散させない)
-          if (std::abs(need) > std::abs(repulse)) {
-            repulse = need;
+          if (std::abs(need) > std::abs(c.repulse)) {
+            c.repulse = need;
           }
         }
       }
     }
-    if (std::abs(repulse) > 1e-3 && can_pass_now_) {
+    if (std::abs(c.repulse) > 1e-3 && can_pass_now_) {
       // 反発は追い越し要求より優先する。接触は crash ペナルティで最も重い。
       // ただし並走できない幅しかない区間では横に逃げても壁に当たるだけなので行わない
       // (その場合は下の追従制御で車間を空ける)。
-      target_offset = my_lat_for_target_ + repulse;
-      if (blocker.empty()) {
-        blocker = "近接車";
+      c.target_offset = my_lat_for_target_ + c.repulse;
+      if (c.blocker.empty()) {
+        c.blocker = "近接車";
       }
     }
+  }
+
+  // スタート直後はグリッドの横位置を保持し、距離とともに 0 へ減衰させる。
+  // 全車が一斉に同じレースラインへ収束して団子になるのを防ぐ。
+  void holdStartLane(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
 
     // --- スタート直後はグリッドの横位置を保持する
     // 4台が一斉に同じレースラインへ収束すると、スタート直後に必ず接触して団子になる。
@@ -2683,14 +2926,22 @@ private:
         if (run < start_merge_dist_) {
           const double w = 1.0 - run / start_merge_dist_;
           // 他車回避の要求が無いときだけレーン保持。回避が必要ならそちらを優先
-          if (blocker.empty()) {
-            target_offset = start_lat_ * w;
+          if (c.blocker.empty()) {
+            c.target_offset = start_lat_ * w;
           } else {
-            target_offset = target_offset * (1 - w) + start_lat_ * w;
+            c.target_offset = c.target_offset * (1 - w) + start_lat_ * w;
           }
         }
       }
     }
+  }
+
+  // 並走中は横オフセットを保持する。
+  // 横に並ぶと相手が前方帯から外れて検出されなくなり、目標が 0 に戻ってしまうため。
+  void holdSideBySide(const Frame & f, PlanCtx & c)
+  {
+    const size_t n = f.n;
+    const size_t ei = f.ei;
 
     // --- 並走中は横オフセットを保持する
     // 横に並びかけると、相手は「前方の帯(front_lane_half)」から外れるので
@@ -2699,7 +2950,7 @@ private:
     // 実測: 失敗ログが全て `横目標=0.00 allow=1 幅=4.6〜5.4` で、
     // 判定は通っているのに横へ出る指令だけが消えていた(成功 0 回の直接原因)。
     // 試行中は、抜き切るか打ち切るまで出した側の offset を保持する。
-    if (attempt_active_ && std::abs(target_offset) < pass_gap_ * 0.5 &&
+    if (attempt_active_ && std::abs(c.target_offset) < pass_gap_ * 0.5 &&
         std::abs(attempt_offset_) > 1e-3) {
       double held = attempt_offset_;
       // 保持する場合も壁だけは避ける。
@@ -2715,9 +2966,16 @@ private:
         }
       }
       if (std::abs(held) > pass_gap_ * 0.5) {
-        target_offset = held;
+        c.target_offset = held;
       }
     }
+  }
+
+  // 追い越しの試行・成功・失敗を数えてログに残す。sweep.sh がこれを集計する。
+  void recordAttempt(const Frame & f, PlanCtx & c)
+  {
+    const double total = f.total;
+    const rclcpp::Time now = f.now;
 
     // --- 追い越しの試行と結果を記録する
     // 「横に出て抜きにいった」を試行開始、「相手を前後で追い越した」を成功、
@@ -2729,23 +2987,23 @@ private:
       // 「試行47回・成功0回」のような数字になり、何が本当の仕掛けか読めなかった。
       // pass_gap の 70%(1.9m -> 1.33m)まで寄せる指令が出て初めて試行とみなす。
       const bool moving_out = std::abs(pass_sep_) > pass_gap_ * 0.7;
-      if (!attempt_active_ && moving_out && !blocker.empty()) {
+      if (!attempt_active_ && moving_out && !c.blocker.empty()) {
         attempt_active_ = true;
-        attempt_target_ = blocker;
+        attempt_target_ = c.blocker;
         attempt_start_ = now.seconds();
         attempt_boosts_ = boost_used_;
-        attempt_offset_ = target_offset;
+        attempt_offset_ = c.target_offset;
         attempt_fail_since_ = -1.0;
         attempt_lead_cnt_ = 0;
         attempt_diff0_ = 1e18;
         attempt_max_sep_ = 0.0;
         attempt_latok_ = false;
         RCLCPP_INFO(get_logger(), "追越試行 開始 target=%s 車間=%.1fm rank=%d",
-                    blocker.c_str(), best_gap, rank_);
+                    c.blocker.c_str(), c.best_gap, rank_);
       } else if (attempt_active_) {
         // 前方車が見えている間は保持値を最新の指令で更新する
         if (moving_out) {
-          attempt_offset_ = target_offset;
+          attempt_offset_ = c.target_offset;
         }
         // 対象車が自分より後ろに回ったら成功。
         // 累積進行度の差をそのまま見ると、周回のまたぎで一時的に大きく振れて
@@ -2851,28 +3109,41 @@ private:
       }
     }
 
+  }
+
+  // 衝突回避層の結果を最優先で指令へ反映する。
+  // 追い越しの都合より当たらないことを優先する(Crash 10秒 / Wall 5秒)。
+  void applyAvoidance(const Frame & f, PlanCtx & c)
+  {
+    const rclcpp::Time now = f.now;
+
     // --- 衝突回避を最優先で適用する
     // 追い越しの都合より、当たらないことを優先する。
     // Crash は 10 秒 5km/h、Wall は 5 秒 5km/h と罰則が重く、
     // 追い越し1回の利得より損失が大きい。
-    dbg_avoid_offset_ = avoid_offset;
-    dbg_avoid_cap_ = avoid_speed_cap;
-    if (std::abs(avoid_offset) > 1e-3) {
-      target_offset = avoid_offset;
-      if (blocker.empty()) {
-        blocker = "回避";
+    dbg_avoid_offset_ = c.avoid_offset;
+    dbg_avoid_cap_ = c.avoid_speed_cap;
+    if (std::abs(c.avoid_offset) > 1e-3) {
+      c.target_offset = c.avoid_offset;
+      if (c.blocker.empty()) {
+        c.blocker = "回避";
       }
     }
-    if (avoid_speed_cap >= 0.0) {
-      speed_cap = (speed_cap < 0.0) ? avoid_speed_cap
-                                    : std::min(speed_cap, avoid_speed_cap);
+    if (c.avoid_speed_cap >= 0.0) {
+      c.speed_cap = (c.speed_cap < 0.0) ? c.avoid_speed_cap
+                                    : std::min(c.speed_cap, c.avoid_speed_cap);
       if ((this->now() - last_avoid_log_).seconds() > 2.0) {
         last_avoid_log_ = this->now();
         RCLCPP_INFO(get_logger(), "衝突回避 減速=%.1fkm/h 横=%.2fm",
-                    avoid_speed_cap * 3.6, avoid_offset);
+                    c.avoid_speed_cap * 3.6, c.avoid_offset);
       }
     }
+  }
 
+  // 追い越し試行中は「寄ると決めた側」を保持しきる(ユーザー方針)。
+  // 一度寄る方向を決めたら、抜き切るか失敗が確定するまで戻さない。
+  void holdAttemptSide(PlanCtx & c)
+  {
     // --- 試行中は「寄ると決めた側」を保持しきる(ユーザー方針)
     //
     // 「抜こうとするときは左右どちらかに寄っておく。一度寄る方向を決めたら
@@ -2890,15 +3161,27 @@ private:
     // ここでは「試行中は side_sign_ の側へ最低 attempt_hold_sep だけ寄せる」
     // を最後に上書きする。試行が終わる(成功・失敗・打切)まで解かない。
     // 壁は下の帯クランプが必ず効くので、寄せ続けても壁には当たらない。
-    if (attempt_hold_side_ && attempt_active_ && !blocker.empty()) {
+    if (attempt_hold_side_ && attempt_active_ && !c.blocker.empty()) {
       const double want = side_sign_ * attempt_hold_sep_;
       // コリドアの余地には従う(壁側へは出ない)
       const double held = std::clamp(want, room_lo_, room_hi_);
       // すでに同じ側へ十分寄っているならそのまま。足りないときだけ引き上げる。
-      if (side_sign_ * target_offset < side_sign_ * held) {
-        target_offset = held;
+      if (side_sign_ * c.target_offset < side_sign_ * held) {
+        c.target_offset = held;
       }
     }
+  }
+
+  // 壁を最優先で避ける。避けきれないときだけ相手側へ寄る。
+  // ここは横目標を決める最後の段。以降はレート制限を掛けて出すだけ。
+  void avoidWall(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // ===================================================================
     // --- 壁を最優先で避ける。避けきれないときだけ相手側へ寄る
@@ -2959,18 +3242,18 @@ private:
       // 罰則で比べれば答えは明らか。Wall は 5秒 5km/h、Crash は 10秒 5km/h。
       // しかも壁は掠める程度なら当たらずに済むが、正面の停止車には確実に当たる。
       // **壁ぎりぎりを通るほうが安い。**
-      if (stop_avoid_active) {
+      if (c.stop_avoid_active) {
         margin = std::min(margin, wall_margin_stopped_);
       }
       // 帯は必ず走行ラインを含める(142 の失敗を繰り返さない)
       double wall_lo = std::min(corridor_.lo[ei] + margin, 0.0);
       double wall_hi = std::max(corridor_.hi[ei] - margin, 0.0);
       if (wall_hi > wall_lo) {
-        const double want = target_offset;
+        const double want = c.target_offset;
         const double safe = std::clamp(want, wall_lo, wall_hi);
         // まず横目標は必ず帯の中に収める。これだけで「壁へ寄せる指令」は出なくなる。
         // 単独走行(他車なし)ではここで終わり。減速は一切しない。
-        target_offset = safe;
+        c.target_offset = safe;
         const bool pushed_to_wall = std::abs(want - safe) > 1e-3;
 
         // --- 停止車を避けきれないなら減速する(ユーザー指示)
@@ -2985,15 +3268,15 @@ private:
         //
         // 潰されたということは、その停止車の脇は通れないということ。
         // 「通れない -> 手前で止まる」の経路(act="停止")と同じ扱いにする。
-        if (stop_avoid_active && std::abs(want - safe) > stop_avoid_crush_) {
-          speed_cap = (speed_cap < 0.0) ? stop_avoid_v_stop
-                                        : std::min(speed_cap, stop_avoid_v_stop);
+        if (c.stop_avoid_active && std::abs(want - safe) > stop_avoid_crush_) {
+          c.speed_cap = (c.speed_cap < 0.0) ? c.stop_avoid_v_stop
+                                        : std::min(c.speed_cap, c.stop_avoid_v_stop);
           if ((this->now() - last_crush_log_).seconds() > 1.0) {
             last_crush_log_ = this->now();
             RCLCPP_WARN(get_logger(),
                         "停止車を避けきれない 横目標 %.2f が壁帯[%.2f,%.2f]で "
                         "%.2f に潰された -> 上限 %.1fkm/h へ減速",
-                        want, wall_lo, wall_hi, safe, stop_avoid_v_stop * 3.6);
+                        want, wall_lo, wall_hi, safe, c.stop_avoid_v_stop * 3.6);
           }
         }
         if (pushed_to_wall) {
@@ -3031,13 +3314,13 @@ private:
             // 横に並んでいる相手なので寄っても Crash にならない。
             // 壁から離れる向きへ、相手との間隔を crash_safe_sep まで詰めてよい。
             const double toward = nearest_lat + crash_safe_sep_ * wall_dir;
-            target_offset = std::clamp(toward, wall_lo, wall_hi);
+            c.target_offset = std::clamp(toward, wall_lo, wall_hi);
             if ((this->now() - last_wallpick_log_).seconds() > 1.0) {
               last_wallpick_log_ = this->now();
               RCLCPP_INFO(get_logger(),
                           "壁回避 相手側へ寄る 横目標 %.2f -> %.2f (壁側=%s "
                           "相手横=%.2f 自車横=%.2f 帯=[%.2f,%.2f])",
-                          want, target_offset, wall_dir > 0 ? "左" : "右",
+                          want, c.target_offset, wall_dir > 0 ? "左" : "右",
                           nearest_lat, my_lat_for_target_, wall_lo, wall_hi);
             }
           } else if (have_car && crash_risk) {
@@ -3049,27 +3332,44 @@ private:
             // 速度プロファイルの値を基準にして、掛け算が累積しないようにする。
             const double base = std::max<double>(in.points[ei].longitudinal_velocity_mps, 0.0);
             const double slow = std::max(base * wall_brake_ratio_, min_follow_speed_);
-            speed_cap = (speed_cap < 0.0) ? slow : std::min(speed_cap, slow);
+            c.speed_cap = (c.speed_cap < 0.0) ? slow : std::min(c.speed_cap, slow);
             if ((this->now() - last_wallpick_log_).seconds() > 1.0) {
               last_wallpick_log_ = this->now();
               RCLCPP_INFO(get_logger(),
                           "壁回避 減速で両方避ける 横目標 %.2f -> %.2f 上限 %.1fkm/h "
                           "(壁側=%s 前に相手あり)",
-                          want, target_offset, slow * 3.6, wall_dir > 0 ? "左" : "右");
+                          want, c.target_offset, slow * 3.6, wall_dir > 0 ? "左" : "右");
             }
           }
         }
       }
     }
 
+  }
+
+  // 決まった横目標へ、レート制限つきで現在のオフセットを近づける。
+  void applyOffsetRateLimit(PlanCtx & c)
+  {
     // --- オフセットをレート制限つきで目標へ動かす
     const double dt = 0.05;
     const double step = offset_rate_ * dt;
-    if (target_offset > offset_) {
-      offset_ = std::min(target_offset, offset_ + step);
+    if (c.target_offset > offset_) {
+      offset_ = std::min(c.target_offset, offset_ + step);
     } else {
-      offset_ = std::max(target_offset, offset_ - step);
+      offset_ = std::max(c.target_offset, offset_ - step);
     }
+
+  }
+
+  // 横オフセットを乗せた軌道を作り、順位に応じた速度上限を掛けて publish する。
+  void publishTrajectory(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const std::vector<double> & s = f.s;
+    const size_t n = f.n;
+    const double total = f.total;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 軌道を作り直す
     Trajectory out = in;
@@ -3135,7 +3435,7 @@ private:
       }
     }
 
-    if (speed_cap >= 0.0) {
+    if (c.speed_cap >= 0.0) {
       // 自車の前方だけ速度を抑える。後方まで下げるとレース全体が遅くなる
       for (size_t k = 0; k < n; ++k) {
         const size_t i = (ei + k) % n;
@@ -3147,9 +3447,12 @@ private:
           break;
         }
         out.points[i].longitudinal_velocity_mps =
-          std::min<double>(out.points[i].longitudinal_velocity_mps, speed_cap);
+          std::min<double>(out.points[i].longitudinal_velocity_mps, c.speed_cap);
       }
     }
+
+    // 次の層(manageBoost)が使うので、自車地点の目標速度を残す。
+    c.ego_target_speed = out.points[ei].longitudinal_velocity_mps;
 
     out.header.stamp = this->now();
     pub_->publish(out);
@@ -3158,6 +3461,19 @@ private:
       ov.data = attempt_active_;
       overtaking_pub_->publish(ov);
     }
+  }
+
+  // 残ったブーストの使い道を決めて発射する。
+  // ブーストは 0.0 に戻してから 1.0 に立ち上げる必要がある(公式仕様)ので
+  // 2周期かけて撃つ。
+  void manageBoost(const Frame & f, PlanCtx & c)
+  {
+    const Trajectory & in = f.in;
+    const size_t n = f.n;
+    const double ex = f.ex;
+    const double ey = f.ey;
+    const size_t ei = f.ei;
+    const rclcpp::Time now = f.now;
 
     // --- 残ったブーストの使い道 ---
     // ブーストは最高速ではなく「加速度 +0.5 m/s^2 を10秒」上げるだけなので、
@@ -3200,7 +3516,7 @@ private:
       // OR にしていたため、実測では 速度1.5m/s・前が1.2m の状態で成立し、
       // 前がつかえたまま撃って丸損した。動き出していて、かつ前が空いている
       // ことの両方を要求する。
-      if (v_now_push > 1.5 && best_gap > 5.0) {
+      if (v_now_push > 1.5 && c.best_gap > 5.0) {
         start_push = true;
       }
     }
@@ -3211,7 +3527,7 @@ private:
       const double my_v = odom_->twist.twist.linear.x;
       // 到達できる速度は「その地点の目標」と「順位のハンデ」の小さい方。
       // 追い越し判定と同じ考え方にそろえる。
-      const double want_v = out.points[ei].longitudinal_velocity_mps;
+      const double want_v = c.ego_target_speed;
       double rank_cap = ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
       // ハンデが効いていない場面(handicap off の計測など)では、現在速度が
       // 上限を超えている。そのときは上限として扱わない。
@@ -3223,7 +3539,7 @@ private:
                                  v_reach - my_v > free_boost_headroom_;
 
       // (a) 後ろから詰められているか(このサイクルの頭で求めてある)
-      const bool pressed = pressed_from_behind;
+      const bool pressed = c.pressed_from_behind;
       // (b) 終盤か
       // 「最終ラップだけ」にすると、2個を使い切る前にレースが終わる。
       // 実測では 2個目が7周目(=完走後)に撃たれて丸ごと無駄になっていた。
@@ -3278,7 +3594,7 @@ private:
       // どちらかにする。実測では前が詰まったまま(前方空き0)撃って丸損していた。
       // 一方で完全に切ると単独走行でブーストが1発も出ず、
       // タイムが 212.63 -> 214.42 秒に落ちた(ベスト周 34.83 -> 35.37)。
-      const bool clear_ok = ahead_clear && blocker.empty();
+      const bool clear_ok = ahead_clear && c.blocker.empty();
       // スタート直後の1本は「直線か」「加速余地があるか」も問わない。
       //
       // 狙いは合図と同時に前へ出ることなので、条件を待った時点で意味を失う。
@@ -3335,13 +3651,20 @@ private:
     } else if (!want_boost_) {
       boost_armed_ = false;
     }
+  }
 
-    if (!blocker.empty() && (this->now() - last_log_).seconds() > 1.0) {
+  // 前をふさいでいる相手の状況を1秒に1回だけ出す。
+  void logBlocker(const Frame & f, PlanCtx & c)
+  {
+    const double ev = f.ev;
+    const rclcpp::Time now = f.now;
+
+    if (!c.blocker.empty() && (this->now() - last_log_).seconds() > 1.0) {
       last_log_ = this->now();
       RCLCPP_INFO(
         get_logger(), "前方 %s まで %.1f m / 横オフセット %.2f -> %.2f m / 速度上限 %.1f km/h",
-        blocker.c_str(), best_gap, offset_, target_offset,
-        speed_cap >= 0 ? speed_cap * 3.6 : -1.0);
+        c.blocker.c_str(), c.best_gap, offset_, c.target_offset,
+        c.speed_cap >= 0 ? c.speed_cap * 3.6 : -1.0);
       (void)ev;
     }
   }
