@@ -71,6 +71,13 @@ private:
   // 前進中に他車へ近づいたら引き直す。引き直したら true。
   bool replanIfCarNear(const recovery::Pose & p, const recovery::Phase & ph,
                        const rclcpp::Time & now);
+  // 前後を切り替える前に止まりきる。まだ止まりきっていなければ true。
+  bool runBraking(const rclcpp::Time & now);
+  // 後方に余地が無いときの待ち/後退量の調整。値があれば runRecovery はそれを返す。
+  std::optional<bool> waitForRearRoom(const recovery::Phase & ph, const rclcpp::Time & now);
+  // 停滞していたら計画を引き直す。値があれば runRecovery はそれを返す。
+  std::optional<bool> handleStall(const recovery::Pose & p, const recovery::Phase & ph,
+                                  const rclcpp::Time & now);
   // 復帰の前進区間を軌道として publish する。戻せたら true。
   bool publishRecoveryTrajectory();
   // 自車の横位置とその地点のコリドア境界を返す。コリドアが無ければ false。

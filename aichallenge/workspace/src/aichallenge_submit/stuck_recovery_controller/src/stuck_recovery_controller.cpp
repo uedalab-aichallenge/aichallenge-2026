@@ -1261,44 +1261,12 @@ bool StuckRecoveryController::replanIfCarNear(
   return false;
 }
 
-bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
+// 前後を切り替える前に止まりきる。まだ止まりきっていなければ true。
+//
+// 舵は前の区間のまま保つ。ここで舵を先に動かすと、惰性で動いている間に
+// 逆向きに回ってしまう。
+bool StuckRecoveryController::runBraking(const rclcpp::Time & now)
 {
-  if (!recovery_start_time_.has_value()) { return false; }
-  const double total = (now - recovery_start_time_.value()).seconds();
-  if (total > kRecoveryMaxSec) {
-    RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
-                kRecoveryMaxSec, situation_.c_str());
-    finishRecovery(now);
-    return false;
-  }
-
-  recovery::Pose p;
-  if (!currentPose(p)) { return false; }
-
-  // 走った距離を積む
-  if (last_valid_) {
-    phase_travelled_ += std::hypot(p.x - last_x_, p.y - last_y_);
-  }
-  last_x_ = p.x;
-  last_y_ = p.y;
-  last_valid_ = true;
-
-  if (tryHandBack(p, now, total)) { return false; }
-
-  
-
-  if (desperate_) { runDesperate(p, now); return true; }
-
-  if (!plan_.valid || phase_idx_ >= plan_.phases.size()) {
-    const auto done = replanOrEscalate(p, now);
-    if (done.has_value()) { return done.value(); }
-  }
-
-  const auto & ph = plan_.phases[phase_idx_];
-
-  // 前後を切り替える前に止まりきる。
-  // 舵は前の区間のまま保つ。ここで舵を先に動かすと、惰性で動いている間に
-  // 逆向きに回ってしまう。
   if (braking_) {
     const double bt = (now - brake_since_).seconds();
     if (std::abs(latest_velocity_) < kBrakeDoneSpeed || bt > kBrakeMaxSec) {
@@ -1314,7 +1282,19 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
     stall_since_ = now;   // 止まろうとしている間は停滞とみなさない
     return true;
   }
+  return false;
+}
 
+// 後ろに車がいて、この区間で下がる距離が確保できないときの扱い。
+//
+// 下がって当てると Crash(10秒)を食らううえ、同じ相手に再衝突しやすい。
+// ただし相手も詰まっていれば永久に退かないので、待ち続けるのではなく
+// 空いている距離へ後退量を合わせる。
+//
+// 戻り値: 値があれば runRecovery はそれをそのまま返す。nullopt なら先へ進む。
+std::optional<bool> StuckRecoveryController::waitForRearRoom(
+  const recovery::Phase & ph, const rclcpp::Time & now)
+{
   // 後ろに車がいて、この区間で下がる距離が確保できないなら待つ。
   // 下がって当てると Crash(10秒) を食らううえ、同じ相手に再衝突しやすい。
   // ただし計画時点で後方の余裕を上限にしているので、ここで待つのは
@@ -1399,15 +1379,19 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   // この復帰が終わるまで保持する。ここで戻すと基準が元に戻り、
   // また待機に入ってタイマーがリセットされる無限ループになる。
   rear_waiting_ = false;
+  return std::nullopt;
+}
 
-  if (replanIfWallNear(p, ph, now)) { return true; }
-
-  if (replanIfCarNear(p, ph, now)) { return true; }
-
-  // 動けていないなら計画を引き直す。同じ指令を出し続けても出られない。
-  // ただし、区間を始めた直後とギアを入れ替えた直後は数に入れない。
-  // 停止 -> ギア切替 -> 舵を入れる までに 1 秒近くかかるので、
-  // そこを停滞と数えると計画を一度も実行しないまま向きだけ反転し続ける。
+// 動けていないなら計画を引き直す。同じ指令を出し続けても出られない。
+//
+// ただし区間を始めた直後とギアを入れ替えた直後は数に入れない。
+// 停止 -> ギア切替 -> 舵を入れる までに 1 秒近くかかるので、そこを停滞と
+// 数えると計画を一度も実行しないまま向きだけ反転し続ける。
+//
+// 戻り値: 値があれば runRecovery はそれをそのまま返す。nullopt なら先へ進む。
+std::optional<bool> StuckRecoveryController::handleStall(
+  const recovery::Pose & p, const recovery::Phase & ph, const rclcpp::Time & now)
+{
   const double since_phase = (now - phase_start_).seconds();
   const double since_gear = (now - gear_changed_).seconds();
   const bool warming_up = since_phase < kPhaseMinSec || since_gear < kActuatorWaitMax;
@@ -1457,6 +1441,59 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
       makePlan(now, want);
       return true;
     }
+  }
+  return std::nullopt;
+}
+
+bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
+{
+  if (!recovery_start_time_.has_value()) { return false; }
+  const double total = (now - recovery_start_time_.value()).seconds();
+  if (total > kRecoveryMaxSec) {
+    RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
+                kRecoveryMaxSec, situation_.c_str());
+    finishRecovery(now);
+    return false;
+  }
+
+  recovery::Pose p;
+  if (!currentPose(p)) { return false; }
+
+  // 走った距離を積む
+  if (last_valid_) {
+    phase_travelled_ += std::hypot(p.x - last_x_, p.y - last_y_);
+  }
+  last_x_ = p.x;
+  last_y_ = p.y;
+  last_valid_ = true;
+
+  if (tryHandBack(p, now, total)) { return false; }
+
+  
+
+  if (desperate_) { runDesperate(p, now); return true; }
+
+  if (!plan_.valid || phase_idx_ >= plan_.phases.size()) {
+    const auto done = replanOrEscalate(p, now);
+    if (done.has_value()) { return done.value(); }
+  }
+
+  const auto & ph = plan_.phases[phase_idx_];
+
+  if (runBraking(now)) { return true; }
+
+  {
+    const auto done = waitForRearRoom(ph, now);
+    if (done.has_value()) { return done.value(); }
+  }
+
+  if (replanIfWallNear(p, ph, now)) { return true; }
+
+  if (replanIfCarNear(p, ph, now)) { return true; }
+
+  {
+    const auto done = handleStall(p, ph, now);
+    if (done.has_value()) { return done.value(); }
   }
 
   // 区間を走り切ったら次へ。ただし前後が入れ替わるなら先に止まりきる。
