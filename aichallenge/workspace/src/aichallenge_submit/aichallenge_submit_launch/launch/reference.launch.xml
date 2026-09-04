@@ -43,6 +43,31 @@
        description="必要距離に掛ける安全率"/>
   <arg name="zone_fallback_enable" default="$(env ZONE_FALLBACK false)"
        description="予測計画が無いとき汎用ゾーンで仕掛けてよいか"/>
+  <!-- 公式オーバーテイクレーン(SIM決勝の s2r-final のみ有効)。
+       位置は AWSIM のシーンから実測: レースライン idx234-21 の右 2.15〜5.0m。
+       local_script/overtaking_zone.py で再取得できる。 -->
+  <!-- latch で「禁止区間」「側の余地なし」を越えない。玉突きの最初の1台が
+       latch で最狭部と禁止区間へ入って壁に刺さったため(2026-09-05 実測)。 -->
+  <!-- 停止車回避の判定の作り直し(壁帯を抜け切るまでの最狭で見る / 横の到達可能性 /
+       通れないのラッチ / 最大制動)。2026-09-05 実測の玉突き対策。 -->
+  <arg name="stop_avoid_fix" default="$(env STOP_AVOID_FIX true)"
+       description="停止車回避の判定を作り直したものを使うか"/>
+  <arg name="latch_never_no_pass" default="$(env LATCH_HARD false)"
+       description="禁止区間と側の余地なしは latch で越えない"/>
+  <arg name="ot_lane_guard" default="$(env OT_LANE_GUARD_ON true)"
+       description="低速でオーバーテイクレーンへ入らないガード(常時有効)"/>
+  <arg name="ot_lane_enable" default="$(env OT_LANE false)"
+       description="公式オーバーテイクレーンを追い越しに使うか"/>
+  <arg name="ot_lane_zones" default="$(env OT_LANE_ZONES 234:21)"
+       description="オーバーテイクレーンの idx 範囲"/>
+  <arg name="ot_lane_min_kmh" default="$(env OT_LANE_MIN 28.0)"
+       description="レーンを使うのに要る自車速度[km/h]。27がルール上の閾値"/>
+  <arg name="ot_lane_guard_lat" default="$(env OT_LANE_GUARD 2.0)"
+       description="上記未満のときレーン側(右)へ許す最大量[m]"/>
+  <arg name="ot_lane_side_right" default="$(env OT_LANE_SIDE true)"
+       description="レーン内では側を右に固定するか"/>
+  <arg name="no_pass_zones" default="$(env NO_PASS_ZONES 18:30,89:95)"
+       description="追い越し禁止区間。既定の 18:30 はレーン出口(18-21)と重なる"/>
   <arg name="leader_pass_last_laps" default="$(env LEADER_PASS_LAST_LAPS 0)"
        description="先頭を抜いてよい残り周回数(0で無効)"/>
   <arg name="rank2_corner_gain" default="1.00" description="2位以下のときコーナー速度に掛ける係数"/>
@@ -306,6 +331,15 @@
             <param name="spot_pass_len_gain" value="$(var spot_pass_len_gain)"/>
             <param name="spot_need_margin" value="$(var spot_need_margin)"/>
             <param name="zone_fallback_enable" value="$(var zone_fallback_enable)"/>
+            <param name="stop_avoid_fix" value="$(var stop_avoid_fix)"/>
+            <param name="latch_never_no_pass" value="$(var latch_never_no_pass)"/>
+            <param name="ot_lane_guard" value="$(var ot_lane_guard)"/>
+            <param name="ot_lane_enable" value="$(var ot_lane_enable)"/>
+            <param name="ot_lane_zones" type="str" value="$(var ot_lane_zones)"/>
+            <param name="ot_lane_min_kmh" value="$(var ot_lane_min_kmh)"/>
+            <param name="ot_lane_guard_lat" value="$(var ot_lane_guard_lat)"/>
+            <param name="ot_lane_side_right" value="$(var ot_lane_side_right)"/>
+            <param name="no_pass_zones" type="str" value="$(var no_pass_zones)"/>
             <param name="leader_pass_last_laps" value="$(var leader_pass_last_laps)"/>
             <param name="rank1_corner_gain" value="$(var rank1_corner_gain)"/>
             <param name="rank2_corner_gain" value="$(var rank2_corner_gain)"/>

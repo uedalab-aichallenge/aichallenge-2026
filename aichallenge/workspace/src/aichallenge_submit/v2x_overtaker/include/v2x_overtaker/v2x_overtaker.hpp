@@ -509,6 +509,10 @@ private:
   bool boostLapOk() const { return !lap_gate_enable_ || lap_ >= boost_min_lap_; }
   void planOvertake(const Frame & f, PlanCtx & c);
   void preventRearEnd(const Frame & f, PlanCtx & c);
+  // 指定 idx が公式オーバーテイクレーンの中か。
+  bool inOtLane(std::size_t idx) const;
+  // いま公式オーバーテイクレーンを使ってよいか(位置と自車速度で判定)。
+  bool otLaneUsable(std::size_t idx) const;
   void avoidStoppedCars(const Frame & f, PlanCtx & c);
   void avoidCollision(const Frame & f, PlanCtx & c);
   void repulseFromNearCars(const Frame & f, PlanCtx & c);
@@ -945,6 +949,57 @@ private:
   const bool attempt_require_intent_;
   // latch に追い越しの「許可」を持たせるか。false なら latch は横位置の保持だけ。
   const bool latch_allow_enable_;
+  // latch は「横に出続けてよい」を保持するための仕組みだが、許可(allow)まで
+  // 持たせているため、**許可が下りない理由が安全に直結するものでも継続する**。
+  //
+  // 【実測(20260905-012703 d1、玉突きの最初の1台)】
+  //   19.2s latchで継続 allow_base落ち=ゾーン外 幅=2.60(要1.80)
+  //   21.2s latchで継続 allow_base落ち=禁止区間 idx=91
+  //   22.5s stuck detected 横=-1.31 [-0.45,3.600] 領域外  <- 走行可能領域の外で壁に食い込む
+  // latch が許可の下りない追い越しをコース最狭部(幅2.60m)と
+  // 自前の追い越し禁止区間(idx89-95)へ運び込み、そこで壁に刺さった。
+  //
+  // 2026-09-03 の計測では「latch 継続 451窓 = 走行時間の24.9%、
+  // その内訳 ゾーン外185 / 側の余地なし111 / 速度差不足88 / 禁止区間55」で、
+  // **「側の余地なし」と「禁止区間」だけが安全に直結する**と分かっている。
+  // latch を全部外す A/B は結論が出なかったので、この2つだけ外す。
+  const bool latch_never_no_pass_;   // 禁止区間と側の余地なしは latch で越えない
+
+  // --- 停止車回避の判定の作り直し(2026-09-05) ---
+  //
+  // 【実測(20260905-012703 d2 の接近)】
+  //   39.0m 空き幅2.95m -> 通過(上限なし)
+  //   21.8m 空き幅3.31m -> 通過(上限なし)
+  //   11.3m 空き幅3.25m -> 通過(上限なし)
+  //    6.8m 横目標2.34 が壁帯[-1.60,0.40]で0.40に潰された -> 上限8.6km/h
+  //    2.6m 空き幅1.69m -> 通過(上限なし)      <- 解除される
+  //   TTC0.68s 正面衝突を回避
+  //
+  // 原因は3つ。
+  //  (1) 壁の走行可能帯を**停止車の地点だけ**で見ている。抜け切るまでの
+  //      区間で最も狭いところを見ていないので、存在しない経路に全開で向かう。
+  //  (2) **横位置が実現するまでの距離を見ていない。** 横位置は指令から
+  //      約20m走ってから実現する(offset_rate 1.2m/s の他に追従遅れ)。
+  //      36km/h で 1m 寄せるには rate だけで 8.3m、遅れを足すと約28m 要る。
+  //      6.8m 手前で気づく設計では制御上間に合わない。
+  //  (3) 判定に履歴が無く毎周期やり直すので、上限が「なし→8.6→なし」と振動する。
+  //
+  // 直し方は3つに対応させる。設計は ChatGPT にも相談した
+  // (`work/chatgpt_avoid_20260905.txt`)。
+  const bool stop_avoid_fix_;        // この作り直しを使うか
+  const double stop_avoid_span_;     // 壁帯を最狭で見る s 区間の長さ[m]
+  const double stop_avoid_lat_lag_;  // 横位置が実現するまでの距離[m]
+  const double stop_avoid_emg_margin_;  // 緊急制動の判定に足す余裕[m]
+  const double stop_avoid_emg_accel_;   // 緊急制動で見込む減速度[m/s^2]
+  // 「通れない」と決めた状態のラッチ。抜け切るか止まるまで解除しない。
+  std::string stop_nopass_target_;
+  bool stop_nopass_latched_{false};
+  rclcpp::Time last_stop_fix_log_{0, 0, RCL_ROS_TIME};
+  // ラッチした対象を最後に見た時刻。抜け切ると探索対象から外れて
+  // `stopped` が空になり、解除処理自体が走らなくなる
+  // (外部レビュー レビュー 2026-09-05: 同じ名前の車が次周も停止していると
+  //  古いラッチがそのまま効いてしまう)。時刻で切る。
+  rclcpp::Time stop_nopass_seen_{0, 0, RCL_ROS_TIME};
   const double attempt_infeasible_time_;   // 継続不能が続いたら打ち切る秒数(0で無効)
   const double attempt_wall_look_time_;    // 壁余裕を見る先読み時間[s]
   const double attempt_wall_abort_clear_;  // これを下回ったら「壁に当たる」[m]
@@ -1077,6 +1132,20 @@ private:
   const int teammate_pass_lap_;  // P1 が僚車を抜き始める周回(0起点)
   const int leader_pass_last_laps_;  // 先頭を抜いてよい残り周回数(0で無効)
   const bool zone_fallback_enable_;  // 予測計画が無いとき汎用ゾーンで仕掛けてよいか
+  // --- 公式のオーバーテイクレーン(SIM決勝で追加。s2r-final のみ有効) ---
+  // AWSIM のシーン(level1)から実測した位置: レースライン idx234-21、
+  // 自車ラインの右 2.15〜5.0m、幅 2.5m x 長さ 36m。走行可能幅は 2.2〜2.5m。
+  // ルール: 車体全体がレーン内で 27km/h 以上の車が「アタッカー」。
+  // アタッカーがいる間、レーンに触れている 27km/h 以下の車は3秒以内に
+  // 完全退出しないと BLOCK(20秒間 5km/h 固定)。27km/h 未満での進入も違反。
+  // → **27km/h 以上を出せるときだけ入る**。1位はハンデで 25km/h に固定され
+  //   条件を満たせないので、この一つの条件で自動的に入らなくなる
+  //   (順位推定に依存しない。順位推定はずれることが分かっている)。
+  const bool ot_lane_enable_;      // オーバーテイクレーンを使うか
+  const bool ot_lane_guard_;       // 低速でレーンへ入らないガード(常時有効)
+  const double ot_lane_min_kmh_;   // レーンを使うのに要る自車速度[km/h]
+  const double ot_lane_guard_lat_; // 上記未満のとき許す右への最大量[m]
+  const bool ot_lane_side_right_;  // レーン内では側を右に固定するか
   const bool side_pick_over_curve_;  // 録画で決めた側を曲率より優先するか
   const bool side_pick_by_room_;     // 側を「相手と壁の空き」で決めるか
   const bool side_room_use_min_;     // 側の空きを区間の最小で見るか(falseで平均)
@@ -1413,12 +1482,15 @@ private:
   double my_speed_sum_{0.0};
   int my_speed_cnt_{0};
   rclcpp::Time last_stats_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_ot_lane_log_{0, 0, RCL_ROS_TIME};
   std::vector<std::pair<std::size_t, std::size_t>> boost_zones_;
   std::string no_pass_zone_spec_;
+  std::string ot_lane_zone_spec_;
   std::string right_zone_spec_;
   std::string grid_slot_spec_;
   std::vector<std::pair<double, double>> grid_slots_;  // 記録したグリッド座標
   std::vector<std::pair<std::size_t, std::size_t>> no_pass_zones_;  // 追い越し禁止区間
+  std::vector<std::pair<std::size_t, std::size_t>> ot_lane_zones_;  // 公式オーバーテイクレーン
   std::vector<std::pair<std::size_t, std::size_t>> right_zones_;   // 右から抜く区間
   std::vector<std::pair<std::size_t, std::size_t>> side_pick_zones_;  // 側を録画で決める区間
   double slow_rival_ratio_{0.85};

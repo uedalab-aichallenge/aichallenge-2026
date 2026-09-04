@@ -32,6 +32,18 @@ x-autoware-base: &autoware-base
     # 未設定なら launch 側の既定値が使われるので、通常の実験の条件は変わらない。
     - LEADER_PASS_LAST_LAPS=${LEADER_PASS_LAST_LAPS:-0}
     - ZONE_FALLBACK=${ZONE_FALLBACK:-false}
+    # 公式オーバーテイクレーン(SIM決勝)。既定は無効。A/B で確かめてから入れる。
+    - WALL_FWD_BAN=${WALL_FWD_BAN:-true}
+    - WALL_FWD_BAN_HOLD=${WALL_FWD_BAN_HOLD:-0.8}
+    - STOP_AVOID_FIX=${STOP_AVOID_FIX:-true}
+    - LATCH_HARD=${LATCH_HARD:-false}
+    - OT_LANE_GUARD_ON=${OT_LANE_GUARD_ON:-true}
+    - OT_LANE=${OT_LANE:-false}
+    - OT_LANE_ZONES=${OT_LANE_ZONES:-234:21}
+    - OT_LANE_MIN=${OT_LANE_MIN:-28.0}
+    - OT_LANE_GUARD=${OT_LANE_GUARD:-2.0}
+    - OT_LANE_SIDE=${OT_LANE_SIDE:-true}
+    - NO_PASS_ZONES=${NO_PASS_ZONES:-18:30,89:95}
     - SPOT_ENTRY_GAP=${SPOT_ENTRY_GAP:--1.0}
     - SPOT_PASS_LEN_GAIN=${SPOT_PASS_LEN_GAIN:-1.0}
     - SPOT_NEED_MARGIN=${SPOT_NEED_MARGIN:-1.15}

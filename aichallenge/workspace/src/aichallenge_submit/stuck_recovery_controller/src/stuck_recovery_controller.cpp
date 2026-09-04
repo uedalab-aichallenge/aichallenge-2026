@@ -262,6 +262,15 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   // 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始めるか。
   // false で 2026-09-04 以前の挙動(前進を2秒試してから切り返す)。
   wedge_backward_first_ = declare_parameter<bool>("wedge_backward_first", true);
+  wall_forward_ban_ = declare_parameter<bool>("wall_forward_ban", true);
+  wall_forward_ban_hold_ = declare_parameter<double>("wall_forward_ban_hold", 0.8);
+  wall_forward_ban_gain_ = declare_parameter<double>("wall_forward_ban_gain", 0.03);
+  wall_forward_ban_speed_ = declare_parameter<double>("wall_forward_ban_speed", 1.0);
+  wall_forward_ban_depth_ = declare_parameter<double>("wall_forward_ban_depth", 0.15);
+  reject_car_overlap_plan_ = declare_parameter<bool>("reject_car_overlap_plan", false);
+  RCLCPP_INFO(get_logger(),
+    "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
+    wall_forward_ban_ ? "する" : "しない", wall_forward_ban_hold_, wall_forward_ban_gain_);
   hard_stall_sec_ = declare_parameter<double>("hard_stall_sec", 0.0);
   hard_stall_dist_ = declare_parameter<double>("hard_stall_dist", 0.8);
   const auto raceline = declare_parameter<std::string>("raceline_csv", "");
@@ -700,6 +709,9 @@ void StuckRecoveryController::onNominalCommand(
     crash_me_ = false;
     RCLCPP_WARN(get_logger(), "壁当て(動作確認用) 終了");
   }
+  // 壁への食い込みの観測は、指令の向きに関わらず毎周期更新する。
+  // (外部レビュー レビュー: 前進指令中だけ更新すると古い経過時間が残る)
+  updateWallBanState();
   if (runRecovery(now)) {
     return;
   }
@@ -707,7 +719,7 @@ void StuckRecoveryController::onNominalCommand(
   // ギアはこちらが持っているので、向きの管理は従来どおり。
   // **前進の判定より先に見る**(前進用の指令を後退中に流さないため)。
   if (recovery_start_time_.has_value() && reverse_following_ && !traj_giveup_) {
-    if (reverse_cmd_) { control_pub_->publish(*reverse_cmd_); return; }
+    if (reverse_cmd_) { publishFiltered(*reverse_cmd_); return; }
     // 後退用の指令がまだ届いていないなら止めておく(前進用を流さない)
     publishCommand(0.0f, 0.0f, msg->lateral.steering_tire_angle);
     return;
@@ -715,7 +727,11 @@ void StuckRecoveryController::onNominalCommand(
   // 復帰の前進区間を経路で渡している間は、pure_pursuit の指令をそのまま通す。
   // 復帰中なので停滞判定は回さない(回すと復帰の最中に再突入してしまう)。
   if (recovery_start_time_.has_value() && traj_following_) {
-    control_pub_->publish(*msg);
+    // 【外部レビュー レビュー 2026-09-05】ここは control_pub_ へ直接流しており、
+    // publishCommand の不変条件を通っていなかった。
+    // **実測で壁を削っていた「復帰 前進を経路で渡す」はこの経路**なので、
+    // 不変条件の穴として最も大きい。フィルタを通す。
+    publishFiltered(*msg);
     return;
   }
   // 停滞候補の間は、これから使う復帰計画の舵角へ先回りして向けておく。
@@ -728,9 +744,9 @@ void StuckRecoveryController::onNominalCommand(
   if (pre_steer_valid_ && std::abs(latest_velocity_) <= kStuckSpeedThreshold) {
     AckermannControlCommand out = *msg;
     out.lateral.steering_tire_angle = static_cast<float>(pre_steer_);
-    control_pub_->publish(out);
+    publishFiltered(out);
   } else {
-    control_pub_->publish(*msg);
+    publishFiltered(*msg);
   }
   updateStuckDetection(*msg, now);
 }
@@ -1088,7 +1104,33 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
                         ? kRearKeepTight : kRearKeep;
   const double rear = rearRoom() - keep;
   const double max_rev = std::clamp(rear, 0.0, 8.0);
-  if (max_rev < 0.75 && first_phase < 0) { first_phase = 0; }
+  // --- バグA の修正(2026-09-05) ---
+  //
+  // 【何が起きていたか】ここは後退できないときに first_phase を -1 から 0 へ
+  // 黙って書き換えていた。0 は「向きの指定なし」なのでプランナは前進を返す。
+  // つまり **「後退から引き直す」という判断が、後方に車がいるだけで
+  // 前進の再試行に化けていた**。
+  //
+  // 【実測(20260905-003852 d1)】後方 1.6m に他車。kRearKeep=2.0 なので
+  //   rear = 1.6 - 2.0 = -0.4 -> max_rev = 0 < 0.75 -> first_phase = 0
+  // その結果 計画2/計画3 が「前進舵+0deg」になり、車は並進せずヨーだけ
+  // 91°→60° 回り、壁への食い込みが -0.40 → -0.76m と悪化し続けた。
+  // ユーザー報告の「謎の前進を繰り返す」はこれ。
+  //
+  // 【直し方】壁へ食い込んでいないときだけ従来どおり緩める。
+  // 食い込んでいるなら前進は物理的に無意味なので、縛りを外さない。
+  // 解が無ければ計画なしで返し、上位が停止を選ぶ(publishCommand の不変条件が
+  // 前進を止めるので、押し付け続ける枝はもう存在しない)。
+  const double clear_at_plan = recovery::wallClearanceAt(obstacles_, veh_, p);
+  if (max_rev < 0.75 && first_phase < 0) {
+    if (clear_at_plan >= 0.0) {
+      first_phase = 0;
+    } else {
+      RCLCPP_WARN(get_logger(),
+        "復帰 後退したいが下がれない(後方の余地 %.2fm)。壁へ %.2fm 食い込んでいるので "
+        "前進へは切り替えない", max_rev, clear_at_plan);
+    }
+  }
   // まず「中断されない経路」を狙って厳しい余裕つきで計画する。
   // それで見つからない場所もあるので、駄目なら現行どおり緩い条件(余裕0)で
   // 引き直す。フォールバック段が複数あるうち、本命(この呼び出し)だけを
@@ -1103,6 +1145,11 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
                            0.0, 0.0);
     plan_strict = false;
   }
+  // 【外部レビュー レビュー 2026-09-05】この段が first_phase を明示的に 0 へ戻すので、
+  // バグA の修正(食い込んでいるときは後退の縛りを外さない)が直後に無効化されていた。
+  // 食い込んでいるときはこの段を飛ばす。前進の解を拾っても壁を押すだけ。
+  // 【計測で戻した 2026-09-05】ここを飛ばすと計画が取れず desperate が増えた。
+  // 食い込んだまま前進する計画は下のバグB の却下で落ちるので、二重に縛らない。
   if (!plan_.valid && first_phase != 0) {
     // 縛ったせいで解が無いなら縛りを外す
     plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
@@ -1143,6 +1190,42 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
                            8.0, cars, 0.0, 0.0, true);
     plan_best_effort = plan_.valid;
   }
+  // --- バグB の修正(2026-09-05) ---
+  //
+  // 【何が起きていたか】総当りのフォールバック(best_effort)は棄却条件を
+  // すべて外すので、**自分の評価が「壁や他車に当たる」と言っている計画**
+  // (余裕が負)を返す。それをそのまま実行していた。
+  //
+  // 【実測(20260905-003852)】
+  //   d1: 計画2「前進舵+0deg」余裕壁-0.67 車-0.74 / 計画3 余裕壁-0.76 車-0.79
+  //   d2: 計画0〜4 がすべて前進で 車-0.90 → -1.05(他車と約1m重なる評価)
+  //       しかも「地図では壁まで 1.21m ある。自己位置推定のずれとみて
+  //       後退を 1.8→3.5→5.2→7.0m 以上にする」と4回対処しているのに、
+  //       返る計画は毎回前進のみ。min_rev は後退区間があるときの下限にしか
+  //       ならないので、この対処は一度も効いていなかった。
+  //
+  // 当たると分かっている前進を出すより、止まって待つほうが常に安い
+  // (壁ペナルティは接触が続く間ずっと加算される。実測 3回で103秒)。
+  // 【外部レビュー レビュー 2026-09-05】ここは `min_wall_clear` しか見ておらず、
+  // ログとコメントが「壁や他車に当たる計画を却下」と書いているのに
+  // **他車の余裕は却下条件に入っていなかった**。
+  // d2 の実測「計画0〜4 がすべて前進で 車-0.90 → -1.05」はこれで通っていた。
+  // 【計測で戻した 2026-09-05】`min_car_clear < 0` も却下すると、計画が取れない
+  // 場面が増えて desperate(後方余裕を無視して ±4m/s で動く)へ落ちる回数が増え、
+  // 4レースで ペナルティ回数 1.58 -> 2.00 / 壁 7.8 -> 12.1s/車レース と退行した。
+  // 指摘(ログは「壁と車」と書いているのに条件は壁だけ)は正しいので、
+  // **フラグとして残す。** 有効にする前に desperate 側の受け皿を安全にすること。
+  if (plan_.valid && !plan_.phases.empty() && plan_.phases.front().forward &&
+      (plan_.min_wall_clear < 0.0 || clear_at_plan < 0.0 ||
+       (reject_car_overlap_plan_ && plan_.min_car_clear < 0.0)))
+  {
+    RCLCPP_WARN(get_logger(),
+      "復帰 前進から始まる計画を却下(見込み余裕 壁%.2f 車%.2f / 現在の食い込み %.2f)。"
+      "当たると分かっている前進は出さない",
+      plan_.min_wall_clear, plan_.min_car_clear, clear_at_plan);
+    plan_.valid = false;
+  }
+
   // 採用した計画が前進区間で見込んだ余裕を、追従中の中断閾値に使えるよう保存する。
   // 計画が取れなかったときは 1e9 のままにして、中断閾値は既定値を使わせる。
   plan_min_wall_clear_ = plan_.valid ? plan_.min_wall_clear : 1e9;
@@ -2020,6 +2103,77 @@ void StuckRecoveryController::finishRecovery(const rclcpp::Time & now)
   recovery_end_time_ = now;
 }
 
+// 壁への食い込みの観測。**前進指令の有無に関わらず毎周期更新する。**
+//
+// 【外部レビュー レビュー 2026-09-05】更新が前進指令中だけだと、停止・後退で壁から
+// 離れても基準と時刻が古いまま残り、次に前進を始めた瞬間に「改善していない」と
+// 判定されて即座に禁止される。脱出の機会を奪うデッドロック要因になる。
+//
+// また `clear >= 0` で即リセットすると、境界付近の自己位置ノイズで
+// 0.8秒の前進許可を何度も取り直せてしまう。解除側にヒステリシスを入れる。
+void StuckRecoveryController::updateWallBanState()
+{
+  if (!wall_forward_ban_) { return; }
+  recovery::Pose p;
+  if (!currentPose(p) || !obstacles_.valid()) { return; }
+  const double clear = recovery::wallClearanceAt(obstacles_, veh_, p);
+  const double t = this->now().seconds();
+  // 解除は「余裕が正側へ十分出た」ときだけ。ゼロ跨ぎのノイズで戻さない。
+  if (clear >= wall_forward_ban_gain_ * 2.0) {
+    wall_ban_since_ = -1.0;
+    wall_ban_ref_clear_ = 1e9;
+    return;
+  }
+  if (clear >= 0.0) { return; }   // 0 付近は状態を保持(進めも戻しもしない)
+  // 地図誤差の範囲の食い込みでは効かせない。実測の破綻ケースは 0.40〜0.76m。
+  if (clear > -wall_forward_ban_depth_) { return; }
+  if (wall_ban_since_ < 0.0 || clear > wall_ban_ref_clear_ + wall_forward_ban_gain_) {
+    wall_ban_since_ = t;
+    wall_ban_ref_clear_ = clear;
+  }
+}
+
+// 壁へ食い込んだまま前進し続けない(絶対の不変条件)。
+//
+// 【なぜ絶対にするか】運営アナウンス(2026-09-03):
+//   「実機は一度壁にぶつかったままアクセルを踏み続けると再起不能(≒最下位)」
+// SIM でも最大の損失だった(決勝条件の4台走行で壁ペナルティ3台合計193秒、
+// うち1台は3回で103秒。wall は接触が続く間ずっと加算される)。
+//
+// 一律禁止ではなく **「食い込んでいて、かつ改善していないなら禁止」**。
+// 斜めに刺さっている場合は前進で抜けられるので、改善している間は通す。
+void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceleration)
+{
+  if (!wall_forward_ban_ || speed <= 0.05f) { return; }
+  // **走っている車には効かせない。** 押し付けられて動けない状態が前提であり、
+  // 走行中に壁を掠めた程度でスロットルを切ると、コース上に停止して
+  // 全車の玉突きを招く(2026-09-05 に実測。1レースで4台全滅)。
+  if (std::abs(latest_velocity_) >= wall_forward_ban_speed_) { return; }
+  if (wall_ban_since_ < 0.0) { return; }
+  const double held = this->now().seconds() - wall_ban_since_;
+  if (held <= wall_forward_ban_hold_) { return; }
+  if ((this->now() - last_wall_ban_log_).seconds() > 1.0) {
+    last_wall_ban_log_ = this->now();
+    RCLCPP_WARN(get_logger(),
+      "壁へ %.2fm 食い込んだまま %.1fs 改善しない。前進を止める "
+      "(指令 %.2fm/s -> 0 実速度 %.2fm/s)。実機ではこの前進継続が再起不能になる",
+      wall_ban_ref_clear_, held, static_cast<double>(speed), latest_velocity_);
+  }
+  speed = 0.0f;
+  acceleration = kBrakeAccel;
+}
+
+// control_pub_ への唯一の出口。素通しの指令もここを通す。
+void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
+{
+  float speed = cmd.longitudinal.speed;
+  float accel = cmd.longitudinal.acceleration;
+  applyWallForwardBan(speed, accel);
+  cmd.longitudinal.speed = speed;
+  cmd.longitudinal.acceleration = accel;
+  control_pub_->publish(cmd);
+}
+
 void StuckRecoveryController::publishCommand(float speed, float acceleration, float steer)
 {
   const auto stamp = this->now();
@@ -2045,6 +2199,9 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   steer = std::clamp(steer, -kOutMaxSteer, kOutMaxSteer);
   acceleration = std::clamp(acceleration, -kOutMaxAccel, kOutMaxAccel);
   speed = std::clamp(speed, -kOutMaxSpeed, kOutMaxSpeed);
+
+  applyWallForwardBan(speed, acceleration);
+
   AckermannControlCommand msg;
   msg.stamp = stamp;
   msg.lateral.stamp = stamp;

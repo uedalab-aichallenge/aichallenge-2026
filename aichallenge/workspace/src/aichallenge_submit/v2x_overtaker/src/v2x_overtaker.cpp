@@ -245,6 +245,9 @@ V2XOvertaker::V2XOvertaker()
   // idx94-95 は幅こそ広いが曲率半径 6.7/5.7m のヘアピン入口なので残す。
   // 89:95 に絞った(却下85件のうち 41件=48% がこの禁止区間だった)。
   no_pass_zone_spec_(declare_parameter<std::string>("no_pass_zones", "18:30,89:95")),
+  // 公式オーバーテイクレーンの idx 範囲。AWSIM のシーンから実測した値。
+  // local_script/overtaking_zone.py で再取得できる(AWSIM 更新時は確認する)。
+  ot_lane_zone_spec_(declare_parameter<std::string>("ot_lane_zones", "234:21")),
   // 右側から抜くと決めている区間(ユーザー指示)。書式は boost_zones と同じで
   // 0 をまたぐ指定もできる。既定はメインストレート idx220 -> 30。
   // 【空にした(ユーザー指示 2026-08-29)】区間を焼き込んで「ここは右から」と
@@ -489,6 +492,21 @@ V2XOvertaker::V2XOvertaker()
   // 幅の判定を「抜き切るのに要る距離」まで伸ばす。
   // 1.0 でその距離ぶん、0 で従来どおり look_width_ahead_(20m)だけを見る(A/B用)。
   latch_allow_enable_(declare_parameter<bool>("latch_allow_enable", true)),
+  latch_never_no_pass_(declare_parameter<bool>("latch_never_no_pass", false)),
+  // 【採用 2026-09-05】レース単位で各3レース比較し、壁ペナルティ 17.3 -> 7.8s/車レース、
+  // 総ペナルティ 23.2 -> 17.0s/車レース、完走できなかった車 2/12 -> 0/12。既定を true にした。
+  stop_avoid_fix_(declare_parameter<bool>("stop_avoid_fix", true)),
+  // 自車の車体(前後 約1.0m)+ 相手の車体 + 余裕。抜け切るまでを覆う。
+  stop_avoid_span_(declare_parameter<double>("stop_avoid_span", 6.0)),
+  // 横位置が実現するまでの距離。前セッションの実測「横位置が20m遅れて実現する」。
+  // 純粋な遅れとして扱う(そのほうが安全側)。
+  stop_avoid_lat_lag_(declare_parameter<double>("stop_avoid_lat_lag", 20.0)),
+  stop_avoid_emg_margin_(declare_parameter<double>("stop_avoid_emg_margin", 2.0)),
+  // AWSIM は加速度指令を 1.37 に切り捨てる(開発メモ の実測)。
+  // 要求できる減速度の上限がそれなので、発火距離もこれで計算する。
+  // 【計測で戻した 2026-09-05】1.4(指令の切り捨て値)にすると発火距離が倍近くなり、
+  // 停止が増えて退行した。実測の到達減速度 2.44 と指令上限 1.37 の間を採る。
+  stop_avoid_emg_accel_(declare_parameter<double>("stop_avoid_emg_accel", 2.0)),
   // 継続が成立しない状態がこの秒数続いたら試行を終える。0 で無効。
   attempt_infeasible_time_(declare_parameter<double>("attempt_infeasible_time", 1.5)),
   // 打切りの基準: いまの横位置のまま この秒数ぶん進んだときの縁までの余裕が
@@ -720,6 +738,17 @@ V2XOvertaker::V2XOvertaker()
   // 理屈(先頭は25km/hに落とされるので前に出ると抜き返される)は devnote に残してある。
   leader_pass_last_laps_(declare_parameter<int>("leader_pass_last_laps", 0)),
   zone_fallback_enable_(declare_parameter<bool>("zone_fallback_enable", false)),
+  // --- 公式オーバーテイクレーン(SIM決勝) ---
+  // 既定は false。A/B で効果を確かめてから有効にする。
+  ot_lane_enable_(declare_parameter<bool>("ot_lane_enable", false)),
+  // BLOCK(20秒)を避けるガード。レーンを追い越しに使うかとは独立に常時有効。
+  ot_lane_guard_(declare_parameter<bool>("ot_lane_guard", true)),
+  // 27km/h がアタッカーの閾値。境界で振動しないよう 1km/h の余裕を持たせる。
+  ot_lane_min_kmh_(declare_parameter<double>("ot_lane_min_kmh", 28.0)),
+  // レーンは自車ラインの右 2.15m から始まる(実測)。
+  // 速度が足りないときはその手前で止める。
+  ot_lane_guard_lat_(declare_parameter<double>("ot_lane_guard_lat", 2.0)),
+  ot_lane_side_right_(declare_parameter<bool>("ot_lane_side_right", true)),
   // 側の決定: 録画で決めた側を曲率のイン優先より優先するか(コメントどおりの実装)
   side_pick_over_curve_(declare_parameter<bool>("side_pick_over_curve", true)),
   // 側の決定: 「相手と壁の空き」で決めるか(false でレースラインからのずれ)
@@ -785,6 +814,22 @@ V2XOvertaker::V2XOvertaker()
       const auto b = static_cast<std::size_t>(std::stoul(item.substr(c + 1)));
       no_pass_zones_.emplace_back(a, b);
       RCLCPP_INFO(get_logger(), "追越禁止区間 idx%zu-%zu", a, b);
+    }
+  }
+
+  // 公式オーバーテイクレーン。書式と 0 またぎの扱いは boost_zones と同じ。
+  {
+    std::stringstream ss(ot_lane_zone_spec_);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      const std::size_t c = item.find(':');
+      if (c == std::string::npos) { continue; }
+      const auto a = static_cast<std::size_t>(std::stoul(item.substr(0, c)));
+      const auto b = static_cast<std::size_t>(std::stoul(item.substr(c + 1)));
+      ot_lane_zones_.emplace_back(a, b);
+      RCLCPP_INFO(get_logger(),
+        "オーバーテイクレーン idx%zu-%zu 使用=%s 要速度=%.0fkm/h 低速時の右上限=%.2fm",
+        a, b, ot_lane_enable_ ? "する" : "しない", ot_lane_min_kmh_, ot_lane_guard_lat_);
     }
   }
   {
@@ -1360,6 +1405,39 @@ void V2XOvertaker::onTimer()
   // 評価する(latWant() が最終値と一致するのはこの位置だけ)。
   // 出力は boundLat / requestCap のみで、意図は出さない。
   wallGuard(f, c);
+
+  // --- BLOCK ペナルティ(20秒 5km/h 固定)を受けない ---
+  //
+  // 公式オーバーテイクレーンに **27km/h 未満で触れた瞬間**、
+  // アタッカーがいれば BLOCK が発火する(公式FAQ)。また 27km/h 以下で
+  // レーンに触れている間は3秒以内の完全退出が義務で、**加速では免除されない**。
+  // 横位置は指令から約20m(25km/hで2.9秒)遅れて実現するので、
+  // 「入ってから出る」は間に合わない。入らないのが唯一の正解。
+  //
+  // 1位はハンデで 25km/h に固定されるのでこの条件を満たせない。
+  // ユーザー指摘のとおり、現状の左寄りの走りはそのおかげで BLOCK を
+  // 受けていない。その性質を**速度という一つの条件で明示的に保証する**。
+  // (順位推定には依存させない。推定はずれることが分かっている)
+  // 【実測 2026-09-05】`ot_lane_enable=false`(レーンを追い越しに使わない)でも
+  // **BLOCK が発生した**(4レース中1件)。レーンはコース上に実在するので、
+  // 使わない選択をしても低速で触れれば違反になる。
+  // したがってガードは「レーンを使うか」とは独立に常時効かせる。
+  if (ot_lane_guard_ && !ot_lane_zones_.empty() && inOtLane(f.ei) &&
+      my_speed_for_gap_ * 3.6 < ot_lane_min_kmh_)
+  {
+    const double before = c.latWant();
+    c.boundLat(-ot_lane_guard_lat_, 1e9, "追越レーン(低速で入らない)");
+    const double after = c.latWant();
+    if (std::abs(before - after) > 0.05 &&
+        (now - last_ot_lane_log_).seconds() > 1.0)
+    {
+      last_ot_lane_log_ = now;
+      diagLog("追越レーン",
+              "追越レーン 低速で入らない 自車=%.1fkm/h(要%.0f) idx=%zu "
+              "横目標 %.2f -> %.2f",
+              my_speed_for_gap_ * 3.6, ot_lane_min_kmh_, f.ei, before, after);
+    }
+  }
 
   // --- 横位置の確定。ここまでに積まれた意図と制約を調停する。
   // 以降(レート制限・publish・ログ)は確定した c.target_offset を読むだけ。
@@ -3892,7 +3970,21 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
         }
       }
     }
-    const bool in_right_zone = by_room;   // 録画で決めた側は曲率より優先する
+    // --- 公式オーバーテイクレーンでは側は右で確定する ---
+    //
+    // レーンは自車ラインの**右** 2.15〜5.0m の帯(AWSIM のシーンから実測)。
+    // ところが idx220-241 の曲率半径は 8.7〜37m なので下の曲率ブロックが
+    // 必ず発火し、イン側=左へ書き換える。その左は idx10-20 で左壁まで
+    // 1.5〜2.0m しかない。**運営が右に追い越し車線を引いた直線で、
+    // わざわざ左の壁際へ潜る**動きになっていた(ユーザーが繰り返し報告)。
+    //
+    // ここだけ側を固定する。側の反転を全区間で許すと成績が落ちることは
+    // 実測済み(2026-09-04: 反転0%->21%で追い越し 0.50->0.00)だが、
+    // レーンは242点中34点しかなく、しかも運営が側を決めている区間なので
+    // 「場所ごとに側を選び直す」ことにはならない。
+    const bool ot_lane_side = ot_lane_side_right_ && otLaneUsable(ei);
+    if (ot_lane_side) { want = -1.0; }        // 右
+    const bool in_right_zone = by_room || ot_lane_side;   // 録画で決めた側は曲率より優先する
     // 【修正 2026-09-04】上のコメント「録画で決めた側は曲率より優先する」が
     // **実装されていなかった**。in_right_zone は 3881行の別の判定でしか
     // 使われておらず、ここの曲率によるイン優先が録画の判断を無条件に
@@ -3906,7 +3998,9 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
     //
     // コメントどおり、録画で側を決めた区間では曲率で上書きしない。
     // side_pick_over_curve=false で従来の挙動に戻せる。
-    const bool curve_may_override = !(side_pick_over_curve_ && in_right_zone);
+    // レーン内は side_pick_over_curve に関係なく曲率で上書きしない。
+    const bool curve_may_override =
+      !ot_lane_side && !(side_pick_over_curve_ && in_right_zone);
     if (curve_may_override && curve_sign_ != 0.0) {
       const double inside_sign = (curve_sign_ > 0.0) ? +1.0 : -1.0;
       const bool inside_fit = (inside_sign > 0.0) ? fit_left : fit_right;
@@ -4449,7 +4543,13 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   // 検証済みの区間なので、そこで仕掛けること自体は危険側ではない。
   // 予測計画が出ているときは従来どおりそれを使い、出ていないときだけ使う。
   // zone_fallback_enable=false で 2026-09-02 以降の挙動(予測のみ)に戻せる。
-  const bool zone_ok = spot_ready ||
+  // 公式のオーバーテイクレーンは**運営が「ここで抜け」と指定した区間**なので、
+  // 録画から学習した抜きどころと同格に扱う。
+  // 実測(20260905-003852、4台・決勝条件): レーン内(idx234-21)で追い越しが
+  // 始まらない理由は全車とも「開始車間不足」12件が最多で、
+  // 却下理由の全体1位は「ゾーン外」だった。レーンにいても許可が下りていない。
+  const bool ot_lane_here = otLaneUsable(ei);
+  const bool zone_ok = spot_ready || ot_lane_here ||
                        (zone_fallback_enable_ && c.in_zone && !require_spot_plan);
 
   // 計画開始後に相手がこちらの側へ動いた場合、または実測速度を反映した
@@ -4544,7 +4644,10 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   //
   // 計画した抜きどころに着いているなら、残すのは「相手の直後に貼り付いた
   // 状態から新規に横へ出ない」ための最小限(start_gap_floor)だけにする。
-  const bool start_gap_settled = spot_ready && gap >= start_gap_floor_;
+  // レーン内では横に 2.2〜2.5m の走行可能幅が確保されている(実測)ので、
+  // 「相手の直後から新規に横へ出ない」ための最小限(start_gap_floor)まで許す。
+  // 4.5m を要求していると、レーンに着いた時点で既に車間が足りない。
+  const bool start_gap_settled = (spot_ready || ot_lane_here) && gap >= start_gap_floor_;
   const bool start_gap_ok =
     attempt_active_ || gap >= start_gap_need || start_gap_settled;
   // --- 周回による解禁(ユーザー指示) ---
@@ -4622,7 +4725,11 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   // 横位置を保ったまま縦の車間を作って相手を先に行かせる」そのものになる。
   //
   // latch_allow_enable=true で従来の挙動に戻せる(A/B の対照)。
-  const bool allow = allow_base || (latch_allow_enable_ && latched);
+  // latch で越えてはいけない理由(安全に直結する2つ)。
+  // ここを越えると、許可が下りていない追い越しを最狭部や禁止区間へ運び込む。
+  const bool latch_hard_block = latch_never_no_pass_ && (in_no_pass || !side_fits_);
+  const bool allow = allow_base ||
+                     (latch_allow_enable_ && latched && !latch_hard_block);
   // 追い越しが途中で降りる原因を追うため、判定の中身を残しておく。
   dbg_allow_ = allow; dbg_width_ = w_avail; dbg_zone_ = c.in_zone;
   // 【追加 2026-09-03 夜】継続の可否を試行の終了判断へ渡す。
@@ -4701,7 +4808,7 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
     diagLog("追越却下", "追越却下 決め手=%s self_ok=%d capped自=%d capped先=%d 遅相手=%d ブ助=%d "
       "gap=%.1f zone=%d %s 幅=%.1f(要%.1f) 残距離=%.0f "
       "v_reach=%.1f 相手=%.1f closing=%.1f 所要=%.1fs 距離=%.0f rank=%d "
-      "側OK=%d 側=%s 相手横=%.2f 余地=[%.2f,%.2f] idx=%zu 同速=%d 禁止区=%d "
+      "側OK=%d 側=%s 相手横=%.2f 余地=[%.2f,%.2f] idx=%zu 同速=%d 禁止区=%d レーン=%d "
       "枠=%d/%d 不成立=%.1fs 学習連続=[%.1f,%.1f]m/%d点 空き=[%.2f,%.2f]m "
       "抜きどころ=%s/%s/%.0fm 展開距離=%.0fm 加速待=%.1fs 周回=%d 相手P%d"
       " 帯幅min=%.2f 閉塞位置=%.0fm 閉塞幅=%.2f"
@@ -4714,6 +4821,7 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
       side_fits_ ? 1 : 0, (side_sign_ > 0.0) ? "左" : "右",
       olat, room_lo_, room_hi_, ei,
       (!c.slow_leader && !closing_ok) ? 1 : 0, in_no_pass ? 1 : 0,
+      ot_lane_here ? 1 : 0,
       side_flip_cnt_, side_flip_max_,
       (side_unfit_since_ >= 0.0) ? (now.seconds() - side_unfit_since_) : -1.0,
       dbg_map_l_, dbg_map_r_, dbg_map_n_, dbg_room_l_, dbg_room_r_,
@@ -5557,6 +5665,32 @@ void V2XOvertaker::followAndCommit(const Frame & f, PlanCtx & c,
 // ここでは全車を見て、自分の車体が通る帯に入っている車のうち最も近いものに対し、
 // 「止まれる速度」まで上限を落とす。抜き切りの判断より後に置いてあるので、
 // どの層が上限を外していても最後にここで抑えられる。
+// 指定 idx が公式オーバーテイクレーンの中か。0 またぎは no_pass_zones と同じ扱い。
+bool V2XOvertaker::inOtLane(std::size_t idx) const
+{
+  for (const auto & z : ot_lane_zones_) {
+    const bool inside = (z.first <= z.second)
+                          ? (idx >= z.first && idx <= z.second)
+                          : (idx >= z.first || idx <= z.second);
+    if (inside) { return true; }
+  }
+  return false;
+}
+
+// いま公式オーバーテイクレーンを使ってよいか。
+//
+// 判定は「レーンの中の idx にいる」かつ「27km/h(+余裕) 以上出ている」だけ。
+// 順位は見ない。1位はハンデで 25km/h に固定されるので速度条件を満たせず、
+// 自動的にレーンを使わない側に回る。順位推定はずれることが分かっているので、
+// 推定に依存しないこの形にしてある(ユーザー指摘: 左寄りのおかげで
+// 1位は今まで BLOCK を受けていない。その性質は壊さない)。
+bool V2XOvertaker::otLaneUsable(std::size_t idx) const
+{
+  if (!ot_lane_enable_ || ot_lane_zones_.empty()) { return false; }
+  if (!inOtLane(idx)) { return false; }
+  return my_speed_for_gap_ * 3.6 >= ot_lane_min_kmh_;
+}
+
 void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
 {
   if (!rear_end_guard_) { return; }
@@ -5987,6 +6121,22 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       stopped.push_back({gap, olat_s, oi, std::hypot(o.vx, o.vy), kv.first});
     }
 
+    // --- ラッチの「抜け切り」解除(外部レビュー レビュー 2026-09-05) ---
+    //
+    // 抜き切ると対象の gap が周回長近くになり探索対象から外れる。
+    // その周期は stopped が空なので、内側に置いた解除処理は走らない。
+    // 結果、同じ名前の車が次周も停止していると古いラッチがそのまま効く。
+    // 「一定時間その対象を見ていない」を解除条件にする。
+    if (stop_nopass_latched_ && stop_nopass_seen_.nanoseconds() > 0 &&
+        (now - stop_nopass_seen_).seconds() > 1.0)
+    {
+      stop_nopass_latched_ = false;
+      RCLCPP_INFO(get_logger(),
+        "停止車 %s を見なくなったので「通れない」を解除する",
+        stop_nopass_target_.c_str());
+      stop_nopass_target_.clear();
+    }
+
     if (!stopped.empty()) {
       std::sort(stopped.begin(), stopped.end(),
                 [](const StoppedCar & a, const StoppedCar & b) { return a.gap < b.gap; });
@@ -5998,6 +6148,38 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       if (corridor_.lo.size() == n) {
         lo = corridor_.lo[bi] + safetyAt(bi);
         hi = corridor_.hi[bi] - safetyAt(bi);
+      }
+      // --- (1) 壁帯は「抜け切るまでの区間の最狭」で取る(2026-09-05) ---
+      //
+      // 停止車の1点だけで見ていたため、入口は広くて出口で壁が迫る場所に
+      // 全開で入っていた。実測では 11.3m 手前で「空き幅3.25m→通過」と出した
+      // 直後、6.8m 手前で壁帯が [-1.60,0.40] に潰れている。
+      // 停止車の手前から抜け切るまでを覆う区間で最も狭い帯を使う。
+      if (stop_avoid_fix_ && corridor_.lo.size() == n) {
+        // 【外部レビュー レビュー 2026-09-05】6m では停止車クラスタ(8m先まで同じ
+        // 障害物群として扱う)を覆えない。+3〜+8m の2台目が横を塞ぐのに、
+        // その地点の壁帯を評価していなかった。クラスタ + 車体通過長まで見る。
+        // 【計測で戻した 2026-09-05】クラスタ(8m)まで広げると「通れない」が増え、
+        // 停止時間が伸びて退行した。span_eff はパラメータで広げられるようにしておく。
+        const double span_eff = std::max(stop_avoid_span_, stop_avoid_span_);
+        double acc = 0.0;
+        // 手前側は半区間ぶん戻ってから、前方へ span ぶん見る。
+        size_t k0 = bi;
+        double back = 0.0;
+        while (back < stop_avoid_span_ * 0.5) {
+          const size_t prev = (k0 + n - 1) % n;
+          back += std::hypot(in.points[k0].pose.position.x - in.points[prev].pose.position.x,
+                             in.points[k0].pose.position.y - in.points[prev].pose.position.y);
+          k0 = prev;
+        }
+        for (size_t k = 0; k < n; ++k) {
+          const size_t a = (k0 + k) % n, b = (k0 + k + 1) % n;
+          lo = std::max(lo, corridor_.lo[a] + safetyAt(a));
+          hi = std::min(hi, corridor_.hi[a] - safetyAt(a));
+          acc += std::hypot(in.points[b].pose.position.x - in.points[a].pose.position.x,
+                            in.points[b].pose.position.y - in.points[a].pose.position.y);
+          if (acc > span_eff) { break; }
+        }
       }
 
       // 手前の集団(先頭から stopped_cluster_span 以内)が塞ぐ横位置
@@ -6061,7 +6243,55 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       // 帯の中央なら左右に best_w/2 の余裕が残る。
       const double band_center = (best_a + best_b) * 0.5;
       std::string act;
-      if (best_w >= stopped_slack_) {
+
+      // --- (2)(3) 到達可能性の判定と「通れない」のラッチ(2026-09-05) ---
+      //
+      // (2) 横位置は指令から約20m走ってから実現する。狙う横位置まで
+      //     寄せ切るのに要る距離を先に見て、残距離が足りないなら
+      //     「通れる」と判断してはいけない。
+      //     必要距離 = 遅れ(20m) + |Δ横| / offset_rate * 速度
+      // (3) 一度「通れない」と決めたら、抜け切るか止まるまで解除しない。
+      //     従来は毎周期やり直していたので上限が「なし→8.6→なし」と振動し、
+      //     2.6m 手前で上限なしに戻って正面衝突の緊急回避に至った。
+      bool reach_ok = true;
+      double need_dist = 0.0;
+      if (stop_avoid_fix_) {
+        const double dy = std::abs(band_center - my_lat_for_target_);
+        const double v = std::max(my_speed_for_gap_, 0.5);
+        need_dist = stop_avoid_lat_lag_ + (dy / std::max(offset_rate_, 0.1)) * v;
+        reach_ok = (base >= need_dist) ||
+                   (dy < 0.15) ||   // すでにその横位置にいる
+                   (my_speed_for_gap_ < 1.0);  // ほぼ止まっているなら遅れは効かない
+        // ラッチの解除条件: 対象が変わった / ほぼ止まった。
+        // 「抜け切った」の解除は下(stopped が空の場合を含む)で時刻で見る。
+        if (stop_nopass_latched_ &&
+            (stop_nopass_target_ != stopped.front().name || my_speed_for_gap_ < 0.5))
+        {
+          stop_nopass_latched_ = false;
+        }
+        // 対象を今この周期で見たことを記録する。
+        for (const auto & st : stopped) {
+          if (st.name == stop_nopass_target_) { stop_nopass_seen_ = now; break; }
+        }
+      }
+      const bool pass_geom_ok = (best_w >= stopped_slack_);
+      const bool pass_ok = stop_avoid_fix_
+                             ? (pass_geom_ok && reach_ok && !stop_nopass_latched_)
+                             : pass_geom_ok;
+      if (stop_avoid_fix_ && !pass_ok && !stop_nopass_latched_) {
+        stop_nopass_latched_ = true;
+        stop_nopass_target_ = stopped.front().name;
+        if ((now - last_stop_fix_log_).seconds() > 1.0) {
+          last_stop_fix_log_ = now;
+          RCLCPP_WARN(get_logger(),
+            "停止車 %s まで %.1fm 通れないと決めた(抜けるか止まるまで解除しない) "
+            "空き幅=%.2f(要%.2f) 壁帯=[%.2f,%.2f] 横目標=%.2f 自車横=%.2f "
+            "寄せ切るのに要る距離=%.1fm",
+            stopped.front().name.c_str(), base, best_w, stopped_slack_,
+            lo, hi, band_center, my_lat_for_target_, need_dist);
+        }
+      }
+      if (pass_ok) {
         // 余裕をもって通れる。帯の中央へ寄せる。
         c.requestLat(band_center, PlanCtx::LatPrio::kStoppedCar, "停止車回避");
         c.stop_avoid_active = true;
@@ -6133,7 +6363,10 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
         c.requestLat(band_center, PlanCtx::LatPrio::kStoppedCar, "停止車回避");
         c.stop_avoid_active = true;
         c.stop_avoid_v_stop = v_stop;
-        c.stop_avoid_have_gap = true;
+        // 【2026-09-05】「通れない」とラッチされている間は have_gap を主張しない。
+        // これは preventRearEnd の「通れる帯があるので微速を許す」免除に効く。
+        // 通れないのに微速で寄っていくと、壁と相手の間へ押し込まれる。
+        c.stop_avoid_have_gap = !(stop_avoid_fix_ && stop_nopass_latched_);
         c.stop_avoid_lo = best_a;
         c.stop_avoid_hi = best_b;
         c.stop_avoid_dist = base;
@@ -6143,6 +6376,41 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
         // 通れない。手前で止まる。
         c.requestCap(v_stop, "停止車回避");
         act = "停止";
+      }
+
+      // --- (4) 最大制動の監督(2026-09-05) ---
+      //
+      // 速度上限は「目標」であって、下位制御がどれだけの遅れで実現するかに
+      // 依存する。避けられないと分かった時点で残距離が制動距離を割っているなら、
+      // 上限を下げるだけでは足りないので**最大制動を明示的に要求する**。
+      //
+      // 発火は TTC ではなく「回避経路が無い かつ 残距離 <= 制動距離 + 余裕」。
+      // 36km/h(10m/s)から 2.4m/s^2 で止まるだけで 20.8m 要る。TTC 0.68s で
+      // 気づく設計では原理的に間に合わない。
+      //
+      // 後方から追突されるリスクはあるが、追突の罰は当てた側にしか付かない
+      // (公式のペナルティ表: 自車の前バンパーが他車の後バンパーに接触したとき)。
+      // 自分が正面衝突を選ぶ理由にはならないので、ここでは後方を理由に
+      // 最大制動を拒否しない。早めの弱い減速で境界に入らないのが本筋。
+      if (stop_avoid_fix_ && !pass_ok) {
+        const double v = std::max(my_speed_for_gap_, 0.0);
+        // 【外部レビュー レビュー 2026-09-05】ここは a_min(2.5) を使っており楽観的だった。
+        // **加速度指令は AWSIM 側で 1.37 に切り捨てられる**(開発メモ の実測)ので、
+        // 要求できる減速度はそれが上限。発火距離もそれで計算する。
+        // 10m/s なら制動距離は 20m ではなく約 36m。
+        const double a_emg = std::max(stop_avoid_emg_accel_, 0.5);
+        // 反応(V2X 遅延 + 1周期)で進む距離 + 制動距離 + 余裕
+        const double d_emg = v * 0.25 + (v * v) / (2.0 * a_emg) + stop_avoid_emg_margin_;
+        if (base <= d_emg && v > 1.0) {
+          c.emergency_brake = true;
+          c.requestCap(0.0, "停止車回避(最大制動)");
+          if ((now - last_stop_fix_log_).seconds() > 1.0) {
+            last_stop_fix_log_ = now;
+            RCLCPP_WARN(get_logger(),
+              "停止車 %s まで %.1fm。避けられず制動距離(%.1fm)を割ったので最大制動",
+              stopped.front().name.c_str(), base, d_emg);
+          }
+        }
       }
       // --- 膠着の検出(警告のみ)
       // stuck_recovery_controller は「指令速度が閾値未満なら stuck ではない」と

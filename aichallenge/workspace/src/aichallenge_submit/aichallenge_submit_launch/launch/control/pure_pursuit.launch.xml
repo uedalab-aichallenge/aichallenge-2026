@@ -60,6 +60,11 @@
     <!-- 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始める。
          false で従来(前進を2秒試してから切り返す)。A/B 用に env で切替可。 -->
     <param name="wedge_backward_first" value="$(env RECOVERY_FIX false)"/>
+    <!-- 壁へ食い込んだままの前進を禁じる(既定 on)。A/B のため車ごとに切れる。
+         運営アナウンス 2026-09-03: 実機では壁にぶつかったままアクセルを
+         踏み続けると再起不能(≒最下位)。SIM でも壁ペナルティが最大の損失。 -->
+    <param name="wall_forward_ban" value="$(env WALL_FWD_BAN true)"/>
+    <param name="wall_forward_ban_hold" value="$(env WALL_FWD_BAN_HOLD 0.8)"/>
     <!-- 復帰経路の計算に使う。コース境界(可動域)と他車位置から
          「後退したときに最も空いている方向」を選んで舵を当てる。 -->
     <!-- 理由を問わない膠着の安全網。指令0かつ相手が前方車の箱に入らないと

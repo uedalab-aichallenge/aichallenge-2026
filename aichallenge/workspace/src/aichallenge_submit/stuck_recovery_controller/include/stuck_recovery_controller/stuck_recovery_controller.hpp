@@ -113,6 +113,46 @@ private:
   bool reverse_following_{false};
   bool reverse_traj_enable_{true};
   bool wedge_backward_first_{true};   // 壁へ食い込んでいたら後退から始める
+
+  // --- 壁へ食い込んだまま前進し続けることを禁じる(絶対の不変条件) ---
+  //
+  // 【なぜ絶対にするか】運営アナウンス(2026-09-03):
+  //   「実機はシミュレーションと違い、一度壁にぶつかったまま
+  //     アクセルを踏み続けると再起不能(≒最下位)になります」
+  // SIM でも実測で最大の損失だった。決勝条件の4台走行(355秒)で
+  // 壁ペナルティが3台合計193秒、うち1台は3回で103秒。
+  // wall は接触が続いている間ずっと加算されるので、回数ではなく
+  // 「押し付け続けた時間」がそのまま損失になる。
+  //
+  // publishCommand は唯一の publish 地点なので、そこで止めれば
+  // 経路追従・直接制御・最後の手段のどの枝から来ても守れる。
+  bool wall_forward_ban_{true};          // 壁へ食い込んだままの前進を禁じるか
+  double wall_forward_ban_hold_{0.8};    // 改善しないまま前進を許す時間[s]
+  double wall_forward_ban_gain_{0.03};   // 「改善した」とみなす最小の増分[m]
+  // 【誤爆の修正 2026-09-05】この不変条件を素通しの publish まで広げたところ、
+  // **29km/h で走行中の車のスロットルを切って**コース上に停止させ、
+  // 全車の玉突きを招いた(1レースで4台全滅、壁ペナルティ 322/249/166秒。
+  // 発火回数 112〜219回、ログは「壁へ -0.10m 食い込んだまま … 指令 8.04m/s -> 0」)。
+  //
+  // 不変条件の前提は「壁に押し付けられて動けない」状態であって、
+  // 走行中に壁を掠めることではない。実際に守りたかった実測ケースは
+  // 速度 0.01〜0.03m/s・食い込み 0.40〜0.76m だった。
+  // 2つの条件で場面を限定する。
+  double wall_forward_ban_speed_{1.0};   // この速度[m/s]未満のときだけ効かせる
+  double wall_forward_ban_depth_{0.15};  // この深さ[m]を超えて食い込んだときだけ
+  // 他車と重なる評価の前進計画も却下するか(既定 false。計測で退行したため)
+  bool reject_car_overlap_plan_{false};
+  double wall_ban_ref_clear_{1e9};       // 基準にしている壁の余裕[m]
+  double wall_ban_since_{-1.0};          // その基準を更新した時刻[s]
+  rclcpp::Time last_wall_ban_log_{0, 0, RCL_ROS_TIME};
+  // 壁への食い込みの観測。前進指令の有無に関わらず毎周期更新する
+  // (外部レビュー レビュー: 更新が前進指令中だけだと、停止・後退で壁から離れても
+  //  基準と時刻が古いまま残り、次の前進開始時に即座に禁止されてしまう)。
+  void updateWallBanState();
+  // 壁へ食い込んだままの前進を止める。全 publish 経路がここを通る。
+  void applyWallForwardBan(float & speed, float & acceleration);
+  // control_pub_ への唯一の出口。素通しの指令もここを通す。
+  void publishFiltered(AckermannControlCommand cmd);
   rclcpp::Publisher<Trajectory>::SharedPtr reverse_traj_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr recovery_path_pub_;
   rclcpp::Time last_path_marker_{0, 0, RCL_ROS_TIME};
