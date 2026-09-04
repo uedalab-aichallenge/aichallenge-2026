@@ -1,31 +1,33 @@
+# 【2026-09-01 公式P3再現】ローカル中央値12.2km/hに対し公式7.9km/hなので、
+# 目標速度を0.65倍にする。横軌道は他車との相互作用で変わるため固定再生しない。
 ref_vel_configulator:
   s1:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 1
   s1_1:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 30
   s2:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 55
   s3:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 100
   s4:
-    ref_vel: 22.0
+    ref_vel: 6.84
     wp_id: 155
   s5:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 190
   s6:
-    ref_vel: 22.0
+    ref_vel: 6.84
     wp_id: 265
   s7:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 290
   s8:
-    ref_vel: 25.0
+    ref_vel: 7.80
     wp_id: 320
   s9:
-    ref_vel: 30.0
+    ref_vel: 9.05
     wp_id: 335

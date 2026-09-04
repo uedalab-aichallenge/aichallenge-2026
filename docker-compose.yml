@@ -28,6 +28,17 @@ x-autoware-base: &autoware-base
     - HOST_GID=${HOST_GID:-}
     - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}
     - LOG_DIR=${LOG_DIR:-}
+    # 同一レース内で新旧の設定を比べるための、車ごとの上書き(A/B用)。
+    # 未設定なら launch 側の既定値が使われるので、通常の実験の条件は変わらない。
+    - LEADER_PASS_LAST_LAPS=${LEADER_PASS_LAST_LAPS:-0}
+    - ZONE_FALLBACK=${ZONE_FALLBACK:-false}
+    - SPOT_ENTRY_GAP=${SPOT_ENTRY_GAP:--1.0}
+    - SPOT_PASS_LEN_GAIN=${SPOT_PASS_LEN_GAIN:-1.0}
+    - SPOT_NEED_MARGIN=${SPOT_NEED_MARGIN:-1.15}
+    - REAR_END_FREE_MIN=${REAR_END_FREE_MIN:-1.66}
+    - ATTEMPT_LAT_HOLD=${ATTEMPT_LAT_HOLD:-false}
+    - SIDE_FIX=${SIDE_FIX:-false}
+    - RECOVERY_FIX=${RECOVERY_FIX:-false}
   volumes:
     - ./output:${OUTPUT_ROOT:-/output}
     - ./aichallenge:/aichallenge

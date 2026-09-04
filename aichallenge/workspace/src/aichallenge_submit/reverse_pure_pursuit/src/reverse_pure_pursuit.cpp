@@ -1,4 +1,4 @@
-#include "simple_pure_pursuit/simple_pure_pursuit.hpp"
+#include "reverse_pure_pursuit/reverse_pure_pursuit.hpp"
 
 #include <motion_utils/motion_utils.hpp>
 #include <tier4_autoware_utils/tier4_autoware_utils.hpp>
@@ -6,19 +6,18 @@
 #include <tf2/utils.h>
 
 #include <algorithm>
-#include <cmath>
 #include <sstream>
 #include <string>
 
-namespace simple_pure_pursuit
+namespace reverse_pure_pursuit
 {
 
 using motion_utils::findNearestIndex;
 using tier4_autoware_utils::calcLateralDeviation;
 using tier4_autoware_utils::calcYawDeviation;
 
-SimplePurePursuit::SimplePurePursuit()
-: Node("simple_pure_pursuit"),
+ReversePurePursuit::ReversePurePursuit()
+: Node("reverse_pure_pursuit"),
   // initialize parameters
   wheel_base_(declare_parameter<float>("wheel_base", 2.14)),
   lookahead_gain_(declare_parameter<float>("lookahead_gain", 1.0)),
@@ -56,8 +55,9 @@ SimplePurePursuit::SimplePurePursuit()
   start_steer_limit_(declare_parameter<float>("start_steer_limit", 0.21)),
   stuck_steer_free_speed_(declare_parameter<float>("stuck_steer_free_speed", 0.4)),
   max_acceleration_(declare_parameter<float>("max_acceleration", 3.0)),
-  wall_guard_clamp_enable_(declare_parameter<bool>("wall_guard_clamp_enable", true)),
-  wall_guard_stale_sec_(declare_parameter<float>("wall_guard_stale_sec", 0.3))
+  // 後退時の速度上限。経路の速度(前進用にチューニングされている)をそのまま使うと
+  // 速すぎるので、絶対値をここで頭打ちにする。
+  reverse_max_speed_(declare_parameter<float>("reverse_max_speed", 1.5))
 {
   // "165:185:0.35,10:20:0.5" の形を解析する
   {
@@ -77,19 +77,8 @@ SimplePurePursuit::SimplePurePursuit()
   }
   pub_cmd_ = create_publisher<AckermannControlCommand>("output/control_cmd", 1);
   pub_raw_cmd_ = create_publisher<AckermannControlCommand>("output/raw_control_cmd", 1);
-  pub_lookahead_point_ = create_publisher<PointStamped>("/control/debug/lookahead_point", 1);
-  // 壁ガードの舵角クランプ。トピックは絶対名なので remap は要らない。
-  pub_steer_override_ = create_publisher<std_msgs::msg::Bool>(
-    "/control/wall_guard/override", rclcpp::QoS(1));
-  sub_steer_limit_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
-    "/control/wall_guard/steer_limit", rclcpp::QoS(1),
-    [this](const geometry_msgs::msg::Vector3Stamped::ConstSharedPtr msg) {
-      steer_limit_lo_ = msg->vector.x;
-      steer_limit_hi_ = msg->vector.y;
-      steer_limit_flag_ = msg->vector.z;
-      steer_limit_time_ = this->now();   // 古さは **受信時刻** で判定する
-      steer_limit_valid_ = true;
-    });
+  // デバッグ用トピック名が前進用(simple_pure_pursuit)と衝突しないよう reverse_ を付ける
+  pub_lookahead_point_ = create_publisher<PointStamped>("/control/debug/reverse_lookahead_point", 1);
 
   const auto bv_qos = rclcpp::QoS(rclcpp::KeepLast(1)).durability_volatile().best_effort();
   sub_kinematics_ = create_subscription<Odometry>(
@@ -101,7 +90,7 @@ SimplePurePursuit::SimplePurePursuit()
     "input/trajectory", bv_qos, [this](const Trajectory::SharedPtr msg) { trajectory_ = msg; });
 
   using namespace std::literals::chrono_literals;
-  timer_ = create_wall_timer(10ms, std::bind(&SimplePurePursuit::onTimer, this));
+  timer_ = create_wall_timer(10ms, std::bind(&ReversePurePursuit::onTimer, this));
 }
 
 AckermannControlCommand zeroAckermannControlCommand(rclcpp::Time stamp)
@@ -119,7 +108,7 @@ AckermannControlCommand zeroAckermannControlCommand(rclcpp::Time stamp)
 // 自車の少し先(lookahead_curve_ahead_ 手前まで)の軌道の曲率半径[m]を返す。
 // 3点の外接円で見る。軌道点の間隔は約2.7mなので、3点で 5m 程度の区間を見ることになる。
 // 直線では半径が発散するので、上限を切って返す。
-double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
+double ReversePurePursuit::localTurnRadius(size_t closest_idx) const
 {
   constexpr double kStraight = 1e4;
   if (!trajectory_) {
@@ -177,7 +166,7 @@ double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
   return tightest;
 }
 
-void SimplePurePursuit::onTimer()
+void ReversePurePursuit::onTimer()
 {
   // check data
   if (!subscribeMessageAvailable()) {
@@ -194,8 +183,12 @@ void SimplePurePursuit::onTimer()
   TrajectoryPoint closet_traj_point = trajectory_->points.at(closet_traj_point_idx);
 
   // calc longitudinal speed and acceleration
+  // --- 後退用に変更 ---
+  // 経路の速度は前進用にチューニングされた値なので、絶対値を reverse_max_speed_ で
+  // 頭打ちにしたうえで符号を反転し、後退方向の指令にする。
   double target_longitudinal_vel =
     use_external_target_vel_ ? external_target_vel_ : closet_traj_point.longitudinal_velocity_mps;
+  target_longitudinal_vel = -std::min(std::abs(target_longitudinal_vel), reverse_max_speed_);
   double current_longitudinal_vel = odometry_->twist.twist.linear.x;
 
   cmd.longitudinal.speed = target_longitudinal_vel;
@@ -332,15 +325,27 @@ void SimplePurePursuit::onTimer()
     }
     lookahead_distance = std::max(lookahead_distance, lookahead_slow_min_);
   }
-  //// calc center coordinate of rear wheel
+  //// calc center coordinate of front wheel (後退用に変更)
   //// orientation.z はクォータニオンの z 成分であって yaw ではない。
   //// ここを取り違えると基準点が最大 wheel_base/2 だけ明後日の方向へずれる。
+  ////
+  //// 前進の pure pursuit は「後軸を基準に前方の目標点を追う」。
+  //// 後退はその鏡像で、「前軸を基準に後方の目標点を追う」ことになるため、
+  //// 元の rear_x/rear_y の式(position - wheel_base/2 * cos/sin(yaw))の符号を
+  //// 反転して前軸位置(front_x/front_y)を基準点として使う。
+  //// 変数名は以降の式(steering 計算など)を極力変えずに済むよう rear_x/rear_y の
+  //// ままにしているが、実体は前軸位置である点に注意。
   const double yaw = tf2::getYaw(odometry_->pose.pose.orientation);
-  double rear_x = odometry_->pose.pose.position.x - wheel_base_ / 2.0 * std::cos(yaw);
-  double rear_y = odometry_->pose.pose.position.y - wheel_base_ / 2.0 * std::sin(yaw);
+  double rear_x = odometry_->pose.pose.position.x + wheel_base_ / 2.0 * std::cos(yaw);
+  double rear_y = odometry_->pose.pose.position.y + wheel_base_ / 2.0 * std::sin(yaw);
   //// search lookahead point
   //// 閉ループ軌道では末尾で探索が尽きるため、先頭へ回り込んで探す。
   //// 回り込まずに end() をそのまま参照すると未定義動作になり、操舵指令が壊れる。
+  ////
+  //// 【後退用の前提】この探索は「最近傍点からインデックスが増える方向」へ進む。
+  //// 前進用ではそれが「経路上で自車より前方」を意味したが、後退用の経路は
+  //// 「後退の進行方向(=自車が向かう向き)に沿ってインデックスが並んでいる」
+  //// ことを前提とする。この前提が満たされていれば探索ロジックは変更不要。
   const auto & traj_points = trajectory_->points;
   const size_t n_points = traj_points.size();
   // 閉ループ判定。
@@ -398,6 +403,8 @@ void SimplePurePursuit::onTimer()
                  yaw;
   cmd.lateral.steering_tire_angle =
     steering_tire_angle_gain_ * std::atan2(2.0 * wheel_base_ * std::sin(alpha), lookahead_distance);
+  // 後退時は同じ舵角でも車体の振られ方が前進と逆になるため、符号を反転する。
+  cmd.lateral.steering_tire_angle = -cmd.lateral.steering_tire_angle;
 
   // 低速時は操舵角に上限を掛ける。
   // スタート時、車両はグリッド位置(レースラインから最大 1.3 m ずれる)に置かれる。
@@ -420,49 +427,12 @@ void SimplePurePursuit::onTimer()
     }
   }
 
-  // --- 壁ガードによる舵角クランプ(最終手段の安全網)
-  // v2x_overtaker が「壁に当たらない舵角の範囲」を流してくる。ここは
-  // steering_tire_angle_gain_ を掛けたあとの物理的な舵角なので、
-  // gain で割る前(= この位置)でクランプする必要がある。
-  // 【フェイルオープン】無効化されている / 一度も受け取っていない /
-  // wall_guard_stale_sec_ 以上古い / 範囲が無効(lo > hi, 非有限)の場合は
-  // **一切クランプしない**。安全網が死んだときに操舵が固まるほうが危険。
-  {
-    bool override_active = false;
-    if (wall_guard_clamp_enable_ && steer_limit_valid_) {
-      const double age = (this->now() - steer_limit_time_).seconds();
-      const double lo = steer_limit_lo_;
-      const double hi = steer_limit_hi_;
-      if (age >= 0.0 && age < wall_guard_stale_sec_ &&
-          std::isfinite(lo) && std::isfinite(hi) && lo <= hi) {
-        const double before = cmd.lateral.steering_tire_angle;
-        const double after = std::clamp<double>(before, lo, hi);
-        if (after != before) {
-          cmd.lateral.steering_tire_angle = after;
-          override_active = true;
-          const auto now_log = this->now();
-          if ((now_log - last_steer_override_log_).seconds() > 2.0) {
-            last_steer_override_log_ = now_log;
-            RCLCPP_WARN(get_logger(),
-              "舵角上書き 元=%.3frad(%.1fdeg) -> %.3frad(%.1fdeg) 範囲=[%.3f,%.3f] 検知=%.0f",
-              before, before * 180.0 / M_PI, after, after * 180.0 / M_PI,
-              lo, hi, steer_limit_flag_);
-          }
-        }
-      }
-    }
-    // 上書きしたかどうかを v2x_overtaker へ返す(処理の中への通知)。
-    std_msgs::msg::Bool ov;
-    ov.data = override_active;
-    pub_steer_override_->publish(ov);
-  }
-
   pub_cmd_->publish(cmd);
   cmd.lateral.steering_tire_angle /=  steering_tire_angle_gain_;
   pub_raw_cmd_->publish(cmd);
 }
 
-bool SimplePurePursuit::subscribeMessageAvailable()
+bool ReversePurePursuit::subscribeMessageAvailable()
 {
   if (!odometry_) {
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000 /*ms*/, "odometry is not available");
@@ -478,12 +448,12 @@ bool SimplePurePursuit::subscribeMessageAvailable()
     }
   return true;
 }
-}  // namespace simple_pure_pursuit
+}  // namespace reverse_pure_pursuit
 
 int main(int argc, char const * argv[])
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<simple_pure_pursuit::SimplePurePursuit>());
+  rclcpp::spin(std::make_shared<reverse_pure_pursuit::ReversePurePursuit>());
   rclcpp::shutdown();
   return 0;
 }

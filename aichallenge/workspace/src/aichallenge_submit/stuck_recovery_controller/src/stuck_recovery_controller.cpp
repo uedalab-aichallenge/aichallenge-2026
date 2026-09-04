@@ -89,6 +89,11 @@ constexpr double kHandbackLookahead = 3.5;      // pure_pursuit の lookahead_mi
 constexpr double kHandbackLookaheadGain = 0.20; // pure_pursuit の lookahead_gain
 constexpr double kHandbackRelaxSec = 12.0;      // これを過ぎたら検査距離を半分にする
 constexpr double kTrajStillSec = 2.0;           // 経路で渡して動かない時間[s]の上限
+// 本線へ戻すときに横ずれを吸収する距離[m]。継ぎ足すだけだと継ぎ目で経路が折れ、
+// 速度も段差になる(ユーザー報告「既定の経路への復帰がなめらかでない」)。
+constexpr double kBlendLen = 8.0;
+// 占有格子を rviz に出すときに、余裕を濃淡で表す範囲[m]。
+constexpr double kGridShowRange = 1.5;
 constexpr double kPlanMinEscape = 2.5;     // 計画の終端は詰まった場所からこれだけ[m]離れること
 // 地図の上では余裕があるのに動けなかったとき、後退の下限をこれだけ[m]ずつ伸ばす。
 // 自己位置推定が実際とずれていると、地図では前方が空いているのに壁に当たる。
@@ -101,7 +106,21 @@ constexpr double kExplainedClearance = 0.30;   // これだけ[m]余裕があれ
 // wall_margin(0.12)より少し大きくして、食い込む前に反応させる。
 constexpr double kFwdAbortClearance = 0.20;
 // 区間の出だしは姿勢が定まらないので、少し走ってから見る。
-constexpr double kFwdAbortMinTravel = 0.05;
+// 0.05m は姿勢が定まる前で、実測では引き直しの全件がこの距離で起きていた。
+constexpr double kFwdAbortMinTravel = 0.15;
+// 復帰の開始時点で壁までの余裕がこれを割っていたら、前進を試さず後退から始める。
+// 0.0 は「走行可能領域の縁」。負は既に食い込んでいる状態。
+constexpr double kWedgedWallClear = 0.0;
+// 計画は「中断されない経路」を出すべきである。中断は壁 kFwdAbortClearance /
+// 他車 kFwdAbortCarDist で入るので、計画側にはそれより少し広い余裕を求める。
+// これが無いと、計画が通した経路を中断側が 0.23m 手前で落とし、
+// 走行 0.05m で必ず引き直しになる(実測: 6回/レース・平均10.5秒)。
+constexpr double kPlanWallClear = 0.28;   // 前進区間で確保を試みる壁との余裕[m]
+constexpr double kPlanCarClear = 0.32;    // 同 他車との余裕[m]
+// 上の条件では見つからない場所もある。そのときは現行どおり緩い条件で計画し、
+// 中断閾値の方を「その計画が見込んだ余裕」に合わせて下げる(下の Floor まで)。
+constexpr double kFwdAbortWallFloor = 0.02;  // 壁はここまでは許す(実接触の直前)
+constexpr double kFwdAbortCarFloor = 0.10;   // 他車の接触は Crash 10秒なので厚めに残す
 // 前後を切り替える前に止まりきる。実測で、後退区間が終わった時点でまだ
 // -0.8m/s あり、0.3m 行き過ぎてから前進に入って、後退した円弧をそのまま
 // 戻って同じ壁に当たっていた。
@@ -144,6 +163,8 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
 {
   control_pub_ = create_publisher<AckermannControlCommand>("/control/command/control_cmd", 1);
   gear_pub_ = create_publisher<GearCommand>("/control/command/gear_cmd", 1);
+  status_pub_ = create_publisher<std_msgs::msg::String>(
+      "/control/debug/recovery_status", rclcpp::QoS(1));
 
   // 動作確認用の強制発動。壁に当たらなくなると復帰が動く場面に出会えないため。
   // 軌道の経路にも入る。通常は素通しし、復帰の前進区間だけ差し替える。
@@ -153,6 +174,23 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   // 届かなくなる(実測: rviz に軌道が出ず、車が動かなくなった)。
   const auto traj_qos = rclcpp::QoS(rclcpp::KeepLast(1)).durability_volatile().best_effort();
   traj_pub_ = create_publisher<Trajectory>("output/trajectory", traj_qos);
+  // 後退用 pure_pursuit へ渡す経路。進行方向(=後退の向き)に点が並ぶ。
+  reverse_traj_pub_ = create_publisher<Trajectory>("output/reverse_trajectory", traj_qos);
+  // rviz 用。後退->前進->本線復帰 を 1本の Y字として出す。
+  // 「復帰で何をしようとしているか」が見えないという指摘への対応(2026-08-31)。
+  recovery_path_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/planning/debug/recovery_path", rclcpp::QoS(1));
+  // --- 復帰の当たり判定が見ている占有格子を rviz へ出す(2026-08-31・ユーザー指示)
+  //
+  // 【ユーザー指摘】rviz の地図が lanelet なので、実際の壁と
+  // 走行可能領域の関係が確認できない。
+  //
+  // この地図は当たり判定に使っている符号付き距離場そのものなので、
+  // 「判定が見ているもの」と「表示」が原理的にズレない。
+  // rviz が後から起動しても届くよう transient_local(latched)にする。
+  grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "/planning/debug/recovery_grid",
+      rclcpp::QoS(1).transient_local().reliable());
   traj_sub_ = create_subscription<Trajectory>(
     "input/trajectory", traj_qos,
     [this](const Trajectory::ConstSharedPtr msg) {
@@ -196,6 +234,13 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   nominal_sub_ = create_subscription<AckermannControlCommand>(
     "/control/command/nominal_control_cmd", 1,
     std::bind(&StuckRecoveryController::onNominalCommand, this, std::placeholders::_1));
+  // 後退用 pure_pursuit の指令。後退区間ではこちらを中継する(2026-08-31)。
+  // 【ユーザー指示】後退も pure_pursuit で追従させ、経路(後退->前進->本線復帰)を
+  // 1本として計算・表示する。復帰ノードは元から最終段の中継役なので、
+  // 区間に応じてどちらの指令を通すかを選ぶだけで済む(調停の追加は不要)。
+  reverse_sub_ = create_subscription<AckermannControlCommand>(
+    "/control/command/reverse_control_cmd", 1,
+    [this](const AckermannControlCommand::ConstSharedPtr msg) { reverse_cmd_ = msg; });
   // 復帰経路の計算に使う情報:
   //  - 自車の位置と向き(kinematic_state)
   //  - コース境界(lanelet2 から抽出した corridor CSV: raceline 各点の左右可動域)
@@ -209,12 +254,28 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
     "/v2x/vehicle_positions", rclcpp::QoS(10),
     [this](const V2XVehiclePositionArray::ConstSharedPtr msg) { v2x_ = msg; });
 
+  // 理由を問わない膠着の安全網。既定 0.0 = 無効(現行と完全に同一の挙動)。
+  // 後退を経路追従(後退用 pure_pursuit)で走らせるか。
+  // false にすると従来どおり舵角と速度を直接指令する。
+  // 新しい経路は評価が済んでいないので、問題が出たらここで即座に戻せるようにする。
+  reverse_traj_enable_ = declare_parameter<bool>("reverse_traj_enable", true);
+  // 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始めるか。
+  // false で 2026-09-04 以前の挙動(前進を2秒試してから切り返す)。
+  wedge_backward_first_ = declare_parameter<bool>("wedge_backward_first", true);
+  hard_stall_sec_ = declare_parameter<double>("hard_stall_sec", 0.0);
+  hard_stall_dist_ = declare_parameter<double>("hard_stall_dist", 0.8);
   const auto raceline = declare_parameter<std::string>("raceline_csv", "");
   const auto corridor = declare_parameter<std::string>("corridor_csv", "");
   const auto grid = declare_parameter<std::string>("occupancy_grid_yaml", "");
   loadRaceline(raceline, corridor);
   if (!grid.empty() && obstacles_.load(grid)) {
     RCLCPP_INFO(get_logger(), "復帰用の占有格子を読んだ: %s", grid.c_str());
+    publishGrid();
+    // 起動時の1回だけでは、後から起動した rviz が Volatile で購読していると
+    // 受け取れない(実測: トピックは見えるのに "No map received")。
+    // latched に頼らず、低頻度で出し続ける。570KB を 2 秒に1回なので負荷は小さい。
+    grid_timer_ = create_wall_timer(std::chrono::milliseconds(2000),
+                                    [this]() { publishGrid(); });
   } else if (!grid.empty()) {
     RCLCPP_WARN(get_logger(),
                 "復帰用の占有格子を読めない: %s (コリドアで代用する)", grid.c_str());
@@ -642,6 +703,15 @@ void StuckRecoveryController::onNominalCommand(
   if (runRecovery(now)) {
     return;
   }
+  // 後退区間を経路で渡している間は、後退用 pure_pursuit の指令を通す。
+  // ギアはこちらが持っているので、向きの管理は従来どおり。
+  // **前進の判定より先に見る**(前進用の指令を後退中に流さないため)。
+  if (recovery_start_time_.has_value() && reverse_following_ && !traj_giveup_) {
+    if (reverse_cmd_) { control_pub_->publish(*reverse_cmd_); return; }
+    // 後退用の指令がまだ届いていないなら止めておく(前進用を流さない)
+    publishCommand(0.0f, 0.0f, msg->lateral.steering_tire_angle);
+    return;
+  }
   // 復帰の前進区間を経路で渡している間は、pure_pursuit の指令をそのまま通す。
   // 復帰中なので停滞判定は回さない(回すと復帰の最中に再突入してしまう)。
   if (recovery_start_time_.has_value() && traj_following_) {
@@ -800,7 +870,51 @@ void StuckRecoveryController::updateStuckDetection(
     blocked_vehicle_start_time_ &&
     (now - blocked_vehicle_start_time_.value()).seconds() >= kBlockedVehicleDurationSec;
 
-  if (!moving_observed_ || (!motion_requested && !blocked_vehicle_ready)) {
+  // --- 理由を問わない最後の安全網(hard stall)
+  //
+  // 【直したバグ(ユーザー報告: ぶつかっても復帰せず強引に前進を続ける)】
+  // 実測(20260829-181500 d1 レース277s〜): preventRearEnd が
+  // 「上限 10.8 -> 0.0km/h」を出し続け、実速度 -0.00m/s のまま
+  // **55秒間** この関数のログが1行も出なかった。
+  // 下のゲートは motion_requested(指令速度>=1.0)か blocked_vehicle_ready の
+  // どちらかを要求する。指令が0で、かつ相手が前方車の箱
+  // (前方0.3〜4.0m/横±1.6m)にも近接2.5mにも入らないと、
+  // hasNoProgress を評価する前に return してしまう。
+  // ここでは指令も他車も見ない。「車体が動いていない」だけで拾う。
+  //
+  // 誤検知しない根拠: 閾値速度は 0.8m/0.4.0s = 0.20m/s = 0.72km/h。
+  // ペナルティのクランプ中でも 5km/h 出るので4秒で5.6m進み、閾値の7倍。
+  // 徐行通過の最低上限 stopped_thread_speed(10.8km/h)とも桁が違う。
+  bool hard_stall = false;
+  if (hard_stall_sec_ > 0.0 && moving_observed_) {
+    recovery::Pose cp;
+    if (currentPose(cp)) {
+      if (!hard_ref_valid_ ||
+          std::hypot(cp.x - hard_ref_x_, cp.y - hard_ref_y_) > hard_stall_dist_) {
+        hard_ref_x_ = cp.x;
+        hard_ref_y_ = cp.y;
+        hard_ref_time_ = now;
+        hard_ref_valid_ = true;
+      } else if ((now - hard_ref_time_).seconds() >= hard_stall_sec_) {
+        hard_stall = true;
+      }
+    }
+  }
+  // 復帰直後は通常制御に発進の機会を与える(既存の kCooldownSec と同じ扱い)
+  if (recovery_end_time_ &&
+      (now - recovery_end_time_.value()).seconds() < kCooldownSec) {
+    hard_stall = false;
+  }
+  if (hard_stall) {
+    RCLCPP_WARN(get_logger(),
+                "膠着(理由不問) %.1f秒で %.2fm も進んでいない "
+                "指令速度=%.2f 指令加速度=%.2f 実速度=%.2f",
+                hard_stall_sec_, hard_stall_dist_,
+                command.longitudinal.speed, command.longitudinal.acceleration,
+                velocity);
+  }
+
+  if (!moving_observed_ || (!motion_requested && !blocked_vehicle_ready && !hard_stall)) {
     stuck_start_time_.reset();
     pre_steer_valid_ = false;
     return;
@@ -808,7 +922,7 @@ void StuckRecoveryController::updateStuckDetection(
 
   // 近接車条件は専用タイマーで既に3秒を確認済み。通常条件へ切り替わった
   // 時間を流用せず、この周期で復帰を開始する。
-  if (blocked_vehicle_ready) {
+  if (blocked_vehicle_ready || hard_stall) {
     stuck_start_time_ = now - rclcpp::Duration::from_seconds(kStuckDurationSec);
   }
 
@@ -830,7 +944,7 @@ void StuckRecoveryController::updateStuckDetection(
   // 不整合だった。入口も実際の移動量で見る。
   const bool no_progress = hasNoProgress(now);
 
-  if (std::abs(velocity) <= kStuckSpeedThreshold || no_progress) {
+  if (std::abs(velocity) <= kStuckSpeedThreshold || no_progress || hard_stall) {
     if (!stuck_start_time_.has_value()) {
       if (no_progress && std::abs(velocity) > kStuckSpeedThreshold) {
         RCLCPP_WARN(get_logger(),
@@ -975,8 +1089,20 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   const double rear = rearRoom() - keep;
   const double max_rev = std::clamp(rear, 0.0, 8.0);
   if (max_rev < 0.75 && first_phase < 0) { first_phase = 0; }
+  // まず「中断されない経路」を狙って厳しい余裕つきで計画する。
+  // それで見つからない場所もあるので、駄目なら現行どおり緩い条件(余裕0)で
+  // 引き直す。フォールバック段が複数あるうち、本命(この呼び出し)だけを
+  // 厳→緩の2段にする(全段を厳→緩で一巡させるのは複雑になるため見送り)。
   plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
-                         first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars);
+                         first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
+                         kPlanWallClear, kPlanCarClear);
+  bool plan_strict = plan_.valid;
+  if (!plan_.valid) {
+    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+                           first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
+                           0.0, 0.0);
+    plan_strict = false;
+  }
   if (!plan_.valid && first_phase != 0) {
     // 縛ったせいで解が無いなら縛りを外す
     plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
@@ -1006,11 +1132,21 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   {
     plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            -1, 0.0, 0.0, 0.0, std::max(max_rev, 1.5), cars);
+    plan_strict = false;
   }
+  bool plan_best_effort = false;
   if (!plan_.valid) {
+    // 最後のフォールバック。ここでも解が無いなら best_effort を立てて、
+    // 棄却条件を全て外した上で「一番離れられる案」を採らせる
+    // (kCarRadius を 1.49m に拡げた副作用で解なしになる距離が伸びたぶんの受け皿)。
     plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0, 0, 0.0, 0.0, 0.0,
-                           8.0, cars);
+                           8.0, cars, 0.0, 0.0, true);
+    plan_best_effort = plan_.valid;
   }
+  // 採用した計画が前進区間で見込んだ余裕を、追従中の中断閾値に使えるよう保存する。
+  // 計画が取れなかったときは 1e9 のままにして、中断閾値は既定値を使わせる。
+  plan_min_wall_clear_ = plan_.valid ? plan_.min_wall_clear : 1e9;
+  plan_min_car_clear_ = plan_.valid ? plan_.min_car_clear : 1e9;
   phase_idx_ = 0;
   phase_travelled_ = 0.0;
   phase_start_wall_clear_ = recovery::wallClearanceAt(obstacles_, veh_, p);
@@ -1032,8 +1168,10 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
                   ph.forward ? "前進" : "後退", ph.steer * 180.0 / M_PI, ph.length);
     desc += buf;
   }
-  RCLCPP_INFO(get_logger(), "復帰 計画%d: %s(評価%.2f)",
-              replan_count_, desc.c_str(), plan_.cost);
+  RCLCPP_INFO(get_logger(), "復帰 計画%d: %s(評価%.2f) 余裕壁%.2f 車%.2f 厳%d 総当り%d",
+              replan_count_, desc.c_str(), plan_.cost,
+              plan_min_wall_clear_, plan_min_car_clear_, plan_strict ? 1 : 0,
+              plan_best_effort ? 1 : 0);
   return true;
 }
 
@@ -1052,7 +1190,36 @@ void StuckRecoveryController::beginRecovery(
   traj_giveup_ = false;
   recovery::Pose p;
   if (currentPose(p)) { recovery_start_x_ = p.x; recovery_start_y_ = p.y; }
-  makePlan(now, forward_blocked ? -1 : 0);
+  // --- 既に壁へ食い込んでいるなら、前進を試さず後退から始める ---
+  //
+  // 【実測(2026-09-04、ユーザー報告「無駄に何度も切り返す」)】
+  //   復帰 状況= 後方車 ... 壁-0.30          <- 開始時点で既に 0.30m 食い込み
+  //   復帰追跡 前進 舵指令+18 速度0.00 走行0.00/4.50m 壁まで-0.30
+  //   (同じ行が2秒間くり返し、走行は 0.06m のみ)
+  //   復帰 経路で渡しても 2.0s 動かない。直接制御に戻す
+  //   復帰 前進 で動けない。後退から引き直す
+  //   → 後退へ切り替えた途端に動いた(速度 -0.22→-1.12、壁まで -0.30→+0.28)
+  //
+  // 【なぜ既存のガードで捕まらなかったか】前進中断の判定は
+  //   clear_now < thr && clear_now < 区間開始より悪化 && 走行 > 0.15m
+  // の AND で、「走りながら悪化する」場合を想定している。
+  // ところが実際は**開始時点で既に最悪**なので「悪化」が成立せず、
+  // 動けないので「0.15m 走った」も成立しない。両方すり抜けて
+  // 2秒の汎用タイムアウトを待っていた。
+  //
+  // 壁に押し付けられた状態で前進しても物理的に出られない。
+  // 出口が塞がっていることは、走ってみなくても開始時点で分かる。
+  bool wedged = false;
+  {
+    const double clear_now = recovery::wallClearanceAt(obstacles_, veh_, p);
+    if (wedge_backward_first_ && clear_now < kWedgedWallClear) {
+      wedged = true;
+      RCLCPP_WARN(get_logger(),
+                  "復帰 開始時点で壁へ %.2fm 食い込んでいる。前進を試さず後退から始める",
+                  clear_now);
+    }
+  }
+  makePlan(now, (forward_blocked || wedged) ? -1 : 0);
 }
 
 // 計画した区間を順に実行する。
@@ -1212,18 +1379,22 @@ bool StuckRecoveryController::replanIfWallNear(
   // 停滞判定(kStallSec)を待つと、その頃には壁に押し付けられて動けない。
   if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
   const double clear_now = recovery::wallClearanceAt(obstacles_, veh_, p);
+  // 計画が見込んだ余裕より下げない。計画が「0.05m しかない所を通す」と決めたなら、
+  // 中断側が 0.20m で落とすのは矛盾であり、必ず引き直しになる。
+  const double thr = std::max(kFwdAbortWallFloor,
+      std::min(kFwdAbortClearance, plan_min_wall_clear_ - kFwdAbortWorsen));
   // 壁も同じ。狭い所ではもともと余裕が小さいので、
   // 「閾値を割った」だけでは降りない。**区間開始より悪化している**ことを条件にする。
-  if (clear_now < kFwdAbortClearance &&
+  if (clear_now < thr &&
       clear_now < phase_start_wall_clear_ - kFwdAbortWorsen &&
       phase_travelled_ > kFwdAbortMinTravel)
   {
     ++replan_count_;
     blocked_dir_ = 1;                     // 前進は駄目だったと覚える
     RCLCPP_WARN(get_logger(),
-                "復帰 前進中に壁まで %.2fm まで詰まった(走行%.2fm)。"
+                "復帰 前進中に壁まで %.2fm まで詰まった(走行%.2fm しきい%.2f)。"
                 "動けなくなる前に後退から引き直す(%d回目)",
-                clear_now, phase_travelled_, replan_count_);
+                clear_now, phase_travelled_, thr, replan_count_);
     makePlan(now, -1);                    // 後退から始める計画を要求
     return true;
   }
@@ -1243,17 +1414,20 @@ bool StuckRecoveryController::replanIfCarNear(
   // 離れていても 0 を返すので、距離として使うと他車が1台もいなくても
   // 条件が真になり、前進のたびに中断して無限に切り返す(実際に出したバグ)。
   const double cc = recovery::carClearanceAt(carObstacles(), veh_, p);
+  // 計画が見込んだ余裕より下げない。理由は壁側の thr と同じ。
+  const double thr = std::max(kFwdAbortCarFloor,
+      std::min(kFwdAbortCarDist, plan_min_car_clear_ - kFwdAbortWorsen));
   // 近いだけでは降りない。**区間開始より悪化している**ときだけ降りる。
   // そうしないと、もともと狭い所では出だしで必ず降りて同じ計画を引き直し続ける。
-  if (cc < kFwdAbortCarDist && cc < phase_start_car_clear_ - kFwdAbortWorsen &&
+  if (cc < thr && cc < phase_start_car_clear_ - kFwdAbortWorsen &&
       phase_travelled_ > kFwdAbortMinTravel)
   {
     ++replan_count_;
     blocked_dir_ = 1;
     RCLCPP_WARN(get_logger(),
-                "復帰 前進中に他車まで %.2fm(開始時%.2fm)。"
+                "復帰 前進中に他車まで %.2fm(開始時%.2fm しきい%.2f)。"
                 "ぶつかる前に引き直す(%d回目)",
-                cc, phase_start_car_clear_, replan_count_);
+                cc, phase_start_car_clear_, thr, replan_count_);
     makePlan(now, -1);
     return true;
   }
@@ -1586,6 +1760,23 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
     }
     publishCommand(kRecoverySpeed, kRecoveryAccel, steer);
   } else {
+    // 後退区間も経路を publish して後退用 pure_pursuit に追従させる
+    // (2026-08-31・ユーザー指示)。前進とまったく同じ形にする。
+    // 追従できずに止まったままなら、従来どおり直接制御へ戻す。
+    if (reverse_following_ && !traj_giveup_) {
+      if (std::abs(latest_velocity_) > kMovingSpeedThreshold) {
+        traj_still_ = false;
+      } else {
+        if (!traj_still_) { traj_still_ = true; traj_still_since_ = now; }
+        else if ((now - traj_still_since_).seconds() > kTrajStillSec) {
+          traj_giveup_ = true;
+          RCLCPP_WARN(get_logger(),
+                      "復帰 後退を経路で渡しても %.1fs 動かない。直接制御に戻す",
+                      kTrajStillSec);
+        }
+      }
+      if (!traj_giveup_) { return false; }   // 指令は後退用 pure_pursuit のものを通す
+    }
     // AWSIM は後退ギアのとき「負の目標速度・正の加速度」を期待する。
     publishCommand(-kRecoverySpeed, kRecoveryAccel, steer);
   }
@@ -1603,20 +1794,16 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 bool StuckRecoveryController::publishRecoveryTrajectory()
 {
   if (!latest_traj_ || !recovery_start_time_.has_value() || !plan_.valid) {
+    reverse_following_ = false;
     return false;
   }
-  if (phase_idx_ >= plan_.phases.size() || !plan_.phases[phase_idx_].forward) {
-    return false;   // 後退中・区間切替中は直接制御に任せる
+  if (braking_ || desperate_ || phase_idx_ >= plan_.phases.size()) {
+    reverse_following_ = false;
+    return false;
   }
-  if (braking_ || desperate_) { return false; }
-
-  // 計画した前進経路 + そのあと目標軌道へ合流する部分をつなげる
-  Trajectory out;
-  out.header = latest_traj_->header;
-  out.header.stamp = this->now();
 
   recovery::Pose cur;
-  if (!currentPose(cur)) { return false; }
+  if (!currentPose(cur)) { reverse_following_ = false; return false; }
 
   // 計画の経路のうち、現在地より先の部分だけを使う
   std::size_t from = 0;
@@ -1625,22 +1812,67 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
     const double d = std::hypot(plan_.path[i].x - cur.x, plan_.path[i].y - cur.y);
     if (d < bd) { bd = d; from = i; }
   }
-  auto push = [&out](double x, double y, double yaw, double v) {
+
+  auto push = [](Trajectory & t, double x, double y, double yaw, double v) {
     autoware_auto_planning_msgs::msg::TrajectoryPoint p;
     p.pose.position.x = x;
     p.pose.position.y = y;
     p.pose.orientation.z = std::sin(yaw * 0.5);
     p.pose.orientation.w = std::cos(yaw * 0.5);
     p.longitudinal_velocity_mps = static_cast<float>(v);
-    out.points.push_back(p);
+    t.points.push_back(p);
   };
-  for (std::size_t i = from; i < plan_.path.size(); ++i) {
-    push(plan_.path[i].x, plan_.path[i].y, plan_.path[i].yaw, kRecoverySpeed);
+
+  const std::size_t rev_n = std::min(plan_.rev_points, plan_.path.size());
+  const bool in_reverse = reverse_traj_enable_ && !plan_.phases[phase_idx_].forward;
+  if (!reverse_traj_enable_ && !plan_.phases[phase_idx_].forward) {
+    reverse_following_ = false;
+    publishRecoveryPathMarker(from);   // 表示だけは従来どおり出す
+    return false;
+  }
+
+  // --- 後退区間: 後退用 pure_pursuit へ、後退の向きに並んだ経路を渡す
+  if (in_reverse) {
+    Trajectory rev;
+    rev.header = latest_traj_->header;
+    rev.header.stamp = this->now();
+    for (std::size_t i = from; i < rev_n; ++i) {
+      push(rev, plan_.path[i].x, plan_.path[i].y, plan_.path[i].yaw, kRecoverySpeed);
+    }
+    publishRecoveryPathMarker(from);
+    if (rev.points.size() < 2) { reverse_following_ = false; return false; }
+    reverse_traj_pub_->publish(rev);
+    reverse_following_ = true;
+    if ((this->now() - last_traj_log_).seconds() > 1.0) {
+      last_traj_log_ = this->now();
+      RCLCPP_INFO(get_logger(), "復帰 後退を経路で渡す (%zu点)", rev.points.size());
+    }
+    // traj_following_(前進用)は立てない。呼び出し側は戻り値でそれを決めるので
+    // false を返す。前進用 pure_pursuit には通常の軌道を流しておいてよい
+    // (後退中はその指令を使わないため)。
+    return false;
+  }
+
+  reverse_following_ = false;
+
+  // --- 前進区間: 計画した前進経路 + 本線へ「なめらかに」合流する部分
+  Trajectory out;
+  out.header = latest_traj_->header;
+  out.header.stamp = this->now();
+  const std::size_t f0 = std::max(from, rev_n);
+  for (std::size_t i = f0; i < plan_.path.size(); ++i) {
+    push(out, plan_.path[i].x, plan_.path[i].y, plan_.path[i].yaw, kRecoverySpeed);
   }
   if (out.points.size() < 2) { return false; }
 
-  // 終端から目標軌道へつなぐ。つながっていないと pure_pursuit が
-  // 経路の終端で止まってしまい、復帰しても走り出せない。
+  // 終端から目標軌道へつなぐ。
+  //
+  // 【ユーザー報告】「生成した経路が短く、既定の経路への復帰がなめらかでない」。
+  // 以前はここで最近傍点から先を **そのまま継ぎ足していた** ため、
+  // 計画の終端が本線から横にずれていると継ぎ目で経路が折れ、
+  // 速度も kRecoverySpeed から本線の速度へ段差になっていた。
+  // 終端の横ずれを kBlendLen[m] かけて指数的に 0 へ近づけ、
+  // 速度も同じ区間で本線の値へ寄せる。
   const auto & tail = out.points.back().pose.position;
   std::size_t near = 0;
   double nd = 1e18;
@@ -1650,16 +1882,135 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
                                 tp[i].pose.position.y - tail.y);
     if (d < nd) { nd = d; near = i; }
   }
-  for (std::size_t k = 1; k < tp.size(); ++k) {
-    out.points.push_back(tp[(near + k) % tp.size()]);
+  // 継ぎ目での横ずれを、本線の法線方向に符号つきで測る
+  double nx = 0.0, ny = 0.0;
+  {
+    const std::size_t a = near;
+    const std::size_t b = (near + 1) % tp.size();
+    const double dx = tp[b].pose.position.x - tp[a].pose.position.x;
+    const double dy = tp[b].pose.position.y - tp[a].pose.position.y;
+    const double L = std::hypot(dx, dy);
+    if (L > 1e-6) { nx = -dy / L; ny = dx / L; }
   }
+  const double lat0 = (tail.x - tp[near].pose.position.x) * nx +
+                      (tail.y - tp[near].pose.position.y) * ny;
+
+  double run = 0.0;
+  for (std::size_t k = 1; k < tp.size(); ++k) {
+    const std::size_t i = (near + k) % tp.size();
+    const std::size_t j = (near + k - 1) % tp.size();
+    run += std::hypot(tp[i].pose.position.x - tp[j].pose.position.x,
+                      tp[i].pose.position.y - tp[j].pose.position.y);
+    auto pt = tp[i];
+    if (run < kBlendLen && std::abs(lat0) > 1e-3) {
+      const double w = 1.0 - run / kBlendLen;      // 1 -> 0
+      double bx = 0.0, by = 0.0;
+      const std::size_t i2 = (i + 1) % tp.size();
+      const double dx = tp[i2].pose.position.x - tp[i].pose.position.x;
+      const double dy = tp[i2].pose.position.y - tp[i].pose.position.y;
+      const double L = std::hypot(dx, dy);
+      if (L > 1e-6) { bx = -dy / L; by = dx / L; }
+      pt.pose.position.x += lat0 * w * bx;
+      pt.pose.position.y += lat0 * w * by;
+      // 速度も段差にしない
+      const double vt = pt.longitudinal_velocity_mps;
+      pt.longitudinal_velocity_mps =
+          static_cast<float>(kRecoverySpeed * w + vt * (1.0 - w));
+    }
+    out.points.push_back(pt);
+  }
+  publishRecoveryPathMarker(from);
   traj_pub_->publish(out);
   if ((this->now() - last_traj_log_).seconds() > 1.0) {
     last_traj_log_ = this->now();
-    RCLCPP_INFO(get_logger(), "復帰 前進を経路で渡す (%zu点, 計画%zu点ぶん)",
-                out.points.size(), plan_.path.size() - from);
+    RCLCPP_INFO(get_logger(),
+                "復帰 前進を経路で渡す (%zu点, 計画%zu点ぶん, 継ぎ目の横ずれ%.2fm)",
+                out.points.size(), plan_.path.size() - f0, lat0);
   }
   return true;
+}
+
+// 復帰の当たり判定が見ている占有格子を、そのまま rviz へ出す。
+//
+// 値は「余裕の大きさ」を段階で表す。単なる白黒より、
+// **どこがぎりぎりなのか** が見えるほうがデバッグに役立つ。
+//   壁の中(clearance <= 0)          -> 100 (黒)
+//   余裕 0 〜 kGridShowRange[m]      -> 99 〜 1 (濃いほど壁に近い)
+//   それ以上                         -> 0 (白)
+void StuckRecoveryController::publishGrid()
+{
+  if (!grid_pub_ || !obstacles_.valid()) { return; }
+  nav_msgs::msg::OccupancyGrid g;
+  g.header.frame_id = "map";
+  g.header.stamp = this->now();
+  g.info.resolution = static_cast<float>(obstacles_.resolution());
+  g.info.width = static_cast<unsigned int>(obstacles_.width());
+  g.info.height = static_cast<unsigned int>(obstacles_.height());
+  g.info.origin.position.x = obstacles_.originX();
+  g.info.origin.position.y = obstacles_.originY();
+  g.info.origin.orientation.w = 1.0;
+  g.data.resize(static_cast<std::size_t>(g.info.width) * g.info.height);
+  for (int iy = 0; iy < obstacles_.height(); ++iy) {
+    for (int ix = 0; ix < obstacles_.width(); ++ix) {
+      const double c = obstacles_.distAt(ix, iy);
+      int8_t v;
+      if (c <= 0.0) {
+        v = 100;
+      } else if (c >= kGridShowRange) {
+        v = 0;
+      } else {
+        v = static_cast<int8_t>(99.0 * (1.0 - c / kGridShowRange));
+        if (v < 1) { v = 1; }
+      }
+      g.data[static_cast<std::size_t>(iy) * g.info.width + ix] = v;
+    }
+  }
+  grid_pub_->publish(g);
+  if (!grid_logged_) {
+    grid_logged_ = true;
+    RCLCPP_INFO(get_logger(),
+                "復帰用の占有格子を rviz へ出した: %ux%u 解像度%.3fm 原点(%.1f, %.1f) "
+                "topic=/planning/debug/recovery_grid (2秒ごとに再送)",
+                g.info.width, g.info.height, g.info.resolution,
+                g.info.origin.position.x, g.info.origin.position.y);
+  }
+}
+
+// rviz へ「後退 -> 前進 -> 本線復帰」を1本の Y字として出す。
+// 後退部を赤、前進部を緑で色分けする。
+void StuckRecoveryController::publishRecoveryPathMarker(std::size_t from)
+{
+  if (!recovery_path_pub_ || !plan_.valid || plan_.path.empty()) { return; }
+  // 表示専用の間引き。0.2s では復帰の動きが追えないので詰める。
+  if ((this->now() - last_path_marker_).seconds() < 0.05) { return; }
+  last_path_marker_ = this->now();
+  const std::size_t rev_n = std::min(plan_.rev_points, plan_.path.size());
+  visualization_msgs::msg::MarkerArray arr;
+  for (int part = 0; part < 2; ++part) {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = "map";
+    m.header.stamp = this->now();
+    m.ns = "recovery_path";
+    m.id = part;
+    m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.scale.x = 0.15;
+    m.color.a = 0.95f;
+    m.color.r = (part == 0) ? 1.0f : 0.1f;
+    m.color.g = (part == 0) ? 0.2f : 1.0f;
+    m.color.b = 0.2f;
+    m.pose.orientation.w = 1.0;
+    const std::size_t b = (part == 0) ? 0 : rev_n;
+    const std::size_t e = (part == 0) ? rev_n : plan_.path.size();
+    for (std::size_t i = b; i < e; ++i) {
+      geometry_msgs::msg::Point q;
+      q.x = plan_.path[i].x; q.y = plan_.path[i].y;
+      q.z = (i < from) ? 0.1 : 0.3;   // 通過済みは低く描く
+      m.points.push_back(q);
+    }
+    if (m.points.size() >= 2) { arr.markers.push_back(m); }
+  }
+  if (!arr.markers.empty()) { recovery_path_pub_->publish(arr); }
 }
 
 void StuckRecoveryController::finishRecovery(const rclcpp::Time & now)
@@ -1672,6 +2023,28 @@ void StuckRecoveryController::finishRecovery(const rclcpp::Time & now)
 void StuckRecoveryController::publishCommand(float speed, float acceleration, float steer)
 {
   const auto stamp = this->now();
+  // --- 出力段で必ず範囲に収める(唯一の publish 地点なので、ここだけで全経路を守れる) ---
+  //
+  // 【なぜここか】publishCommand の呼び出しは7箇所あり、そのうち4箇所は
+  // 舵角をクランプせずに渡していた(1256 / 1701 / 1726 / 1746行)。
+  // 呼び出し側それぞれにクランプを足すと同じ判定が散らばるので、出口に1つ置く。
+  //
+  // 【OVER ペナルティ】大会ルールでは加速度指令の絶対値が ±3 m/s^2 を超えると
+  // 2秒間 5km/h に制限される(simple_pure_pursuit 側のコメントに実装当時の調査あり)。
+  // AWSIM は入力を ±1.37 m/s^2 に clamp するので、2.0 に抑えても性能は落ちない。
+  // 復帰の定数は現状すべて 1.37 以下だが、将来の変更で踏まないように出口で止める。
+  //
+  // 非有限値(NaN/Inf)も落とす。計算のどこかで 0 除算が起きたときに
+  // そのまま車両へ流すと、何が起きたか分からない挙動になる。
+  constexpr float kOutMaxSteer = static_cast<float>(kMaxSteerRad);
+  constexpr float kOutMaxAccel = 2.0f;
+  constexpr float kOutMaxSpeed = 10.0f;
+  if (!std::isfinite(steer)) { steer = 0.0f; }
+  if (!std::isfinite(acceleration)) { acceleration = 0.0f; }
+  if (!std::isfinite(speed)) { speed = 0.0f; }
+  steer = std::clamp(steer, -kOutMaxSteer, kOutMaxSteer);
+  acceleration = std::clamp(acceleration, -kOutMaxAccel, kOutMaxAccel);
+  speed = std::clamp(speed, -kOutMaxSpeed, kOutMaxSpeed);
   AckermannControlCommand msg;
   msg.stamp = stamp;
   msg.lateral.stamp = stamp;
@@ -1680,7 +2053,39 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   msg.longitudinal.stamp = stamp;
   msg.longitudinal.speed = speed;
   msg.longitudinal.acceleration = acceleration;
+  // --- publish 間隔の自己監視(観測のみ) ---
+  // 大会ルールでは 250Hz 以上で publish しても OVER ペナルティになる。
+  // 現構成では pure_pursuit は nominal_control_cmd へ出しており、
+  // /control/command/control_cmd の publisher はこのノードだけなので
+  // 二重 publish は起きないはずだが、**確かめずに「起きない」と書かない**。
+  // 4ms(=250Hz)を下回る間隔が出たら記録する。
+  {
+    const double t = stamp.seconds();
+    if (last_pub_t_ > 0.0) {
+      const double dt = t - last_pub_t_;
+      if (dt < 0.004 && dt > 0.0) {
+        ++fast_pub_cnt_;
+        if ((t - last_fast_log_t_) > 2.0) {
+          last_fast_log_t_ = t;
+          RCLCPP_WARN(get_logger(),
+                      "指令の publish 間隔が短い %.1fms (250Hz超) 累計%d回",
+                      dt * 1000.0, fast_pub_cnt_);
+        }
+      }
+    }
+    last_pub_t_ = t;
+  }
   control_pub_->publish(msg);
+  // GUI 用。ここが呼ばれている = 復帰が車両を直接動かしている。
+  // 呼ばれなくなれば GUI 側が時間切れで「通常」に戻す。
+  if (status_pub_) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "RECOVERY  cmd %.1f km/h  steer %.0f deg",
+                  speed * 3.6f, steer * 180.0f / static_cast<float>(M_PI));
+    std_msgs::msg::String m;
+    m.data = buf;
+    status_pub_->publish(m);
+  }
 }
 
 void StuckRecoveryController::publishGear(std::uint8_t command)

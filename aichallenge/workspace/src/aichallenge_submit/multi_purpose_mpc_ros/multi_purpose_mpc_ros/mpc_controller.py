@@ -29,6 +29,7 @@ from rclpy.parameter import Parameter
 
 # autoware
 from autoware_auto_control_msgs.msg import AckermannControlCommand
+from autoware_auto_vehicle_msgs.msg import GearCommand
 from autoware_auto_planning_msgs.msg import Trajectory
 from v2x_msgs.msg import V2XVehiclePositionArray
 from multi_purpose_mpc_ros.v2x_vehicle_tracker import (
@@ -505,6 +506,12 @@ class MPCController(Node):
             AckermannControlCommand, "/control/command/control_cmd_raw", 1)
           print("use normal ackermann control command")
 
+        # 簡単な復帰(後退)用
+        self._gear_pub = self.create_publisher(GearCommand, "/control/command/gear_cmd", 1)
+        self._stuck_since = 0.0
+        self._rev_until = 0.0
+        self._gear_was_reverse = False
+
         # NOTE:評価環境での可視化のためにダミーのトピック名を使用
         self._mpc_pred_pub = self.create_publisher(
             MarkerArray, "/mpc/prediction", 1)
@@ -570,8 +577,114 @@ class MPCController(Node):
         ackerman_boost_cmd.boost_mode = bug_acc_enabled
         return ackerman_boost_cmd
 
+    # --- 動かなくなったら後ろに下がるだけの簡単な復帰(ユーザー依頼)
+    #
+    # 目的は「相手役が詰まったまま計測レースが潰れる」のを防ぐこと。
+    # 公式 rosbag(08301327_1)の実測では、大会NPC は 32.3% の時間
+    # 完全停止していた。原因はおそらく接触で、復帰する様子は無い。
+    # つまりこれは**大会NPCの再現ではなく、計測を回すための仕掛け**。
+    # STUCK_RECOVERY_ENABLE = False にすれば素の挙動に戻る。
+    # 【無効にした理由(実測 20260831-011257)】レース開始前は全車が停止して
+    # いるので、開始を待っている 3 秒でこれが発火してギアを REVERSE にする。
+    # その結果 MPC が一度も動かなくなった(最大速度 0.0km/h)。
+    # 直すならレース開始の検知を入れる必要があるが、相手役の都合で
+    # 自車の計測を壊すのは本末転倒なので、いまは切っておく。
+    STUCK_RECOVERY_ENABLE = False
+    STUCK_SPEED = 0.3      # [m/s] これ未満なら止まっているとみなす
+    STUCK_SEC = 3.0        # [s]   この時間続いたら下がる
+    REVERSE_SEC = 1.8      # [s]   下がる時間
+    REVERSE_SPEED = 1.5    # [m/s] 下がる速さ
+    REVERSE_COOLDOWN = 4.0 # [s]   下がり終えてから次に下がるまで
+
+    def _update_stuck_recovery(self, stamp):
+        """後退中なら (speed, accel, gear) を返す。そうでなければ None。"""
+        if not self.STUCK_RECOVERY_ENABLE or self._odom is None:
+            return None
+        now = self.get_clock().now().nanoseconds / 1e9
+        v = abs(self._odom.twist.twist.linear.x)
+
+        if self._rev_until > now:
+            return (-self.REVERSE_SPEED, -1.0, GearCommand.REVERSE)
+
+        if self._rev_until > 0.0 and now - self._rev_until < self.REVERSE_COOLDOWN:
+            self._stuck_since = 0.0
+            return None
+
+        if v < self.STUCK_SPEED:
+            if self._stuck_since == 0.0:
+                self._stuck_since = now
+            elif now - self._stuck_since >= self.STUCK_SEC:
+                self._rev_until = now + self.REVERSE_SEC
+                self._stuck_since = 0.0
+                self.get_logger().warn("動かないので後退する (%.1f秒)" % self.REVERSE_SEC)
+                return (-self.REVERSE_SPEED, -1.0, GearCommand.REVERSE)
+        else:
+            self._stuck_since = 0.0
+        return None
+
+    # --- 練習用: 大会NPC(GoKart3)の挙動を真似る ---------------------------
+    # 実提出したrosbag (result/08301327_1) から測った大会NPCの実態:
+    #   完全停止(<0.5km/h)  32.3%
+    #   5km/h付近(ペナルティ固定) 15.6%
+    #   6-15km/h            42.4%
+    #   >15km/h              5.3%
+    #   巡航平均(6km/h超)   10.4 km/h
+    # ローカルのMPCは一度も止まらないので、停止車を避ける経路
+    # (avoidStoppedCars) がローカルでは一度も試されていなかった。
+    # 環境変数 NPC_SIM=1 のときだけ、周期的に止まってこれを再現する。
+    # **自車(pure_pursuit)には一切影響しない。既定では完全に無効。**
+    NPC_SIM_HOLD_SEC = 8.0     # 止まっている時間
+    NPC_SIM_CYCLE_SEC = 25.0   # 周期 (8/25 = 32% で大会NPCと同じ)
+
+    def _npc_sim_hold(self, stamp):
+        if os.environ.get("NPC_SIM", "0") != "1":
+            return False
+        if self._odom is None:
+            return False
+        v = abs(self._odom.twist.twist.linear.x)
+        t = stamp.sec + stamp.nanosec * 1e-9
+        # 一度でも動き出すまでは何もしない(グリッドでの待機中に
+        # 止め続けると発進しなくなるため)。
+        if getattr(self, "_npc_sim_t0", None) is None:
+            if v < 0.3:
+                return False
+            self._npc_sim_t0 = t
+            return False
+        phase = (t - self._npc_sim_t0) % self.NPC_SIM_CYCLE_SEC
+        return phase < self.NPC_SIM_HOLD_SEC
+
     def _publish_control_command(self, stamp, u, acc, bug_acc_enabled):
         cmd = self._create_ackerman_control_command(stamp, u, acc, bug_acc_enabled)
+
+        if self._npc_sim_hold(stamp):
+            cmd.longitudinal.speed = 0.0
+            cmd.longitudinal.acceleration = -2.0
+            self._command_pub.publish(cmd)
+            return
+
+        rec = self._update_stuck_recovery(stamp)
+        if rec is not None:
+            speed, accel, gear = rec
+            cmd.longitudinal.speed = speed
+            cmd.longitudinal.acceleration = accel
+            cmd.lateral.steering_tire_angle = 0.0
+            if self._gear_pub is not None:
+                g = GearCommand()
+                g.stamp = stamp
+                g.command = gear
+                self._gear_pub.publish(g)
+            # 【必ず立てる】ここを立て忘れると、後退が終わったあと
+            # 下の「DRIVE へ戻す」分岐に入らず **ギアが REVERSE のまま**になり、
+            # 二度と前へ進まなくなる(ユーザー報告「MPCが前に進まなくなった」)。
+            self._gear_was_reverse = True
+            self._command_pub.publish(cmd)
+            return
+        if self._gear_pub is not None and self._gear_was_reverse:
+            g = GearCommand()
+            g.stamp = stamp
+            g.command = GearCommand.DRIVE
+            self._gear_pub.publish(g)
+            self._gear_was_reverse = False
 
         # publish raw control command
         self._command_raw_pub.publish(cmd)

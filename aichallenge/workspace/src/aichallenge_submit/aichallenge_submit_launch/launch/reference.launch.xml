@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <launch>
   <!-- Essential parameters -->
+  <arg name="debug_gui" default="true"/>
   <arg name="vehicle_id" default="$(env VEHICLE_ID default)" description="vehicle specific ID"/>
   <arg name="simulation" description="used for sensor kit param"/>
   <arg name="use_sim_time"/>
@@ -19,6 +20,31 @@
        data/ten_map/; pass raceline_file:=raceline_awsim_30km_from_garage.csv to fall back to the upstream line. -->
   <arg name="corridor_file" default="ten_map/corridor_ten.csv" description="追い越し時に使える横可動域(make_corridor.py で生成)"/>
   <arg name="rank1_corner_gain" default="1.00" description="1位のときコーナー速度に掛ける係数"/>
+  <!-- 先頭を抜いてよい残り周回数。0 でいつでも抜く。
+       同一レース内で新旧を比べるため、環境変数で車ごとに上書きできる。 -->
+  <!-- 追突防止を緩め始める横間隔[m]。車幅1.46mより下げると車体が重なる。
+       実測(2026-09-04): 追突防止が効いているときの横間隔は中央値0.83m、
+       既定1.66mに届くのは4%だけで、事実上一度も解除されていなかった。 -->
+  <!-- 試行中の横位置を「試行」が保持するか。false で 2026-09-04 以前の挙動
+       (並走した瞬間に追越の意図が消え、基準ラインへ引き戻される)。 -->
+  <!-- 側の決定の2つの修正をまとめて切り替える(A/B用)。
+       true: 録画で決めた側を曲率より優先し、側は「相手と壁の空き」で決める -->
+  <arg name="side_fix" default="$(env SIDE_FIX false)"
+       description="側の決定の修正を有効にするか"/>
+  <arg name="attempt_lat_hold_enable" default="$(env ATTEMPT_LAT_HOLD false)"
+       description="試行中の横位置を試行が保持するか"/>
+  <arg name="rear_end_free_min" default="$(env REAR_END_FREE_MIN 1.66)"
+       description="追突防止を緩め始める横間隔[m]"/>
+  <arg name="spot_entry_gap" default="$(env SPOT_ENTRY_GAP -1.0)"
+       description="横へ出る前に取り返す縦の安全車間[m]。負で従来値"/>
+  <arg name="spot_pass_len_gain" default="$(env SPOT_PASS_LEN_GAIN 1.0)"
+       description="前へ出切る量に掛ける係数"/>
+  <arg name="spot_need_margin" default="$(env SPOT_NEED_MARGIN 1.15)"
+       description="必要距離に掛ける安全率"/>
+  <arg name="zone_fallback_enable" default="$(env ZONE_FALLBACK false)"
+       description="予測計画が無いとき汎用ゾーンで仕掛けてよいか"/>
+  <arg name="leader_pass_last_laps" default="$(env LEADER_PASS_LAST_LAPS 0)"
+       description="先頭を抜いてよい残り周回数(0で無効)"/>
   <arg name="rank2_corner_gain" default="1.00" description="2位以下のときコーナー速度に掛ける係数"/>
   <arg name="enable_overtake" default="true" description="V2X による追い越し・追従を有効にする"/>
   <arg name="raceline_file" default="$(eval &quot;'ten_map/raceline_ten_v2.csv' if '$(var track)' == 'citycircuit' else '$(var track_subdir)raceline_awsim_30km_from_garage.csv'&quot;)" description="raceline csv path relative to simple_trajectory_generator/data"/>
@@ -165,18 +191,127 @@
                  レース開始時に自車の座標を照合して P1/P2/P3 を確定する。
                  他車の進行度から毎回並べ替える方法は V2X の到着に依存して
                  崩れるので、固定のグリッド座標との照合を優先する。 -->
+            <!-- 【2026-09-03】ここは3台分の座標しかない。自コード4台の検証では
+                 台数が登録数を超えるため、assignStartSlots が進行度順の
+                 フォールバックへ切り替わる(グリッド確定(進行度順) のログ)。
+                 4台のグリッド座標を固定したい場合は、そのログの実測座標を
+                 ここへ追記する。 -->
             <param name="grid_slots"
-                   value="89631.0:43128.0,89633.0:43131.3,89628.9:43131.5"/>
+                   value="89631.0:43128.0,89633.0:43131.3,89628.9:43131.5,89630.8:43134.9"/>
+            <!-- 【2026-09-03 実測】自コード4台(MPCなし)でシミュレータを起動し、
+                 スタート前に静止している各車の /localization/kinematic_state を読んだ値:
+                   d2 = (89633.307, 43131.176)   既存 P2 と 0.3m 以内で一致
+                   d3 = (89629.065, 43131.418)   既存 P3 と 0.3m 以内で一致
+                   d4 = (89630.776, 43134.926)   ← 4台目。最前列(y が最大)
+                 d1 は取得に失敗したが、同構成の走行ログで「自車=P1(照合 0.46m)」と
+                 出ており既存 P1 と一致することを確認済み。
+                 P1〜P3 は本番3台構成で検証済みの値をそのまま残し、P4 だけ追加した
+                 (照合しきい値は 3.0m なので 0.3m の差は影響しない)。 -->
+            <!-- 発進レーンの保持。第1段は左へ向く原因の除去(既定 true)。
+                 第2段は P1 を右へ出して MPC を即座に抜きにいく(ユーザー要望)。 -->
+            <!-- 【2026-09-03 ユーザー指示】発進時にP1が右へ寄る処理を無効化。
+                 恒久設定ではない。戻すときは true。 -->
+            <!-- 【2026-09-03 検証用・要復帰】自コード4台・MPC0台で走らせる間は
+                 NPC が居ない。既定の npc_slot=3 のままだと P3 の僚車を NPC と
+                 みなし、予測速度の上限を「遅いNPC」側で見積もる等の誤りが出る。
+                 0 はどのスロットにも一致しない。**本番提出前に 3 へ戻すこと。** -->
+            <param name="npc_slot" value="0"/>
+            <!-- 【A/B比較用 2026-09-03】壁の安全網。導入前後の成績を測るため
+                 launch から明示的に切り替えられるようにしてある。
+                 occ_enable: 占有格子で舵角範囲を決める最終手段
+                 wall_guard_enable: コリドアベースの横範囲/速度の制約 -->
+            <!-- 【A/B比較用 2026-09-03 夜】
+                 pass_width_dist_gain: 幅の判定を「抜き切るのに要る距離」まで
+                 伸ばす。0 で従来(look_width_ahead=20m のみ)。
+                 attempt_require_intent: 追越試行の検出に、横位置の調停で
+                 追越の意図が採用されていることを要求する。false で従来。 -->
+            <!-- latch_allow_enable: latch に追い越しの許可を持たせるか。
+                 false で「latch は横位置の保持だけ」。実測で全走行時間の24.9%が
+                 latch による allow_base の迂回だった。 -->
+            <param name="latch_allow_enable" value="true"/>
+            <param name="pass_width_dist_gain" value="0.0"/>
+            <param name="attempt_infeasible_time" value="0.0"/>
+            <param name="attempt_require_intent" value="false"/>
+            <param name="occ_enable" value="true"/>
+            <param name="wall_guard_enable" value="false"/>
+            <param name="launch_p1_right" value="false"/>
+            <!-- 第3段: 発進の一発追い越し。P1・1周目・25秒以内・横間隔1.6m以上・
+                 相手はNPCのみ、という閉じた条件でだけ追従上限を外す。 -->
+            <!-- 【2026-09-03】発進の一発追い越しは「相手はNPCのみ」という条件付き。
+                 自コード4台・MPC0台の検証構成ではNPCが居ないため発火せず、
+                 P1限定の特別扱いだけが残る。あわせて無効化する。戻すときは true。 -->
+            <param name="launch_p1_pass" value="false"/>
+            <!-- 抜き切れないまま idx18 の狭窄へ並走進入しない。禁止区間の
+                 12m手前で発進専用の横保持を解除し、通常の衝突回避へ戻す。 -->
+            <param name="launch_no_pass_guard_dist" value="12.0"/>
+            <!-- 中盤のブーストの無駄撃ち対策。実測で「停止中のMPC(相手0.0km/h)」に
+                 加速余地1.1〜1.9で撃っていた。止まっている車を抜くのに
+                 ブーストは要らない。余地の下限を上げる。 -->
+            <param name="boost_min_headroom" value="2.5"/>
+            <!-- 【実測 2026-08-30 / output/20260830-141528】
+                 1位でブーストを撃たせたところ、発射後10秒の窓で観測された
+                 最高速度は 24.8km/h で 25.0 を超えなかった。
+                 1位でいた期間の最速ラップも 47.2s(=25.5km/h)で上限に貼り付き。
+                 => ブーストは1位の上限を突破しない。1位で撃つのは死に資源。
+                 さらに1位で撃たせると狙いが周回遅れのMPC(車間24.1m)になり、
+                 順位を脅かさない相手にブーストを捨てていた。
+                 よって既定(false / true)のまま抑止するのが正しい。 -->
+            <!-- 発進の検証中は計測ログを40秒まで伸ばす(既定20秒では足りない) -->
+            <param name="telem_sec" value="40.0"/>
             <param name="detect_range" value="25.0"/>
             <param name="avoid_range" value="14.0"/>
             <param name="stopped_look_ahead" value="40.0"/>
-            <param name="pass_gap" value="1.9"/>
+            <!-- 【2026-08-31】1.9 -> 1.75。pass_gap は「狙う間隔」だが side_fits_ の
+                 判定では余地に収まることを要求するため、実質の必要幅になっていた。
+                 実測(sepfix01)では 余地に 1.7〜1.8m あるのに 1.9 が入らず却下。
+                 接触しない下限は band_car_w=1.60 がクランプ側で保証する。 -->
+            <param name="pass_gap" value="1.75"/>
+            <!-- 【2026-08-31】2 -> 4。却下46件中13件が「相手が余地の外側に居て、
+                 反対側なら 3.7m 空いているのに側を変えられない」形だった。
+                 側の振れは path_rate(2.0m/s)と band_side_hold で別途抑えてある。 -->
+            <param name="side_flip_max" value="4"/>
+            <!-- 【2026-08-31 実測】カートの実幅は 1.46m(半幅0.73 x2)。
+                 並走するには自車と相手の中心間隔が 1.46m 以上必要。
+                 ところが band_car_w の既定は 1.30 で、バンド(経路の最終クランプ)は
+                 相手の中心から 1.30m の位置まで自車の経路を許していた。
+                 = 16cm 重なった経路を「通れる」として出力していたことになる。
+                 min_pass_sep(既定1.15)も同じ性質で、こちらは 31cm 重なる。
+                 目標間隔 pass_gap は 1.9m と安全側なのに、狭くなった瞬間に
+                 この2つがクランプ側で効いて相手へ寄せてしまう。
+                 実幅 1.46m + 余裕 0.14m = 1.60m に揃える。 -->
+            <param name="band_car_w" value="1.60"/>
+            <param name="min_pass_sep" value="1.60"/>
+            <!-- 計画側も追突防止の解除境界(1.66m)より広くする。
+                 ソース既定と勝利確認済みの実験条件を一致させる。 -->
+            <param name="spot_margin" value="1.80"/>
             <param name="follow_gap" value="7.0"/>
             <param name="offset_rate" value="1.2"/>
             <!-- 順位別のコーナー速度係数。sweep.sh の順位別計測で最適値を決める。
                  1.00 = 速度マップそのまま。1位は 25km/h 制限があるのでコーナーで稼ぐ余地がある。 -->
+            <!-- 【デバッグ用 2026-09-04 ユーザー指示・一時的】
+                 ブーストの「最終区間用の温存」を無効化する。
+                 実測: boost_reserve_final=1 で持ち球2個のため、1個目を撃った瞬間に
+                 残り1となり、以後の追い越し要求が全部
+                 「ブースト見送り(最終区間用に温存)」で消えていた(28回)。
+                 追い越し成功18件すべてがブースト未使用。
+                 **必要なときに本当に使えるかを確認するための一時設定。**
+                 本番前に 1 へ戻すか、使えることを確認した上で値を決めること。 -->
+            <param name="boost_reserve_final" value="0"/>
+            <param name="side_pick_over_curve" value="$(var side_fix)"/>
+            <param name="side_pick_by_room" value="$(var side_fix)"/>
+            <param name="side_room_use_min" value="$(var side_fix)"/>
+            <param name="attempt_lat_hold_enable" value="$(var attempt_lat_hold_enable)"/>
+            <param name="rear_end_free_min" value="$(var rear_end_free_min)"/>
+            <param name="spot_entry_gap" value="$(var spot_entry_gap)"/>
+            <param name="spot_pass_len_gain" value="$(var spot_pass_len_gain)"/>
+            <param name="spot_need_margin" value="$(var spot_need_margin)"/>
+            <param name="zone_fallback_enable" value="$(var zone_fallback_enable)"/>
+            <param name="leader_pass_last_laps" value="$(var leader_pass_last_laps)"/>
             <param name="rank1_corner_gain" value="$(var rank1_corner_gain)"/>
             <param name="rank2_corner_gain" value="$(var rank2_corner_gain)"/>
+    <!-- 抜く側を相手の予測経路に沿って決める(2026-08-31)。
+         発進区間は自動的に除外される。問題が出たら false にするだけで戻せる。 -->
+    <param name="band_side_pred" value="false"/>
             <remap from="input/trajectory" to="trajectory_raw"/>
             <!-- 復帰処理が最後に入るので、ここでは中間トピックへ出す -->
             <remap from="output/trajectory" to="trajectory_v2x"/>
@@ -185,6 +320,17 @@
             <remap from="input/awsim_status" to="/awsim/status"/>
             <remap from="output/awsim_cmd" to="/awsim/cmd"/>
             <remap from="output/overtaking" to="/planning/scenario_planning/overtaking"/>
+            <remap from="output/status" to="/planning/scenario_planning/v2x_status"/>
+      </node>
+
+      <!-- デバッグ表示。走りには一切影響しない(購読するだけ)。
+           debug_gui:=false で止められる。1台につき1つ窓が出る。 -->
+      <node pkg="race_debug_gui" exec="race_debug_gui_node" name="race_debug_gui"
+            output="log" if="$(var debug_gui)">
+            <!-- 窓のタイトルにだけ使う「本当の」グリッド位置(ユーザーの許可)。
+                 判断には一切使わない。ローカル検証環境では ドメイン番号 = グリッド番号。 -->
+            <param name="vehicle_id" value="$(env ROS_DOMAIN_ID 0)"/>
+            <remap from="input/status" to="/planning/scenario_planning/v2x_status"/>
       </node>
       
     </group>

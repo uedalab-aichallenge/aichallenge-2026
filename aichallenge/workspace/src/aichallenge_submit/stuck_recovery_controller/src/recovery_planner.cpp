@@ -232,7 +232,19 @@ namespace
 {
 
 // 他車を円で近似したときの半径[m]。車体半幅 0.65 + 余裕 0.35。
-constexpr double kCarRadius = 1.00;
+//
+// 【1.00 -> 1.49 に拡大】実車は全長約2.6m×全幅約1.46mで、半径1.00mの円では
+// 車体を包みきれていなかった(対角半径 sqrt(1.30^2+0.73^2)=1.49m で初めて包む)。
+// 向き(ヨー)を使って楕円などで近似しない理由: v2x で配られるのは相手の位置だけで
+// 向きは無い。速度ベクトルから向きを推定する案もあるが、スタックした車は他車に
+// 押されたりアクセルを踏み続けたりして**その場で回転する**ことがあり、
+// 速度からの向き推定はいちばん危険な場面(相手がスタックして向きが不定)で
+// 必ず外れる(ユーザー指摘)。そのため向きを使わない単一の円で安全側に包む。
+//
+// 副作用: 半径を大きくすると、相手中心が前方2.6m以内(旧)だった「初手から
+// 重なり判定になり解なしを返す」距離が3.1m(新)まで伸びる。これは plan() の
+// best_effort 引数(棄却条件を外して最も離れられる案を返す)で受ける。
+constexpr double kCarRadius = 1.49;
 
 // 車体の外周点を返す。四隅だけだと、隅の間にある壁の出っ張りを跨いでしまう。
 int bodyPoints(const VehicleParams & v, const Pose & p, double * bx, double * by)
@@ -381,7 +393,8 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           const VehicleParams & veh, const Pose & start,
           double ahead_min, double ahead_max, int first_phase, double min_gain,
           double min_escape, double min_reverse, double max_reverse,
-          const std::vector<CarObstacle> & cars)
+          const std::vector<CarObstacle> & cars,
+          double req_wall_clear, double req_car_clear, bool best_effort)
 {
   Plan best;
   if (!corridor.valid()) { return best; }
@@ -514,12 +527,23 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
         // car_allow(開始時の重なり + 0.05)をそのまま使うと、せっかく下がったのに
         // 元の食い込みまで突っ込み直す経路が通ってしまう。
         // 後退終了時点の重なりを基準に張り直す。
-        const double fwd_car_allow =
+        // clearance >= req_car_clear <=> violation <= -req_car_clear
+        // req_*_clear が 0 のとき(緩い段)は締めない。ここで無条件に clamp すると
+        // 「開始時に既に重なっているなら +0.05 まで許す」という逃げ道を潰してしまい、
+        // 相手が前方 2.6m 以内にいるだけで経路が一切見つからなくなる
+        // (過去に実際に出したバグ。復帰が20秒以上働かなかった)。
+        double fwd_car_allow =
           std::min(car_allow, carViolation(cars, veh, after_rev) + 0.05);
+        if (req_car_clear > 0.0) { fwd_car_allow = std::min(fwd_car_allow, -req_car_clear); }
+        // clearance >= req_wall_clear <=> violation <= wall_margin - req_wall_clear
+        double fwd_wall_allow = allow;
+        if (req_wall_clear > 0.0) {
+          fwd_wall_allow = std::min(allow, veh.wall_margin - req_wall_clear);
+        }
         for (int i = 0; i < fnmax; ++i) {
           q = advance(q, kStep, fs, veh.wheel_base);
           const double vio = wallViolation(obstacles, corridor, veh, q);
-          if (vio > allow) { break; }
+          if (vio > fwd_wall_allow) { break; }
           const double cvio = carViolation(cars, veh, q);
           if (cvio > fwd_car_allow) { break; }
           if (touching && fwd_is_first && (i + 1) * kStep <= kEarlyLen &&
@@ -587,12 +611,114 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           best.phases.push_back({true, fs, fl});
           best.path.assign(path.begin(), path.begin() + rev_pts);
           best.path.insert(best.path.end(), fpath.begin(), fpath.begin() + fn);
+          best.rev_points = rev_pts;
           best.cost = cost;
           best.valid = true;
+          // 採用した前進区間の最小余裕を記録する。best を更新するときだけ計算する
+          // (毎候補で計算すると重い)。追従中の中断閾値をこれに合わせるために使う。
+          {
+            double min_wall = 1e9;
+            double min_car = 1e9;
+            for (int k = 0; k < fn; ++k) {
+              min_wall = std::min(min_wall, wallClearanceAt(obstacles, veh, fpath[k]));
+              min_car = std::min(min_car, carClearanceAt(cars, veh, fpath[k]));
+            }
+            best.min_wall_clear = min_wall;
+            best.min_car_clear = min_car;
+          }
         }
       }
     }
   }
+
+  // 【best_effort】ここまでの探索で「どこにも当たらない・改善する」案が
+  // 1つも無かった(best.valid == false)場合、円を1.49mへ拡げた副作用で
+  // 「解なしを返す」距離が伸びた分をここで受ける。
+  //
+  // ユーザー指示: 「どこにも当たらない案が無いなら、一番離れられる案を返す」。
+  // 解なしのまま通常制御に返すと、相手や壁へ押し付けたまま何もしない時間が
+  // 続く(過去の実測で20秒以上)。best_effort が立っているときだけ、
+  // 1回目とまったく同じ候補列挙(rev_len x st x fwd_len)をもう一度回すが、
+  // 今回は棄却条件(vio/cvio の閾値・touching/car_touching の出だし条件・
+  // min_gain・min_escape)を一切適用せず、経路の積分も最後まで行う。
+  // 評価は「経路上の全点での壁クリアランスと車クリアランスの最小値」とし、
+  // それが最大の候補(同点なら短いほう)を採用する。1回目の挙動には影響しない。
+  if (best_effort && !best.valid) {
+    double best_score = -1e18;
+    double best_len = 1e18;
+
+    for (double rl : rev_len) {
+      if (first_phase < 0 && rl < 1e-6) { continue; }
+      if (first_phase > 0 && rl > 1e-6) { continue; }
+      if (min_reverse > 0.0 && rl < min_reverse - 1e-6) { continue; }
+      if (rl > max_reverse + 1e-6) { continue; }
+      for (double rs : st) {
+        if (rl < 1e-6 && std::abs(rs) > 1e-6) { continue; }
+        Pose p = start;
+        std::vector<Pose> path;
+        path.push_back(p);
+        const int rn = static_cast<int>(std::ceil(rl / kStep));
+        for (int i = 0; i < rn; ++i) {
+          p = advance(p, -kStep, rs, veh.wheel_base);
+          path.push_back(p);
+        }
+        const Pose after_rev = p;
+        const std::size_t rev_pts = path.size();
+
+        for (double fs : st) {
+          Pose q = after_rev;
+          std::vector<Pose> fpath;
+          const double fmax = fwd_len[6];
+          const int fnmax = static_cast<int>(std::ceil(fmax / kStep));
+          for (int i = 0; i < fnmax; ++i) {
+            q = advance(q, kStep, fs, veh.wheel_base);
+            fpath.push_back(q);
+          }
+          for (double fl : fwd_len) {
+            if (fl > ahead_max + 1e-6) { continue; }
+            const int fn = static_cast<int>(std::ceil(fl / kStep));
+            if (static_cast<int>(fpath.size()) < fn) { continue; }
+
+            double score = 1e18;
+            for (std::size_t k = 0; k < rev_pts; ++k) {
+              score = std::min(score, wallClearanceAt(obstacles, veh, path[k]));
+              score = std::min(score, carClearanceAt(cars, veh, path[k]));
+            }
+            for (int k = 0; k < fn; ++k) {
+              score = std::min(score, wallClearanceAt(obstacles, veh, fpath[k]));
+              score = std::min(score, carClearanceAt(cars, veh, fpath[k]));
+            }
+            const double length = rl + fl;
+            const bool better = score > best_score + 1e-9 ||
+              (std::abs(score - best_score) <= 1e-9 && length < best_len);
+            if (!better) { continue; }
+
+            best_score = score;
+            best_len = length;
+            best.phases.clear();
+            if (rl > 1e-6) { best.phases.push_back({false, rs, rl}); }
+            best.phases.push_back({true, fs, fl});
+            best.path.assign(path.begin(), path.begin() + rev_pts);
+            best.path.insert(best.path.end(), fpath.begin(), fpath.begin() + fn);
+            best.rev_points = rev_pts;
+            best.cost = -score;
+            best.valid = true;
+            {
+              double min_wall = 1e9;
+              double min_car = 1e9;
+              for (int k = 0; k < fn; ++k) {
+                min_wall = std::min(min_wall, wallClearanceAt(obstacles, veh, fpath[k]));
+                min_car = std::min(min_car, carClearanceAt(cars, veh, fpath[k]));
+              }
+              best.min_wall_clear = min_wall;
+              best.min_car_clear = min_car;
+            }
+          }
+        }
+      }
+    }
+  }
+
   return best;
 }
 

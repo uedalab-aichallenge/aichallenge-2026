@@ -1,10 +1,13 @@
 #ifndef STUCK_RECOVERY_CONTROLLER_HPP_
 #define STUCK_RECOVERY_CONTROLLER_HPP_
 
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <v2x_msgs/msg/v2_x_vehicle_position_array.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "stuck_recovery_controller/recovery_planner.hpp"
 
@@ -42,6 +45,10 @@ private:
     const AckermannControlCommand & command, const rclcpp::Time & now);
   bool runRecovery(const rclcpp::Time & now);
   void publishCommand(float speed, float acceleration, float steer = 0.0f);
+  // publish 間隔の自己監視用(OVER ペナルティは 250Hz 以上でも付く)
+  double last_pub_t_{-1.0};
+  double last_fast_log_t_{-1.0};
+  int fast_pub_cnt_{0};
   void loadRaceline(const std::string & raceline_csv, const std::string & corridor_csv);
   bool isRearClear();
   // --- stuck 判定の材料(updateStuckDetection から切り出したもの) ---
@@ -100,6 +107,20 @@ private:
   rclcpp::Publisher<AckermannControlCommand>::SharedPtr control_pub_;
   rclcpp::Publisher<GearCommand>::SharedPtr gear_pub_;
   rclcpp::Subscription<AckermannControlCommand>::SharedPtr nominal_sub_;
+  rclcpp::Subscription<AckermannControlCommand>::SharedPtr reverse_sub_;
+  AckermannControlCommand::ConstSharedPtr reverse_cmd_;
+  // 後退区間を経路で渡している最中か。true の間は後退用 pure_pursuit を中継する。
+  bool reverse_following_{false};
+  bool reverse_traj_enable_{true};
+  bool wedge_backward_first_{true};   // 壁へ食い込んでいたら後退から始める
+  rclcpp::Publisher<Trajectory>::SharedPtr reverse_traj_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr recovery_path_pub_;
+  rclcpp::Time last_path_marker_{0, 0, RCL_ROS_TIME};
+  void publishRecoveryPathMarker(std::size_t from);
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_pub_;
+  void publishGrid();
+  rclcpp::TimerBase::SharedPtr grid_timer_;
+  bool grid_logged_{false};
   // 復帰の前進区間は、指令を直接作るのではなく「たどってほしい経路」を
   // publish して pure_pursuit に追従させる。そのほうが通常制御への
   // 戻りが連続になり、後退に頼る量も減る。後退は pure_pursuit では
@@ -109,6 +130,8 @@ private:
   Trajectory::ConstSharedPtr latest_traj_;
   // 前進区間を経路で渡している間は、舵と速度を pure_pursuit に任せる。
   bool traj_following_{false};
+  // デバッグ表示(GUI)用。復帰が車両へ指令を出している間だけ流す。
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Time last_traj_log_{0, 0, RCL_ROS_TIME};
   // 軌道で渡しているのに動かないときの安全弁。
   // pure_pursuit が何らかの理由で動かせない場合、こちらが指令を出さない
@@ -144,6 +167,19 @@ private:
   std::optional<rclcpp::Time> recovery_start_time_;
   float escape_dir_{0.0f};   // 逃げる向き(+1=左)。後退と前進で共有する
   std::optional<rclcpp::Time> recovery_end_time_;  // 復帰完了時刻(再突入の抑制に使う)
+
+  // --- 理由を問わない最後の安全網(hard stall)---
+  // 実測(20260829-181500 d1 レース277s〜): preventRearEnd が上限0を出し続け、
+  // 実速度 -0.00m/s のまま **55秒** 一度も復帰へ入らなかった。
+  // 入口のゲートが motion_requested(指令速度>=1.0) か blocked_by_vehicle の
+  // どちらかを要求しており、指令0かつ前方車の箱に入らない相手だと
+  // hasNoProgress を評価する前に return してしまう。
+  // ここは指令も他車も見ず、「車体が動いていない」事実だけで拾う。
+  double hard_stall_sec_{0.0};    // 0 = 無効(退避スイッチ)
+  double hard_stall_dist_{0.8};
+  double hard_ref_x_{0.0}, hard_ref_y_{0.0};
+  rclcpp::Time hard_ref_time_{0, 0, RCL_ROS_TIME};
+  bool hard_ref_valid_{false};
 
   // 復帰は「計算した経路を走る」方式。
   //
@@ -230,6 +266,11 @@ private:
   bool entry_ref_valid_{false};
   double phase_start_wall_clear_{1e3};
   double phase_start_car_clear_{1e3};
+  // 採用した計画が前進区間で見込んだ最小余裕[m]。中断閾値をこれに合わせて
+  // 「計画が通した幾何を中断側が落とす」食い違いを無くすために持つ。
+  // 計画が取れなかったときは 1e9 のまま(=中断閾値は既定値を使う)。
+  double plan_min_wall_clear_{1e9};
+  double plan_min_car_clear_{1e9};
   void beginRecovery(const rclcpp::Time & now, bool forward_blocked = false);
   void finishRecovery(const rclcpp::Time & now);
   bool currentPose(recovery::Pose & p) const;

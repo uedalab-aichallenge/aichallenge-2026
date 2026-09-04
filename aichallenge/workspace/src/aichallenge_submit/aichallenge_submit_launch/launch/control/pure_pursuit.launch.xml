@@ -24,8 +24,18 @@
          idx165-185 は内側の余地が 0.90m しかなく、pure_pursuit が
          ラインより 1.2m 内側を通ると領域外に出る。曲率で決めると
          もっときつい idx51-65(R4.0m) 等が強く縮まって発振する。 -->
-    <param name="lookahead_scale_zones" value=""/>
+    <param name="lookahead_scale_zones" value="162:168:0.35"/>
     <param name="lookahead_curve_ahead" value="6.0"/>
+    <!-- 【A/B比較用 2026-09-03】v2x_overtaker が出す舵角範囲へのクランプ。 -->
+    <param name="wall_guard_clamp_enable" value="false"/>
+    <!-- 低速で目標点を近づける処理の下限[m]。
+         【重要】ホイールベースは実測 2.14m。lookahead がこれを下回ると
+         pure pursuit の要求半径が最大舵角で到達できる半径(3.05m)を
+         下回り、舵が飽和したまま収束しない。復帰動作は低速かつ
+         ライン外なので必ずここに入る。 -->
+    <param name="lookahead_slow_min" value="2.8"/>
+    <param name="lookahead_slow_speed" value="2.78"/>
+    <param name="lookahead_slow_exp" value="2.0"/>
     <param name="speed_proportional_gain" value="1.0"/>
     <!-- OVER ペナルティ(|a|>3 m/s^2 で 2 秒間 5 km/h 制限)を踏まないための上限。
          AWSIM は入力を ±1.37 に clamp するので 2.0 でも性能は落ちない。 -->
@@ -47,8 +57,16 @@
        出典: https://github.com/AutomotiveAIChallenge/stuck_recovery_controller -->
   <node pkg="stuck_recovery_controller" exec="stuck_recovery_controller_node"
         name="stuck_recovery_controller" output="screen">
+    <!-- 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始める。
+         false で従来(前進を2秒試してから切り返す)。A/B 用に env で切替可。 -->
+    <param name="wedge_backward_first" value="$(env RECOVERY_FIX false)"/>
     <!-- 復帰経路の計算に使う。コース境界(可動域)と他車位置から
          「後退したときに最も空いている方向」を選んで舵を当てる。 -->
+    <!-- 理由を問わない膠着の安全網。指令0かつ相手が前方車の箱に入らないと
+         復帰に永久に入らない穴があり、実測で55秒間停止し続けた。
+         0.0 で無効(従来どおり)。 -->
+    <param name="hard_stall_sec" value="4.0"/>
+    <param name="hard_stall_dist" value="0.8"/>
     <param name="raceline_csv"
            value="$(find-pkg-share simple_trajectory_generator)/data/$(var raceline_file)"/>
     <param name="corridor_csv"
@@ -63,5 +81,24 @@
          pure_pursuit が読むトピックへ流す)。 -->
     <remap from="input/trajectory" to="/planning/scenario_planning/trajectory_v2x"/>
     <remap from="output/trajectory" to="/planning/scenario_planning/trajectory"/>
+    <!-- 後退区間の経路。後退用 pure_pursuit がこれを追従する。 -->
+    <remap from="output/reverse_trajectory" to="/planning/scenario_planning/trajectory_reverse"/>
+  </node>
+
+  <!-- 後退用 pure_pursuit(2026-08-31・ユーザー指示)。
+       復帰の後退区間を、直接の舵角指令ではなく経路追従で走らせる。
+       前軸を基準に後方の目標点を追い、舵の符号を反転する。
+       ギアは stuck_recovery_controller が持つ(こちらは出さない)。
+       最終出力は復帰ノードが中継するので、reverse 側の専用トピックへ出す。 -->
+  <node pkg="reverse_pure_pursuit" exec="reverse_pure_pursuit"
+        name="reverse_pure_pursuit_node" output="screen">
+    <param name="lookahead_gain" value="0.0"/>
+    <param name="lookahead_min_distance" value="2.5"/>
+    <param name="wheel_base" value="2.14"/>
+    <param name="steering_tire_angle_gain" value="2.8"/>
+    <param name="reverse_max_speed" value="1.5"/>
+    <remap from="input/kinematics" to="/localization/kinematic_state"/>
+    <remap from="input/trajectory" to="/planning/scenario_planning/trajectory_reverse"/>
+    <remap from="output/control_cmd" to="/control/command/reverse_control_cmd"/>
   </node>
 </launch>

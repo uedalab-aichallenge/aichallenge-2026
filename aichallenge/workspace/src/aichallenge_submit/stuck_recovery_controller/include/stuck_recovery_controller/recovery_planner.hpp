@@ -39,6 +39,33 @@ public:
   // 壁の中で負(食い込み量)。地図の外は判定しない(大きな値)。
   double clearance(double x, double y) const;
 
+  // --- rviz へそのまま出すための読み出し(2026-08-31・ユーザー指示)
+  //
+  // 復帰の当たり判定が **実際に見ている地図** を publish するために要る。
+  // map_server を別に立てて同じ yaml を読ませる手もあるが、それだと
+  // 「判定が見ている地図」と「表示している地図」が別物になり得る。
+  // ここから出せば原理的にズレない。
+  int width() const { return w_; }
+  int height() const { return h_; }
+  double resolution() const { return res_; }
+  double originX() const { return ox_; }
+  double originY() const { return oy_; }
+  // 格子 (ix, iy) の符号付き距離[m]。範囲外は 0 を返す。
+  //
+  // **iy は nav_msgs/OccupancyGrid の約束(iy=0 が原点＝下端、上へ増える)**で受ける。
+  // 内部の dist_ は pgm の行順(行0 = 画像の上端 = y が最大)で持っているので、
+  // ここで行を反転する。clearance() が
+  //     r = h - (y - oy) / res
+  // と数えているのと同じ向きにそろえるためで、これを忘れると
+  // **表示だけが上下反転する**(実際に出した不具合)。
+  // 当たり判定は clearance() を通るので、この関数は表示専用。
+  double distAt(int ix, int iy) const
+  {
+    if (ix < 0 || iy < 0 || ix >= w_ || iy >= h_) { return 0.0; }
+    const int r = h_ - 1 - iy;
+    return dist_[static_cast<std::size_t>(r) * static_cast<std::size_t>(w_) + ix];
+  }
+
 private:
   std::vector<float> dist_;
   int w_{0};
@@ -107,6 +134,14 @@ struct Plan
   std::vector<Pose> path;      // 積分した経路(表示・追従用)
   double cost{0.0};
   bool valid{false};
+  // 採用した計画の「前進区間」で見込まれる最小の余裕[m]。
+  // 追従中の中断閾値をこれに合わせるために持つ。計画が合格とした幾何を
+  // 中断側が落とす、という食い違いを構造的に無くす。
+  double min_wall_clear{1e9};
+  double min_car_clear{1e9};
+  // path の先頭から何点が「後退区間」か。後退と前進で別のコントローラへ
+  // 経路を渡すために要る(2026-08-31)。
+  std::size_t rev_points{0};
 };
 
 // 現在姿勢から、コリドア内で目標経路へ戻る操作を計算する。
@@ -152,7 +187,15 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           int first_phase = 0, double min_gain = 0.0,
           double min_escape = 2.5, double min_reverse = 0.0,
           double max_reverse = 8.0,
-          const std::vector<CarObstacle> & cars = {});
+          const std::vector<CarObstacle> & cars = {},
+          double req_wall_clear = 0.0,   // 前進区間で確保したい壁との余裕[m]
+          double req_car_clear = 0.0,    // 前進区間で確保したい他車との余裕[m]
+          // true なら、通常探索で解が1つも無いときに棄却条件を全て外して
+          // 再探索し、「どこにも当たらない案が無いなら、一番離れられる案」を
+          // 返す(ユーザー指示)。kCarRadius を 1.49m に拡げた副作用で
+          // 「解なし」を返す距離が伸びたぶんをここで受ける。
+          bool best_effort = false
+          );
 
 // 姿勢 p に車体を置いたときの、他車との重なりの深さ[m]。
 // **常に 0 以上**を返す(離れていても 0)。経路の棄却判定にだけ使うこと。
