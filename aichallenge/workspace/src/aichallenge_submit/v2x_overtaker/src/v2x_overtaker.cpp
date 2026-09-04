@@ -504,9 +504,15 @@ V2XOvertaker::V2XOvertaker()
   stop_avoid_emg_margin_(declare_parameter<double>("stop_avoid_emg_margin", 2.0)),
   // AWSIM は加速度指令を 1.37 に切り捨てる(開発メモ の実測)。
   // 要求できる減速度の上限がそれなので、発火距離もこれで計算する。
-  // 【計測で戻した 2026-09-05】1.4(指令の切り捨て値)にすると発火距離が倍近くなり、
-  // 停止が増えて退行した。実測の到達減速度 2.44 と指令上限 1.37 の間を採る。
-  stop_avoid_emg_accel_(declare_parameter<double>("stop_avoid_emg_accel", 2.0)),
+  // 【実測 2026-09-05】急ブレーキを実測した(local_script/brake_measure2.py)。
+  // 強い制動(指令 <= -1.2 m/s^2)を出した窓だけを切り出し、衝突の衝撃(|ax|>5)を
+  // 除いた結果:
+  //   達成された平均減速度 中央 1.66 / p90 1.85 / 最大 1.94 m/s^2
+  //   瞬間の減速度        中央 1.92 / 最大 2.38 m/s^2
+  //   指令は ±2.00 でクランプされている
+  // 制動距離は 8m/s から 19.3m、10m/s から 30.2m。
+  // 2.0 は楽観(10m/s で 25m)だったので実測の中央値へ寄せる。
+  stop_avoid_emg_accel_(declare_parameter<double>("stop_avoid_emg_accel", 1.7)),
   // 継続が成立しない状態がこの秒数続いたら試行を終える。0 で無効。
   attempt_infeasible_time_(declare_parameter<double>("attempt_infeasible_time", 1.5)),
   // 打切りの基準: いまの横位置のまま この秒数ぶん進んだときの縁までの余裕が
@@ -686,7 +692,20 @@ V2XOvertaker::V2XOvertaker()
   start_gap_closing_max_(declare_parameter<double>("start_gap_closing_max", 1.5)),
   start_gap_floor_(declare_parameter<double>("start_gap_floor", 1.5)),
   // 減速の見積りを割り引く係数。指令どおりには効かない。
+  // 【実測で見直した 2026-09-05】0.22 は |a_min|(2.5) に対して 0.55 m/s^2 の
+  // 制動を前提にしていた。この値は「追突防止が減速を掛けている区間の実測
+  // 中央値 0.48」から決めたものだが、**その区間では上限が現在速度のすぐ下に
+  // しか置かれていないので、弱い減速しか要求していない**。
+  // つまり「弱いと仮定して早めに減速するから弱い要求しか出ない」という
+  // 自己充足的な校正になっていた。
+  //
+  // 強い制動を指令した窓だけを実測すると **1.66 m/s^2 出ている**
+  // (local_script/brake_measure2.py)。制動距離は減速度に反比例するので、
+  // 0.55 前提では**必要より約3倍手前から速度を落としている**。
+  // これが「せっかく加速して得た速度を落として抜けない」の直接の原因。
   rear_end_brake_k_(declare_parameter<double>("rear_end_brake_k", 0.22)),
+  // 抜く算段が付いているときの制動係数。実測 1.66 m/s^2 の下限側(1.09)相当。
+  rear_end_brake_k_pass_(declare_parameter<double>("rear_end_brake_k_pass", 0.45)),
   // 接触位置へ食い込んだとき、1m につきこれだけ[m/s]相手より遅くする。
   rear_end_back_k_(declare_parameter<double>("rear_end_back_k", 0.8)),
   // 反応の遅れとして見込む時間[s]。この間に進む距離を車間から引く。
@@ -5873,7 +5892,24 @@ void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
   //   自車30/相手18 (Δv3.3m/s): 発動車間 7.7m -> 14.0m
   //   自車25/相手23 (Δv0.55m/s): 3.9m -> 4.0m (後ろで待つ場面はほぼ不変)
   // 「待っているだけの場面」を縛らずに「詰まっている場面」だけ早める形になる。
-  const double brake_a = std::max(std::abs(a_min_) * rear_end_brake_k_, 0.3);
+  // --- 詰めてよいのは「抜けると分かっているとき」だけ(実測 2026-09-05) ---
+  //
+  // 【実測で分かった構造】
+  //  ・`rear_end_brake_k=0.22`(制動 0.55m/s^2 前提)では、実測能力 1.66 の 1/3 なので
+  //    **必要より約3倍手前から速度を落とす。** 先頭に 1.8m までしか近づけず抜けない。
+  //  ・0.45(1.09m/s^2 前提)に上げると **0.4m まで詰められ、追い越しも 1→3〜4件/レース**
+  //    に増えた。診断は正しかった。
+  //  ・ただしペナルティ回数が 1.67 → 3.25/車レース、リタイアが 0/12 → 5/16 に悪化した。
+  //    **詰めた後に安全に横へ出る手段が無いので、詰めた分そのままぶつかる。**
+  //
+  // したがって制動の前提は状況で切り替える。
+  //  ・**抜く算段が付いている**(試行中で、選んだ側に余地があり、幅も足りている)
+  //    → 実測に近い値で詰めてよい。抜くための速度を捨てない。
+  //  ・そうでない(ただ後ろに付いているだけ)
+  //    → 従来の保守的な値。詰める意味が無いのでリスクだけ取らない。
+  const bool pass_underway = attempt_active_ && side_fits_ && dbg_width_ >= min_pass_width_;
+  const double brake_k = pass_underway ? rear_end_brake_k_pass_ : rear_end_brake_k_;
+  const double brake_a = std::max(std::abs(a_min_) * brake_k, 0.3);
   // 接触は**中心間 約2.6m**で起きる(自車前端は原点から1.6m、相手の後端まで約1.0m)。
   // rear_end_margin はこの接触位置に残す余裕。
   // 【3.5 にした理由】接触の余裕ではなく **best_gap の量子化**の吸収。

@@ -1112,6 +1112,7 @@ private:
   const double start_gap_closing_max_;  // 開始車間緩和を許す接近速度の上限[m/s]
   const double start_gap_floor_;  // 開始車間の最小限(貼り付き直後の新規横出しを防ぐ)[m]
   const double rear_end_brake_k_; // 減速の見積りを割り引く係数
+  const double rear_end_brake_k_pass_;  // 抜く算段が付いているときの制動係数
   const double rear_end_back_k_;  // 食い込んだとき相手より遅くする割合[1/s]
   const double rear_end_time_;    // 反応の遅れとして見込む時間[s]
   const double squeeze_ahead_;    // 前に車がいるとき帯を見る先の距離[m]

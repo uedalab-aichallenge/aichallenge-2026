@@ -37,6 +37,7 @@ x-autoware-base: &autoware-base
     - WALL_FWD_BAN_HOLD=${WALL_FWD_BAN_HOLD:-0.8}
     - STOP_AVOID_FIX=${STOP_AVOID_FIX:-true}
     - LATCH_HARD=${LATCH_HARD:-false}
+    - REAR_END_BRAKE_K=${REAR_END_BRAKE_K:-0.22}
     - OT_LANE_GUARD_ON=${OT_LANE_GUARD_ON:-true}
     - OT_LANE=${OT_LANE:-false}
     - OT_LANE_ZONES=${OT_LANE_ZONES:-234:21}
