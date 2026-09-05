@@ -1,4 +1,6 @@
 #include "stuck_recovery_controller/recovery_planner.hpp"
+#include <map>
+#include <queue>
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +76,78 @@ void edt1d(std::vector<float> & f, std::vector<float> & d,
     const float dx = static_cast<float>(q - v[k]);
     d[q] = dx * dx + f[v[k]];
   }
+}
+
+
+// 中心線上の 2 点間の弧長[m]。進行方向にだけ数える。
+double arcBetween(const Corridor & c, std::size_t from, std::size_t to)
+{
+  const std::size_t n = c.x.size();
+  double acc = 0.0;
+  std::size_t i = from;
+  for (std::size_t k = 0; k < n; ++k) {
+    if (i == to) { return acc; }
+    const std::size_t j = (i + 1) % n;
+    acc += std::hypot(c.x[j] - c.x[i], c.y[j] - c.y[i]);
+    i = j;
+  }
+  return acc;
+}
+
+// 中心線の局所曲率半径[m]。3 点から求める。直線に近ければ大きな値。
+double localRadius(const Corridor & c, std::size_t idx, std::size_t span)
+{
+  const std::size_t n = c.x.size();
+  const std::size_t a = (idx + n - span) % n;
+  const std::size_t b = idx;
+  const std::size_t d = (idx + span) % n;
+  const double ax = c.x[a], ay = c.y[a];
+  const double bx = c.x[b], by = c.y[b];
+  const double cx = c.x[d], cy = c.y[d];
+  const double area2 = std::abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax));
+  if (area2 < 1e-6) { return 1e9; }
+  const double ab = std::hypot(bx - ax, by - ay);
+  const double bc = std::hypot(cx - bx, cy - by);
+  const double ca = std::hypot(ax - cx, ay - cy);
+  return ab * bc * ca / (2.0 * area2);
+}
+
+// 目標地点 gi を速度 v_end で通過したあと、共通の評価地点まで走るのに要る時間[s]。
+//
+// 【なぜ要るか】ユーザー指摘「後退を減らすと大きく回転して逆に速度が落ちる」。
+// 復帰の経路だけを比べると「短く済む経路」が勝つが、**復帰した地点と
+// そのときの速度**で、その後の走りが決まる。共通の地点までの時間で比べれば、
+// 大きく回頭して速度を失う経路は自動的に負ける。
+double tailTime(const Corridor & c, std::size_t start_idx, std::size_t gi,
+                double v_end, const GoalPlanParams & prm)
+{
+  const std::size_t n = c.x.size();
+  // 共通の評価地点(現在位置から tail_len 先)までの残り距離。
+  const double done = arcBetween(c, start_idx, gi);
+  double remain = prm.tail_len - done;
+  if (remain <= 0.0) { return 0.0; }
+  double v = std::max(v_end, 0.1);
+  double t = 0.0;
+  std::size_t i = gi;
+  for (std::size_t k = 0; k < n && remain > 0.0; ++k) {
+    const std::size_t j = (i + 1) % n;
+    double ds = std::hypot(c.x[j] - c.x[i], c.y[j] - c.y[i]);
+    if (ds > remain) { ds = remain; }
+    if (ds < 1e-6) { i = j; continue; }
+    const double r = localRadius(c, i, 3);
+    const double v_lim = std::min(prm.v_fwd_max, std::sqrt(prm.ay_max * r));
+    double v2;
+    if (v < v_lim) {
+      v2 = std::min(v_lim, std::sqrt(v * v + 2.0 * prm.a_accel * ds));
+    } else {
+      v2 = std::max(v_lim, std::sqrt(std::max(v * v - 2.0 * prm.a_brake * ds, 0.01)));
+    }
+    t += 2.0 * ds / std::max(v + v2, 0.2);
+    v = v2;
+    remain -= ds;
+    i = j;
+  }
+  return t;
 }
 
 }  // namespace
@@ -391,6 +465,302 @@ bool poseAhead(const Corridor & c, std::size_t start_idx, double dist, Pose & ou
 }
 
 }  // namespace
+
+
+// ===================================================================
+// 目標指向の復帰計画。設計の意図はヘッダのコメントを参照。
+// ===================================================================
+Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
+                const VehicleParams & veh, const Pose & start,
+                const std::vector<CarObstacle> & cars,
+                const GoalPlanParams & prm,
+                std::size_t * goal_idx_out)
+{
+  Plan out;
+  if (!corridor.valid()) { return out; }
+  std::size_t start_idx = 0;
+  double start_lat = 0.0;
+  if (!corridor.locate(start.x, start.y, start_idx, start_lat)) { return out; }
+
+  // --- 目標の候補を作る。参照経路上の「少し先」を等間隔に並べる ---
+  // 1点だけに絞ると、そこがヘアピンの途中で到達できない向きだった場合に
+  // 「解なし」になる。範囲で置いて、到達できた最も手前を採る。
+  struct Goal { Pose pose; std::size_t idx; };
+  std::vector<Goal> goals;
+  for (double d = prm.goal_ahead_min; d <= prm.goal_ahead_max + 1e-9;
+       d += prm.goal_ahead_step)
+  {
+    Pose g;
+    if (!poseAhead(corridor, start_idx, d, g)) { break; }
+    std::size_t gi = 0; double glat = 0.0;
+    if (!corridor.locate(g.x, g.y, gi, glat)) { continue; }
+    goals.push_back({g, gi});
+  }
+  if (goals.empty()) { return out; }
+
+  // --- 当たり判定の許容。開始時点で食い込んでいるならそのぶんは許す ---
+  // 許さないと「いま壁に触れている」状態から一歩も動かせない。
+  // --- 許容は「出だしだけ」に限る(2026-09-06) ---
+  //
+  // 【何が起きていたか】開始時点の食い込みを経路の終わりまで許していたので、
+  // **壁に 0.32m 食い込んだままの経路**を「到達できる」として返していた。
+  // 押し付けるので進めず、引き直すと同じ姿勢から同じ答えが返る。
+  // 実測: 同一の計画(切り返し0回 前進9.5m 余裕壁-0.32)を **189回** 出し直した。
+  // ユーザーが見た「複数回の切り返し」は、1つの計画の中の切り返しではなく
+  // この引き直しの繰り返しだった。
+  //
+  // 触れている状態から動き出すには最初の数十cmの許容が要る。
+  // そこで **開始から kAllowLen[m] までは開始時の食い込みを許し、
+  // それ以降は食い込み 0 を要求する。**
+  const double start_wall_vio = wallViolation(obstacles, corridor, veh, start);
+  const double start_car_vio = carViolation(cars, veh, start);
+  // 【減衰では足りなかった 2026-09-06】許容を距離で線形に減衰させたが、
+  // 開始時点の食い込みが大きい(実測 -0.50m)と減衰の途中でも許容が残り、
+  // **終端で -0.10m 食い込む経路**が通っていた。食い込んだ経路は実行できず、
+  // 引き直して同じ答えが返る。
+  //
+  // 許容は「離れる向きへ動き出すため」にだけ要る。したがって
+  //   ・開始から kAllowLen[m] までは、**開始時点より悪化しない**ことだけを求める
+  //   ・それ以降は食い込み 0 を求める
+  // とする。減衰させず、条件そのものを切り替える。
+  // 【まだ緩すぎた 2026-09-06】開始から kAllowLen[m] のあいだ
+  // 「開始時点の食い込みを許す」としたが、開始時点で 0.85m 食い込んでいると
+  // その 1.5m の窓に**第1区間(前進1.5m)が丸ごと収まり**、
+  // `余裕壁 -0.40` の経路が通っていた。実測ではその計画が70回返り、
+  // 壁前進禁止に毎回止められて位置が 1mm も変わらなかった。
+  //
+  // 許容は「離れる向きへ動き出すため」にだけ要る。したがって
+  //   ・出だしは**開始時点より悪化しない**ことだけを求める(許容は据え置き)
+  //   ・そのぶん **kAllowLen を車体が抜け出せる最小限(0.6m)に縮める**
+  //   ・そして下で **経路全体の最小余裕が負の案は採らない**
+  constexpr double kAllowLen = 0.6;
+  auto wall_allow_at = [&](double run) {
+    return (run < kAllowLen) ? start_wall_vio : 0.0;
+  };
+  auto car_allow_at = [&](double run) {
+    return (run < kAllowLen) ? start_car_vio : 0.0;
+  };
+
+  // --- 素片。舵は最大舵角を5段階 ---
+  const double steers[5] = {-veh.max_steer, -veh.max_steer * 0.5, 0.0,
+                            veh.max_steer * 0.5, veh.max_steer};
+
+  struct Node
+  {
+    Pose pose;
+    double g{0.0};        // ここまでの所要時間[s]
+    double f{0.0};        // g + ヒューリスティック
+    double v{0.0};        // その姿勢での進行方向の速さ[m/s]
+    double run{0.0};      // 開始からの走行距離[m](許容の減衰に使う)
+    int dir{0};           // 直前の素片の向き +1 前進 / -1 後退 / 0 開始
+    int switches{0};      // ここまでの切り返し回数
+    int parent{-1};
+    double steer{0.0};    // ここへ来た素片の舵角
+  };
+
+  // ヒューリスティック: 目標までの直線距離を上限速度で割った時間。
+  // どの動作もこれより速くは進めないので許容的(A* の最適性が保てる)。
+  auto heuristic = [&](const Pose & p) {
+    double best = 1e18;
+    for (const auto & gl : goals) {
+      best = std::min(best, std::hypot(gl.pose.x - p.x, gl.pose.y - p.y));
+    }
+    return best / std::max(prm.v_fwd_max, 0.1);
+  };
+  auto reached = [&](const Pose & p, std::size_t & gi) {
+    for (const auto & gl : goals) {
+      if (std::hypot(gl.pose.x - p.x, gl.pose.y - p.y) <= prm.pos_tol &&
+          std::abs(wrap(p.yaw - gl.pose.yaw)) <= prm.yaw_tol)
+      {
+        gi = gl.idx;
+        return true;
+      }
+    }
+    return false;
+  };
+  auto key = [&](const Pose & p, int dir, double v) {
+    const long ix = static_cast<long>(std::floor(p.x / prm.grid_xy));
+    const long iy = static_cast<long>(std::floor(p.y / prm.grid_xy));
+    long iyaw = static_cast<long>(std::floor(wrap(p.yaw) / prm.grid_yaw));
+    iyaw += 64;   // 方位の索引を非負に寄せる
+    const long iv = static_cast<long>(std::floor(v / std::max(prm.grid_v, 0.1)));
+    return (((ix * 100003L + iy) * 251L + iyaw) * 3L + (dir + 1)) * 61L + iv;
+  };
+
+  std::vector<Node> nodes;
+  nodes.reserve(4096);
+  Node s0;
+  s0.pose = start;
+  s0.g = 0.0;
+  s0.v = 0.0;          // 復帰に入る時点では止まっている前提
+  s0.f = heuristic(start);
+  nodes.push_back(s0);
+
+  // f が小さい順に取り出す。std::priority_queue は最大取り出しなので符号を反転。
+  using Item = std::pair<double, int>;
+  std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
+  open.push({s0.f, 0});
+  std::map<long, double> best_cost;
+  best_cost[key(start, 0, 0.0)] = 0.0;
+
+  int expanded = 0;
+  int goal_node = -1;
+  std::size_t goal_idx = 0;
+  double best_total = 1e18;
+  while (!open.empty() && expanded < prm.max_expand) {
+    const auto top = open.top();
+    open.pop();
+    const int ci = top.second;
+    if (top.first > nodes[ci].f + 1e-9) { continue; }   // 古い項目
+    ++expanded;
+    {
+      // 到達したら、共通の評価地点までの時間を足した合計で比べる。
+      // **後退量ではなく所要時間で選ぶ**ので、大きく回頭して速度を失う経路は
+      // ここで負ける(ユーザー指摘の訂正を反映)。
+      std::size_t gi = 0;
+      if (nodes[ci].dir > 0 && reached(nodes[ci].pose, gi)) {
+        const double total = nodes[ci].g +
+                             tailTime(corridor, start_idx, gi, nodes[ci].v, prm);
+        if (total < best_total) {
+          best_total = total;
+          goal_node = ci;
+          goal_idx = gi;
+        }
+        // 目標に着いた枝はそこで打ち切る(その先を伸ばす意味がない)。
+        continue;
+      }
+    }
+    for (int dir : {+1, -1}) {
+      const int sw = nodes[ci].switches +
+                     ((nodes[ci].dir != 0 && dir != nodes[ci].dir) ? 1 : 0);
+      if (sw > prm.max_switch) { continue; }
+      for (double st : steers) {
+        // 素片を細かく積分して当たり判定する。刻みは plan() と同じ kStep。
+        Pose p = nodes[ci].pose;
+        bool ok = true;
+        const int sub = std::max(1, static_cast<int>(std::ceil(prm.step / kStep)));
+        const double ds = (dir > 0 ? 1.0 : -1.0) * (prm.step / sub);
+        // 開始からの走行距離。許容はこれで減衰させる。
+        double run = nodes[ci].run;
+        for (int k = 0; k < sub; ++k) {
+          p = advance(p, ds, st, veh.wheel_base);
+          run += std::abs(ds);
+          if (wallViolation(obstacles, corridor, veh, p) > wall_allow_at(run)) {
+            ok = false; break;
+          }
+          if (carViolation(cars, veh, p) > car_allow_at(run)) { ok = false; break; }
+        }
+        if (!ok) { continue; }
+        // --- この素片に要る時間を見積る ---
+        // 向きが変わるなら、まず止まりきる時間 + ギアが入る時間を払う。
+        double dt = 0.0;
+        double v0 = nodes[ci].v;
+        if (sw > nodes[ci].switches || nodes[ci].dir == 0) {
+          dt += v0 / prm.a_brake;      // 止まりきる
+          dt += prm.t_gear;            // ギアが入って動き出すまで
+          v0 = 0.0;
+        }
+        // 素片の旋回半径から、横加速度で許される速度の上限を出す。
+        // 舵を大きく切る素片は速度が出せない = 時間がかかる、が自然に入る。
+        const double r_prim = (std::abs(st) > 1e-6)
+                                ? std::abs(veh.wheel_base / std::tan(st)) : 1e9;
+        const double v_cap = (dir > 0)
+          ? std::min(prm.v_fwd_max, std::sqrt(prm.ay_max * r_prim))
+          : prm.v_rev_max;
+        double v1;
+        if (v0 < v_cap) {
+          v1 = std::min(v_cap, std::sqrt(v0 * v0 + 2.0 * prm.a_accel * prm.step));
+        } else {
+          v1 = std::max(v_cap,
+                        std::sqrt(std::max(v0 * v0 - 2.0 * prm.a_brake * prm.step, 0.01)));
+        }
+        dt += 2.0 * prm.step / std::max(v0 + v1, 0.2);
+        const double ng = nodes[ci].g + dt;
+        const long k2 = key(p, dir, v1);
+        const auto it = best_cost.find(k2);
+        if (it != best_cost.end() && it->second <= ng + 1e-9) { continue; }
+        best_cost[k2] = ng;
+        Node nd;
+        nd.pose = p;
+        nd.g = ng;
+        nd.v = v1;
+        nd.run = run;
+        nd.f = ng + heuristic(p);
+        nd.dir = dir;
+        nd.switches = sw;
+        nd.parent = ci;
+        nd.steer = st;
+        nodes.push_back(nd);
+        open.push({nd.f, static_cast<int>(nodes.size()) - 1});
+      }
+    }
+  }
+  if (goal_node < 0) { return out; }
+
+  // --- 経路を復元する ---
+  std::vector<int> chain;
+  for (int i = goal_node; i >= 0; i = nodes[i].parent) { chain.push_back(i); }
+  std::reverse(chain.begin(), chain.end());
+
+  out.path.clear();
+  out.phases.clear();
+  for (std::size_t k = 0; k < chain.size(); ++k) { out.path.push_back(nodes[chain[k]].pose); }
+  // 素片を向きでまとめて区間にする。直接制御へ落ちたときのために
+  // 各区間の舵角は「その区間の最初の素片の舵角」を代表値にする
+  // (追従は経路で行うので、区間はあくまで退避用)。
+  {
+    int cur_dir = 0;
+    double len = 0.0;
+    double steer0 = 0.0;
+    for (std::size_t k = 1; k < chain.size(); ++k) {
+      const Node & nd = nodes[chain[k]];
+      if (nd.dir != cur_dir) {
+        if (cur_dir != 0) { out.phases.push_back({cur_dir > 0, steer0, len}); }
+        cur_dir = nd.dir;
+        steer0 = nd.steer;
+        len = 0.0;
+      }
+      len += prm.step;
+    }
+    if (cur_dir != 0) { out.phases.push_back({cur_dir > 0, steer0, len}); }
+  }
+  // 最初の方向転換までの点数。後退用と合流用で経路を分けるのに使う。
+  out.rev_points = 0;
+  if (!out.phases.empty() && !out.phases.front().forward) {
+    std::size_t cnt = 1;   // 開始姿勢を含む
+    for (std::size_t k = 1; k < chain.size(); ++k) {
+      if (nodes[chain[k]].dir > 0) { break; }
+      ++cnt;
+    }
+    out.rev_points = cnt;
+  }
+  // 前進区間で見込む最小の余裕。追従中の中断閾値に使う(plan() と同じ意味)。
+  {
+    double min_wall = 1e9, min_car = 1e9;
+    for (std::size_t k = 1; k < chain.size(); ++k) {
+      if (nodes[chain[k]].dir <= 0) { continue; }
+      min_wall = std::min(min_wall, wallClearanceAt(obstacles, veh, nodes[chain[k]].pose));
+      min_car = std::min(min_car, carClearanceAt(cars, veh, nodes[chain[k]].pose));
+    }
+    out.min_wall_clear = min_wall;
+    out.min_car_clear = min_car;
+  }
+  out.cost = nodes[goal_node].g;
+  // --- 食い込む経路は採らない(2026-09-06) ---
+  // 出だしの許容(kAllowLen)を抜けたあとに食い込む案は、実行できない。
+  // 実測: `余裕壁 -0.40` の案を70回返し、壁前進禁止に毎回止められて
+  // 位置が変わらないまま無限に引き直していた。
+  // 採れないなら「計画なし」を返す。そのほうが上位が停止を選べる。
+  if (out.min_wall_clear < 0.0) {
+    out.phases.clear();
+    out.path.clear();
+    out.valid = false;
+    return out;
+  }
+  out.valid = true;
+  if (goal_idx_out) { *goal_idx_out = goal_idx; }
+  return out;
+}
 
 Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           const VehicleParams & veh, const Pose & start,

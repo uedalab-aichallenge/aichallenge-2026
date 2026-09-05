@@ -1304,6 +1304,9 @@ private:
   const double geom_front_;      // 後軸中心から前端[m]
   const double geom_rear_;       // 後軸中心から後端[m]
   const double geom_half_width_; // 車体の半幅[m]
+  // 壁の境界を「車体が占める区間」で最も狭いところで取るか。
+  // ヘアピンでは方位差が小さくても車体の前隅が内側の壁を削る。
+  const bool wall_body_span_;
   // 車体が縦に重なっている相手へ、横に近づく動きを禁じるか。
   const bool hold_side_alongside_;
   // 上を効かせる横間隔の上限に足す余裕[m]。

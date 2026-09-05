@@ -84,6 +84,8 @@
   <arg name="body_margin_asym" default="$(env BODY_ASYM true)"
        description="車体の四隅から左右別に張り出しを求める"/>
   <!-- 車体が縦に重なっている相手へ横に近づく動きを禁じる。 -->
+  <arg name="wall_body_span" default="$(env WALL_BODY_SPAN true)"
+       description="壁の境界を車体が占める区間の最も狭いところで取る"/>
   <arg name="hold_side_alongside" default="$(env HOLD_ALONGSIDE true)"
        description="並走中は相手へ寄せない"/>
   <arg name="ot_lane_inset" default="$(env OT_LANE_INSET 0.35)"
@@ -373,6 +375,7 @@
             <param name="ot_lane_inset" value="$(var ot_lane_inset)"/>
             <param name="body_margin_asym" value="$(var body_margin_asym)"/>
             <param name="hold_side_alongside" value="$(var hold_side_alongside)"/>
+            <param name="wall_body_span" value="$(var wall_body_span)"/>
             <param name="ot_lane_use_zones" type="str" value="$(var ot_lane_use_zones)"/>
             <param name="opp_model_enable" value="$(var opp_model_enable)"/>
             <param name="spot_all_slots" value="$(var spot_all_slots)"/>

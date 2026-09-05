@@ -105,6 +105,45 @@ private:
   void publishGear(std::uint8_t command);
   // 指令速度の符号にギアを合わせる(出口の不変条件)。
   void alignGearToSpeed(float speed);
+  // --- 舵角の単位変換(2026-09-06) ---
+  //
+  // 【何を取り違えていたか】ユーザー指摘「公式のドキュメントが間違っている
+  // とは考えにくい」を受けて調べ直したところ、公式値はすべて正しく、
+  // **復帰制御が2つの別の量を混同していた**ことが分かった。
+  //
+  //   幾何ホイールベース 1.087m / 最大実舵角 0.64rad ... 公式値。**運動の予測**に使う
+  //   指令のスケール 約1.97               ... AWSIM は指令を約1.97で割って適用する
+  //
+  // 実測: 復帰が 0.6109rad を publish -> 報告された実舵角 0.314rad(比 1.945)。
+  //       その実舵角と公式の 1.087m で旋回半径 3.35m、実測 3.65〜3.73m(10%以内)。
+  // `simple_pure_pursuit` が wheel_base=2.14 を使うのは誤りではなく、
+  // この変換を式の中で吸収した形(2.14 = 1.087 x 1.97)。
+  //
+  // 復帰は変換を掛けていなかったので **要求の半分しか舵が出ていなかった**
+  // (公式上限 0.64rad に対し 0.310rad)。最小旋回半径 1.45m を 3.41m として
+  // 使っていたことになり、「大きく回頭して速度を失う」の一因。
+  double steer_cmd_scale_{1.97};
+  // --- 実際に送出した指令の記録(2026-09-06) ---
+  // AWSIM は longitudinal.speed を**使わない**。使うのは acceleration だけで、
+  // 向きはギアが決める(docs/specifications/interface.ja.md)。
+  // ところがログには実速度・走行距離・ギアしか出しておらず、
+  // **唯一効く値である加速度を一度も記録していなかった。**
+  // 「符号を直した指令が本当に車両へ届いているか」を確かめられるようにする。
+  float sent_speed_{0.0f};
+  // どのコードから指令が出たか。**推測をやめるための計測。**
+  // 「指令が0になる」の出どころを、憶測ではなくログで確定させる。
+  const char * cmd_src_{"未"};
+  // --- 最終手段の上限(2026-09-06) ---
+  // 終了条件が「復帰開始地点から 1.2m 動けたら」の1つだけで、
+  // 動けない間は**時間の上限なく後退し続けた**。
+  double desperate_max_sec_{10.0};
+  double desperate_stall_sec_{3.0};
+  double desperate_ref_clear_{-1e9};
+  rclcpp::Time desperate_ref_at_{0, 0, RCL_ROS_TIME};
+  float sent_steer_cmd_{0.0f};   // 実際に publish した舵角(指令の単位)
+  float sent_steer_phys_{0.0f};  // その狙いの実舵角[rad]
+  float sent_accel_{0.0f};
+  std::uint8_t sent_gear_{0};
 
   rclcpp::Publisher<AckermannControlCommand>::SharedPtr control_pub_;
   rclcpp::Publisher<GearCommand>::SharedPtr gear_pub_;
@@ -283,6 +322,42 @@ private:
   // 計画を採用した時点の壁との余裕[m]。走り切った計画を「進めた」と数えるには、
   // 距離だけでなく状況が改善していることも要る。
   double plan_wall_clear_{0.0};
+  // --- 目標指向の復帰計画(ユーザー指示 2026-09-06) ---
+  // 参照経路上の少し先の姿勢を目標に置き、そこへ到達する経路を探す。
+  // 切り返しは固定せず、後退と切り返しにコストを掛けて最小化する。
+  // false で従来の「後退1本+前進1本の全列挙」に戻る。
+  // 【削除 2026-09-06】衝突の直接検知(加速度 -5m/s^2)を一度入れたが、
+  // ユーザー指摘のとおり不要だった。停滞の判定から門を外せば、止まる前に
+  // 反応できる 0.1〜0.3 秒のためだけに仕組みを1つ増やす価値がない。
+  // 実測でも一度も発火しなかった(閾値を満たす前に停止していた)。
+  bool goal_plan_enable_{true};
+  // 共通の評価地点までの距離[m]。復帰後の走りをどれだけ重く見るか。
+  double goal_plan_tail_len_{40.0};
+  int goal_plan_max_switch_{4};
+  double goal_plan_ahead_min_{8.0};
+  double goal_plan_ahead_max_{16.0};
+  // 到達した目標の中心線 index。合流用の経路をここから継ぐ。
+  std::size_t plan_goal_idx_{0};
+  // 経路を切り詰める位置。**単調に進める**(戻さない)。
+  // 毎周期 全点から最近傍を探し直すと、切り返しで交差する経路では別の枝へ
+  // 飛び、追従側の進捗が壊れる(外部レビュー 指摘)。
+  std::size_t traj_from_{0};
+  // --- 固定した経路を毎周期検査する(ユーザー質問4/5への答え) ---
+  //
+  // 「経路を固定する」と「他車の変化に追従する」は反発しない。
+  // 分けるべきは **経路の内容(固定)** と **有効かの検査(毎周期)** で、
+  // 作り直しの頻度を決めるのは制御周期ではなく「無効になった事実」。
+  //
+  // 復帰の経路は後退＋数mの向き直しだけなので数秒で終わる。
+  // ラインへ戻る途中の他車・壁の回避は、復帰中も毎周期動いている
+  // 通常走行の回避処理(v2x_overtaker)が担当する。
+  bool path_check_enable_{true};
+  double path_check_bad_sec_{0.4};   // 無効がこの時間続いたら作り直す
+  double path_bad_since_{-1.0};
+  rclcpp::Time last_path_bad_log_{0, 0, RCL_ROS_TIME};
+  // 固定した経路が、いまの他車位置でまだ通れるか。通れなければ false。
+  bool plannedPathStillClear() const;
+  bool plan_from_goal_{false};   // 今の計画が目標指向で作られたか
   // 出口の壁前進禁止が実際に前進を止めたか。
   // 【外部レビュー の最優先指摘 2026-09-05】
   //   「出口が前進を拒否したまま、論理上の区間を FORWARD に残さない」
@@ -295,13 +370,6 @@ private:
   unsigned long plan_seq_{0};
   unsigned long wall_ban_acted_seq_{0};
   bool wall_ban_acted_{false};
-  // 壁に触れたまま前進指令が出ていて動かない状態の計測。
-  // 側面だけの接触は食い込みが浅く、壁前進禁止(深さ 0.15m 必要)が発火しない。
-  // 理由不問の膠着(hard_stall_sec=4秒)を待つと、その間ずっと壁を押し続ける。
-  double wall_contact_stall_sec_{1.5};
-  bool wall_stall_valid_{false};
-  double wall_stall_x_{0.0}, wall_stall_y_{0.0};
-  rclcpp::Time wall_stall_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_wall_stall_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_wedge_hold_log_{0, 0, RCL_ROS_TIME};
 

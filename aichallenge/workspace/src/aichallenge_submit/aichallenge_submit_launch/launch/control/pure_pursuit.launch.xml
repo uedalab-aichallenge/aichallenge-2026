@@ -67,13 +67,6 @@
     <param name="wall_forward_ban_hold" value="$(env WALL_FWD_BAN_HOLD 0.8)"/>
     <!-- 復帰経路の計算に使う。コース境界(可動域)と他車位置から
          「後退したときに最も空いている方向」を選んで舵を当てる。 -->
-    <!-- 理由を問わない膠着の安全網。指令0かつ相手が前方車の箱に入らないと
-         復帰に永久に入らない穴があり、実測で55秒間停止し続けた。
-         0.0 で無効(従来どおり)。 -->
-    <param name="hard_stall_sec" value="4.0"/>
-    <!-- 側面だけの接触は食い込みが浅く壁前進禁止が発火しないので、
-         「壁に触れたまま前進しても動かない」を短い時間で別に拾う。 -->
-    <param name="wall_contact_stall_sec" value="$(env WALL_STALL_SEC 1.5)"/>
     <param name="hard_stall_dist" value="0.8"/>
     <param name="raceline_csv"
            value="$(find-pkg-share simple_trajectory_generator)/data/$(var raceline_file)"/>
@@ -113,7 +106,10 @@
   <node pkg="reverse_pure_pursuit" exec="reverse_pure_pursuit"
         name="reverse_pure_pursuit_node" output="screen">
     <param name="lookahead_gain" value="0.0"/>
-    <param name="lookahead_min_distance" value="2.5"/>
+    <!-- 後退は最大 1.5m/s、最小旋回半径 3.35m。目標距離 2.5m は
+         「切り込み量 2.5^2/(8*3.35)=0.23m」で車体半幅に近く長すぎる。
+         1.5m なら 0.08m。経路の延長(尾)と併せて確実に追従できる長さにする。 -->
+    <param name="lookahead_min_distance" value="1.5"/>
     <param name="wheel_base" value="2.14"/>
     <param name="steering_tire_angle_gain" value="2.8"/>
     <param name="reverse_max_speed" value="1.5"/>

@@ -28,8 +28,23 @@ constexpr double kStuckDurationSec = 0.6;
 // 入口の停滞判定。この秒数のあいだに この距離[m] も進めていなければ、
 // 速度が出ていても「進んでいない」とみなす。
 // 押し合いは 0.2-0.5m/s で動き続けるので、瞬間速度では捉えられない。
-constexpr double kEntryProgressSec = 2.5;
-constexpr double kEntryProgressDist = 0.8;
+// --- 復帰へ入る唯一の条件(ユーザー指示 2026-09-06 で統合) ---
+//
+// 【統合前】同じ「進んでいない」条件が3つあった。
+//   停滞      : 移動量が伸びない(2.5秒 / 0.8m)。ただし **motion_requested の門つき**
+//   膠着      : 位置が 4.0秒 で 0.8m 進まない(門なし)
+//   壁接触膠着: 壁に触れたまま 1.5秒 前進しても動かない
+// 門は「指令速度 >= 1.0 かつ指令加速度 >= 0.3」で、**我々自身の追突防止や
+// 壁前進禁止が指令を 0 にすると閉じる**。実測で 55秒間そのまま停止していた。
+// 膠着と壁接触膠着は、その門を回避するために私が足した重複だった。
+//
+// **門を外して1つにする。** 誤検知しない根拠:
+//   ペナルティのクランプ中でも 5km/h = 1.39m/s 出る -> 1秒で 1.39m
+//   徐行通過の最低上限 10.8km/h = 3.0m/s
+// 閾値 0.5m/1.0秒 = 0.5m/s は、クランプ中の 2.8分の1、徐行の 6分の1。
+// 正常な低速走行と混ざらない。従来の膠着(4.0秒)より **4倍速く** 反応する。
+constexpr double kEntryProgressSec = 1.0;
+constexpr double kEntryProgressDist = 0.5;
 // 通常側が「前車が近いので停止」を出し続ける玉突き状態も復帰対象にする。
 // 実戦bagでは前方車1.5〜1.9mに挟まれ、速度指令0のまま121秒停止した。
 constexpr double kBlockedVehicleDurationSec = 3.0;
@@ -57,8 +72,27 @@ constexpr double kBlockedVehicleAnyDirRange = 2.5;
 constexpr double kRearKeepTight = 0.5;      // 手詰まりのときはここまで詰めてよい
 constexpr double kRearWaitMax = 2.0;        // 後方が退くのをこの時間[s]しか待たない
 constexpr double kRearClearWidth = 1.6;     // 後方判定の横幅[m]
-constexpr double kWheelBase = 2.14;         // ホイールベース[m]
-constexpr double kMaxSteerRad = 0.6109;     // 最大舵角 35度(parameter.md の実装値)
+// --- 運動の予測に使う幾何(公式値。2026-09-06 訂正) ---
+// 公式 racing_kart_description/config/vehicle_info.param.yaml:
+//   wheel_base 1.087 / max_steer_angle 0.64
+// 従来ここには 2.14 と 0.6109 が入っていたが、2.14 は**指令の単位変換を
+// 吸収した値**(1.087 x 1.97)であって幾何ではない。運動の予測に使うと
+// 実際より 12% きつい弧を予測し、車は外側へ膨らんで壁に当たる。
+// 指令の単位変換は publishCommand の steer_cmd_scale_ で別に掛ける。
+constexpr double kWheelBase = 1.087;         // ホイールベース[m]
+// --- 実際に出せる実舵角の上限(実測 2026-09-06) ---
+//
+// 公式 vehicle_info.param.yaml の max_steer_angle は 0.64rad(36.7deg)だが、
+// **この指令経路では到達しない**。実測:
+//   指令 35deg -> 報告された実舵角 18deg
+//   指令 72deg -> 報告された実舵角 18deg   ← 倍にしても変わらない
+// つまり実舵角は 0.31rad(18deg)で飽和する。指令を上げる意味はない。
+// (「AWSIM が指令を 1.97 で割る」という仮説は、この2点測定で棄却した。
+//  1.97 = 2.14/1.087 と一致したのは偶然だった)
+//
+// 計画はこの実測値を使う。実舵 18deg と幾何ホイールベース 1.087m から
+// 最小旋回半径 3.35m。実測の旋回半径 3.65〜3.73m と 10% 以内で一致する。
+constexpr double kMaxSteerRad = 0.31;
 constexpr double kHalfWidth = 0.73;         // 車体半幅[m]
 constexpr double kAvoidMargin = 0.3;        // 回避時の余裕[m]
 constexpr double kAvoidCheckRange = 8.0;    // 前方この距離[m]までを判定対象にする
@@ -324,10 +358,17 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   RCLCPP_INFO(get_logger(),
     "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
     wall_forward_ban_ ? "する" : "しない", wall_forward_ban_hold_, wall_forward_ban_gain_);
-  hard_stall_sec_ = declare_parameter<double>("hard_stall_sec", 0.0);
-  wall_contact_stall_sec_ =
-    declare_parameter<double>("wall_contact_stall_sec", 1.5);
-  hard_stall_dist_ = declare_parameter<double>("hard_stall_dist", 0.8);
+  goal_plan_enable_ = declare_parameter<bool>("goal_plan_enable", true);
+  path_check_enable_ = declare_parameter<bool>("path_check_enable", true);
+  path_check_bad_sec_ = declare_parameter<double>("path_check_bad_sec", 0.4);
+  // 実測で「指令を倍にしても実舵角は変わらない」ことが分かったので 1.0 に戻す。
+  // 仕組みは残すが既定では何もしない。
+  steer_cmd_scale_ = declare_parameter<double>("steer_cmd_scale", 1.0);
+  // 共通の評価地点までの距離[m]。これを長くすると「復帰後の走り」を重く見る。
+  goal_plan_tail_len_ = declare_parameter<double>("goal_plan_tail_len", 40.0);
+  goal_plan_max_switch_ = declare_parameter<int>("goal_plan_max_switch", 4);
+  goal_plan_ahead_min_ = declare_parameter<double>("goal_plan_ahead_min", 4.0);
+  goal_plan_ahead_max_ = declare_parameter<double>("goal_plan_ahead_max", 10.0);
   const auto raceline = declare_parameter<std::string>("raceline_csv", "");
   const auto corridor = declare_parameter<std::string>("corridor_csv", "");
   const auto grid = declare_parameter<std::string>("occupancy_grid_yaml", "");
@@ -856,8 +897,9 @@ void StuckRecoveryController::onNominalCommand(
   // ギアはこちらが持っているので、向きの管理は従来どおり。
   // **前進の判定より先に見る**(前進用の指令を後退中に流さないため)。
   if (recovery_start_time_.has_value() && reverse_following_ && !traj_giveup_) {
-    if (reverse_cmd_) { publishFiltered(*reverse_cmd_); return; }
+    if (reverse_cmd_) { cmd_src_ = "後退経路"; publishFiltered(*reverse_cmd_); return; }
     // 後退用の指令がまだ届いていないなら止めておく(前進用を流さない)
+    cmd_src_ = "後退指令待ち";
     publishCommand(0.0f, 0.0f, msg->lateral.steering_tire_angle);
     return;
   }
@@ -868,6 +910,7 @@ void StuckRecoveryController::onNominalCommand(
     // publishCommand の不変条件を通っていなかった。
     // **実測で壁を削っていた「復帰 前進を経路で渡す」はこの経路**なので、
     // 不変条件の穴として最も大きい。フィルタを通す。
+    cmd_src_ = "前進経路";
     publishFiltered(*msg);
     return;
   }
@@ -881,8 +924,10 @@ void StuckRecoveryController::onNominalCommand(
   if (pre_steer_valid_ && std::abs(latest_velocity_) <= kStuckSpeedThreshold) {
     AckermannControlCommand out = *msg;
     out.lateral.steering_tire_angle = static_cast<float>(pre_steer_);
+    cmd_src_ = "通常制御(舵先回り)";
     publishFiltered(out);
   } else {
+    cmd_src_ = "通常制御";
     publishFiltered(*msg);
   }
   updateStuckDetection(*msg, now);
@@ -984,9 +1029,9 @@ void StuckRecoveryController::updateStuckDetection(
     return;
   }
 
-  const bool motion_requested =
-    command.longitudinal.speed >= kCommandSpeedThreshold &&
-    command.longitudinal.acceleration >= kCommandAccelerationThreshold;
+  // 【削除 2026-09-06】`motion_requested`(指令速度>=1.0 かつ指令加速度>=0.3)は
+  // 復帰へ入る門として使っていたが、我々自身のガードが指令を 0 にすると閉じる
+  // ため、進んでいないのに復帰しない状態を作っていた。門は外した。
 
   // 追い越し層が通路なしと判断すると速度指令0を出すため、従来の
   // motion_requested 条件では複数台が接触したまま永久停止する。
@@ -1080,97 +1125,15 @@ void StuckRecoveryController::updateStuckDetection(
     blocked_vehicle_start_time_ &&
     (now - blocked_vehicle_start_time_.value()).seconds() >= kBlockedVehicleDurationSec;
 
-  // --- 理由を問わない最後の安全網(hard stall)
-  //
-  // 【直したバグ(ユーザー報告: ぶつかっても復帰せず強引に前進を続ける)】
-  // 実測(20260829-181500 d1 レース277s〜): preventRearEnd が
-  // 「上限 10.8 -> 0.0km/h」を出し続け、実速度 -0.00m/s のまま
-  // **55秒間** この関数のログが1行も出なかった。
-  // 下のゲートは motion_requested(指令速度>=1.0)か blocked_vehicle_ready の
-  // どちらかを要求する。指令が0で、かつ相手が前方車の箱
-  // (前方0.3〜4.0m/横±1.6m)にも近接2.5mにも入らないと、
-  // hasNoProgress を評価する前に return してしまう。
-  // ここでは指令も他車も見ない。「車体が動いていない」だけで拾う。
-  //
-  // 誤検知しない根拠: 閾値速度は 0.8m/0.4.0s = 0.20m/s = 0.72km/h。
-  // ペナルティのクランプ中でも 5km/h 出るので4秒で5.6m進み、閾値の7倍。
-  // 徐行通過の最低上限 stopped_thread_speed(10.8km/h)とも桁が違う。
-  bool hard_stall = false;
-  if (hard_stall_sec_ > 0.0 && moving_observed_) {
-    recovery::Pose cp;
-    if (currentPose(cp)) {
-      if (!hard_ref_valid_ ||
-          std::hypot(cp.x - hard_ref_x_, cp.y - hard_ref_y_) > hard_stall_dist_) {
-        hard_ref_x_ = cp.x;
-        hard_ref_y_ = cp.y;
-        hard_ref_time_ = now;
-        hard_ref_valid_ = true;
-      } else if ((now - hard_ref_time_).seconds() >= hard_stall_sec_) {
-        hard_stall = true;
-      }
-    }
-  }
-  // --- 壁に触れたまま前進して動かないなら、理由不問の膠着より早く拾う ---
-  //
-  // 【ユーザー報告 2026-09-05】「側面だけ壁に当たり動けなくなったとき、
-  // すぐに復帰処理に入らずしばらく無理に前進しようとする動きが見える」。
-  //
-  // 【なぜ遅いか】壁前進禁止は食い込みの深さ 0.15m 以上を要求する
-  // (地図誤差で誤発火しないため)。**側面をこするだけの接触はそれより浅い**ので
-  // 発火しない。すると理由不問の膠着(hard_stall_sec = 4.0秒)まで待つことになり、
-  // その4秒はずっと壁を押している。壁ペナルティは接触が続く間ずっと加算される。
-  //
-  // 【条件】車体が走行可能領域の外にある(=壁に触れている)、前進を指令している、
-  // それでも車体が進んでいない。この3つが揃った状態が続いた時間だけを測る。
-  // 深さは問わない代わりに時間を短く(1.5秒)する。
-  bool wall_stall = false;
-  if (wall_contact_stall_sec_ > 0.0 && moving_observed_ &&
-      command.longitudinal.speed > 0.5f && std::abs(velocity) < 0.3)
-  {
-    recovery::Pose wp;
-    if (currentPose(wp) && obstacles_.valid() &&
-        recovery::wallClearanceAt(obstacles_, veh_, wp) < 0.0)
-    {
-      if (!wall_stall_valid_ ||
-          std::hypot(wp.x - wall_stall_x_, wp.y - wall_stall_y_) > 0.20)
-      {
-        wall_stall_x_ = wp.x; wall_stall_y_ = wp.y;
-        wall_stall_since_ = now; wall_stall_valid_ = true;
-      } else if ((now - wall_stall_since_).seconds() >= wall_contact_stall_sec_) {
-        wall_stall = true;
-      }
-    } else {
-      wall_stall_valid_ = false;
-    }
-  } else {
-    wall_stall_valid_ = false;
-  }
-  if (wall_stall) {
-    if ((now - last_wall_stall_log_).seconds() > 2.0) {
-      last_wall_stall_log_ = now;
-      RCLCPP_WARN(get_logger(),
-                  "壁に触れたまま %.1f秒 前進しても動かない(指令%.2f 実速度%.2f)。"
-                  "膠着として復帰へ入る",
-                  wall_contact_stall_sec_, command.longitudinal.speed, velocity);
-    }
-    hard_stall = true;
-  }
+  // 膠着(hard_stall)と壁接触膠着は削除した。同じ「進んでいない」条件の重複で、
+  // 上の門を回避するために足したものだった。門を外したので不要になった。
 
-  // 復帰直後は通常制御に発進の機会を与える(既存の kCooldownSec と同じ扱い)
-  if (recovery_end_time_ &&
-      (now - recovery_end_time_.value()).seconds() < kCooldownSec) {
-    hard_stall = false;
-  }
-  if (hard_stall) {
-    RCLCPP_WARN(get_logger(),
-                "膠着(理由不問) %.1f秒で %.2fm も進んでいない "
-                "指令速度=%.2f 指令加速度=%.2f 実速度=%.2f",
-                hard_stall_sec_, hard_stall_dist_,
-                command.longitudinal.speed, command.longitudinal.acceleration,
-                velocity);
-  }
-
-  if (!moving_observed_ || (!motion_requested && !blocked_vehicle_ready && !hard_stall)) {
+  // --- 門を外した(2026-09-06) ---
+  // ここは以前 motion_requested(指令速度>=1.0 かつ指令加速度>=0.3)を要求して
+  // いた。**指令が0のときに閉じる門**で、我々自身のガードが指令を0にすると
+  // 「進んでいない」判定に一度も到達しなかった(実測 55秒間)。
+  // 進んでいないことは指令の値とは無関係に判定できるので、門は不要。
+  if (!moving_observed_) {
     stuck_start_time_.reset();
     pre_steer_valid_ = false;
     return;
@@ -1178,7 +1141,7 @@ void StuckRecoveryController::updateStuckDetection(
 
   // 近接車条件は専用タイマーで既に3秒を確認済み。通常条件へ切り替わった
   // 時間を流用せず、この周期で復帰を開始する。
-  if (blocked_vehicle_ready || hard_stall) {
+  if (blocked_vehicle_ready) {
     stuck_start_time_ = now - rclcpp::Duration::from_seconds(kStuckDurationSec);
   }
 
@@ -1200,7 +1163,7 @@ void StuckRecoveryController::updateStuckDetection(
   // 不整合だった。入口も実際の移動量で見る。
   const bool no_progress = hasNoProgress(now);
 
-  if (std::abs(velocity) <= kStuckSpeedThreshold || no_progress || hard_stall) {
+  if (std::abs(velocity) <= kStuckSpeedThreshold || no_progress) {
     if (!stuck_start_time_.has_value()) {
       if (no_progress && std::abs(velocity) > kStuckSpeedThreshold) {
         RCLCPP_WARN(get_logger(),
@@ -1374,6 +1337,51 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
         "前進へは切り替えない", max_rev, clear_at_plan);
     }
   }
+  // --- 目標指向の計画を先に試す(ユーザー指示 2026-09-06) ---
+  //
+  // 参照経路上の「少し先」を目標に置き、そこへ到達する経路を A* で探す。
+  //   ・後退 1m のコストを前進 1m の goal_plan_w_reverse 倍にする
+  //   ・切り返し 1 回ごとに goal_plan_w_switch を足す
+  // これで **後方が空いていれば切り返し1回(Y字)が最小コストで選ばれ、
+  // 後方に壁や他車があるときだけ切り返しが増える。**
+  //
+  // 終点が参照経路上の目標そのものなので、合流の継ぎ目は構造的に 0 になる。
+  // 従来の探索は「後退1本+前進1本」しか作れず、前進が一定舵角の円弧なので
+  // 参照経路と繋がらず、実測で継ぎ目が中央 1.16m ずれていた。
+  bool used_goal = false;
+  // 旧探索が使う印。目標指向で決まったときは両方 false のまま。
+  bool plan_strict = false;
+  bool plan_best_effort = false;
+  plan_from_goal_ = false;
+  if (goal_plan_enable_) {
+    recovery::GoalPlanParams gp;
+    gp.max_switch = goal_plan_max_switch_;
+    gp.tail_len = goal_plan_tail_len_;
+    gp.goal_ahead_min = goal_plan_ahead_min_;
+    gp.goal_ahead_max = goal_plan_ahead_max_;
+    std::size_t gi = 0;
+    const auto gplan = recovery::planToGoal(corridor_, obstacles_, veh_, p,
+                                            cars, gp, &gi);
+    if (gplan.valid) {
+      plan_ = gplan;
+      plan_goal_idx_ = gi;
+      plan_from_goal_ = true;
+      used_goal = true;
+      double rev_len = 0.0, fwd_len = 0.0;
+      int sw = 0;
+      for (std::size_t k = 0; k < plan_.phases.size(); ++k) {
+        if (plan_.phases[k].forward) { fwd_len += plan_.phases[k].length; }
+        else { rev_len += plan_.phases[k].length; }
+        if (k > 0 && plan_.phases[k].forward != plan_.phases[k - 1].forward) { ++sw; }
+      }
+      RCLCPP_INFO(get_logger(),
+        "復帰 目標指向の計画: 切り返し%d回 後退%.1fm 前進%.1fm 目標idx%zu "
+        "所要%.2fs(復帰後%.0fm まで込み) 余裕壁%.2f 車%.2f",
+        sw, rev_len, fwd_len, plan_goal_idx_, plan_.cost, goal_plan_tail_len_,
+        plan_.min_wall_clear, plan_.min_car_clear);
+    }
+  }
+  if (!used_goal) {
   // まず「中断されない経路」を狙って厳しい余裕つきで計画する。
   // それで見つからない場所もあるので、駄目なら現行どおり緩い条件(余裕0)で
   // 引き直す。フォールバック段が複数あるうち、本命(この呼び出し)だけを
@@ -1381,7 +1389,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                          first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
                          kPlanWallClear, kPlanCarClear);
-  bool plan_strict = plan_.valid;
+  plan_strict = plan_.valid;
   if (!plan_.valid) {
     plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
@@ -1424,7 +1432,6 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
                            -1, 0.0, 0.0, 0.0, std::max(max_rev, 1.5), cars);
     plan_strict = false;
   }
-  bool plan_best_effort = false;
   if (!plan_.valid) {
     // 最後のフォールバック。ここでも解が無いなら best_effort を立てて、
     // 棄却条件を全て外した上で「一番離れられる案」を採らせる
@@ -1599,12 +1606,14 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
     }
   }
 
+  }
   // 採用した計画が前進区間で見込んだ余裕を、追従中の中断閾値に使えるよう保存する。
   // 計画が取れなかったときは 1e9 のままにして、中断閾値は既定値を使わせる。
   plan_min_wall_clear_ = plan_.valid ? plan_.min_wall_clear : 1e9;
   plan_min_car_clear_ = plan_.valid ? plan_.min_car_clear : 1e9;
   phase_idx_ = 0;
   phase_travelled_ = 0.0;
+  traj_from_ = 0;   // 経路の切り詰め位置も新しい計画に合わせて戻す
   phase_start_wall_clear_ = recovery::wallClearanceAt(obstacles_, veh_, p);
   phase_start_car_clear_ = recovery::carClearanceAt(cars, veh_, p);
   braking_ = false;
@@ -1738,6 +1747,16 @@ void StuckRecoveryController::runDesperate(
     return;
   }
   const double t = (now - desperate_since_).seconds();
+  // 最終手段そのものに上限を付ける。「動けたら終わる」しか無かったので、
+  // 動けない間は永久に続いていた(ユーザー報告の無限後退)。
+  if (t > desperate_max_sec_) {
+    RCLCPP_WARN(get_logger(),
+      "復帰 最終手段を %.0f秒 続けても %.2fm しか動けない。通常制御へ返す",
+      t, moved);
+    desperate_ = false;
+    finishRecovery(now);
+    return;
+  }
   const int swing = static_cast<int>(t / kDesperateSwingSec);
   if (swing != desperate_swing_) {
     desperate_swing_ = swing;
@@ -1782,18 +1801,35 @@ void StuckRecoveryController::runDesperate(
         }
         if (worst > best) { best = worst; best_steer = static_cast<float>(st); }
       }
-      if (rear_ok) {
+      // 余裕が改善しないまま後退を続けても意味がない。基準から
+      // desperate_stall_sec_ のあいだ改善しなければ、後退をやめて待つ。
+      if (desperate_ref_clear_ < -1e8 || now_clear > desperate_ref_clear_ + 0.05) {
+        desperate_ref_clear_ = now_clear;
+        desperate_ref_at_ = now;
+      }
+      const bool improving =
+        (now - desperate_ref_at_).seconds() < desperate_stall_sec_;
+      if (rear_ok && improving) {
         publishGear(GearCommand::REVERSE);
-        publishCommand(static_cast<float>(-wall_ban_reverse_speed_), 0.0f, best_steer);
+        // 加速度が 0 では**ペダルを踏んでいない**ので何も起きない。
+        // AWSIM は speed を見ず、acceleration をギアの向きへのペダルとして使う
+        // (docs/specifications/interface.ja.md: longitudinal.speed は未使用)。
+        // REVERSE ギアなので正の加速度で後退へ踏む。
+        cmd_src_ = "最終手段(後退)";
+        publishCommand(static_cast<float>(-wall_ban_reverse_speed_),
+                       kRecoveryAccel, best_steer);
       } else {
         publishGear(GearCommand::DRIVE);
+        cmd_src_ = "最終手段(待ち)";
         publishCommand(0.0f, kBrakeAccel, best_steer);
       }
       if ((now - last_desperate_hold_log_).seconds() > 1.5) {
         last_desperate_hold_log_ = now;
         RCLCPP_WARN(get_logger(),
           "壁へ %.2fm 食い込んでいる。振らずに%s(舵 %+.0fdeg / 見込みの余裕 %.2fm / 後方 %.1fm)",
-          now_clear, rear_ok ? "後退して回す" : "待つ(後方に余地なし)",
+          now_clear,
+          (rear_ok && improving) ? "後退して回す"
+            : (rear_ok ? "待つ(後退しても改善しない)" : "待つ(後方に余地なし)"),
           best_steer * 180.0 / M_PI, best, rearRoom());
       }
       return;
@@ -1804,6 +1840,7 @@ void StuckRecoveryController::runDesperate(
   const float steer = static_cast<float>(
     ((swing / 2) % 2 == 0 ? 1.0 : -1.0) * kMaxSteerRad);
   publishGear(fwd ? GearCommand::DRIVE : GearCommand::REVERSE);
+  cmd_src_ = "最終手段(振り)";
   publishCommand(fwd ? kDesperateSpeed : -kDesperateSpeed, kDesperateAccel, steer);
 }
 
@@ -1845,6 +1882,7 @@ std::optional<bool> StuckRecoveryController::replanOrEscalate(
       desperate_ = true;
       desperate_since_ = now;
       desperate_swing_ = -1;
+      desperate_ref_clear_ = -1e9;
       return true;
     }
     RCLCPP_WARN(get_logger(), "復帰 計画%d回でも戻れない。通常制御へ返す 状況= %s",
@@ -1900,6 +1938,7 @@ std::optional<bool> StuckRecoveryController::replanOrEscalate(
     desperate_ = true;
     desperate_since_ = now;
     desperate_swing_ = -1;
+    desperate_ref_clear_ = -1e9;
     return true;
   }
   return std::nullopt;
@@ -2047,6 +2086,7 @@ bool StuckRecoveryController::runBraking(const rclcpp::Time & now)
       return true;
     }
     publishGear(brake_was_forward_ ? GearCommand::DRIVE : GearCommand::REVERSE);
+    cmd_src_ = "制動";
     publishCommand(0.0, kBrakeAccel, static_cast<float>(brake_steer_));
     stall_since_ = now;   // 止まろうとしている間は停滞とみなさない
     return true;
@@ -2126,6 +2166,7 @@ std::optional<bool> StuckRecoveryController::waitForRearRoom(
       desperate_ = true;
       desperate_since_ = now;
       desperate_swing_ = -1;
+      desperate_ref_clear_ = -1e9;
       return true;
     }
     publishGear(GearCommand::DRIVE);
@@ -2219,41 +2260,18 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   if (!recovery_start_time_.has_value()) { return false; }
   const double total = (now - recovery_start_time_.value()).seconds();
   if (total > kRecoveryMaxSec) {
-    // --- 食い込んでいる間は通常制御へ返さない(2026-09-05) ---
+    // --- 【撤回 2026-09-06】食い込み中も通常制御へ返す ---
     //
-    // 【ユーザー報告「P2 まだ後退し続けています」の実体】
-    // 実測 20260905-225522/d2: 位置(89617.4,43174.8) が **200秒以上まったく
-    // 変わらない**。壁への食い込みは開始時 -0.22m → **-1.27m** まで深くなった。
-    //
-    // 深くなった理由は、**上限30秒で通常制御へ返すたびに全開(11.67m/s)が
-    // 0.8秒だけ通る**こと。禁止は「食い込んだまま0.8秒改善しない」で効くので、
-    // 返す → 0.8秒踏む → 止める → 復帰30秒 → 返す、を繰り返すと
-    // 1回あたり数cmずつ壁へ押し込む。7回で 1m 進んだ。
-    //
-    // 実機では「壁に当たったままアクセルを踏み続ける」は再起不能(運営アナウンス)。
-    // 食い込んでいる間は返さず、復帰の側で持ち続ける。
-    recovery::Pose wp;
-    const bool wedged_now = currentPose(wp) && obstacles_.valid() &&
-                            recovery::wallClearanceAt(obstacles_, veh_, wp) < 0.0;
-    if (wedged_now) {
-      if ((now - last_wedge_hold_log_).seconds() > 5.0) {
-        last_wedge_hold_log_ = now;
-        RCLCPP_WARN(get_logger(),
-          "復帰 上限%.0fs に到達したが壁へ食い込んでいる。通常制御へ返さず"
-          "後退での脱出を続ける 状況= %s", kRecoveryMaxSec, situation_.c_str());
-      }
-      // 時計を戻して、最終手段(食い込み中は後退か待機しか出さない)に任せる。
-      recovery_start_time_ = now;
-      replan_count_ = 0;
-      desperate_ = true;
-      desperate_since_ = now;
-      desperate_swing_ = -1;
-    } else {
-      RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
-                  kRecoveryMaxSec, situation_.c_str());
-      finishRecovery(now);
-      return false;
-    }
+    // 「返した瞬間に全開が通って壁へ押し込む」のを防ぐために入れたが、
+    // 押し込みを防ぐのは壁前進禁止の仕事で、そちらは実測で機能している
+    // (不変条件の計測で「壁の外で前進」が 758回 -> 1回)。
+    // 一方この変更は**時間の上限を持つ唯一の出口を塞いだ**。
+    // 最終手段の終了条件は「動けたら」だけなので、動けない間は永久に続く。
+    // ユーザー報告「30秒以上ずっと後退。それ以上の可能性もある」はこの構造。
+    RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
+                kRecoveryMaxSec, situation_.c_str());
+    finishRecovery(now);
+    return false;
   }
 
   recovery::Pose p;
@@ -2285,6 +2303,29 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   {
     const auto done = waitForRearRoom(ph, now);
     if (done.has_value()) { return done.value(); }
+  }
+
+  // --- 固定した経路を毎周期検査する(内容は変えない) ---
+  // 塞がれた状態が path_check_bad_sec_ 続いたときだけ作り直す。
+  // 瞬間的な判定で差し替えると、境界で振動して同じ計画を出し続ける。
+  if (path_check_enable_) {
+    if (plannedPathStillClear()) {
+      path_bad_since_ = -1.0;
+    } else {
+      const double tnow = now.seconds();
+      if (path_bad_since_ < 0.0) { path_bad_since_ = tnow; }
+      else if (tnow - path_bad_since_ >= path_check_bad_sec_) {
+        path_bad_since_ = -1.0;
+        if ((now - last_path_bad_log_).seconds() > 1.0) {
+          last_path_bad_log_ = now;
+          RCLCPP_WARN(get_logger(),
+            "復帰 他車が動いて経路が塞がれた。作り直す(計画%d回)", replan_count_);
+        }
+        if (replan_count_ < kReplanMax) { ++replan_count_; }
+        makePlan(now, 0);
+        return true;
+      }
+    }
   }
 
   if (replanIfWallNear(p, ph, now)) { return true; }
@@ -2346,13 +2387,17 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   if ((now - last_trace_).seconds() > 0.5) {
     last_trace_ = now;
     RCLCPP_INFO(get_logger(),
-                "復帰追跡 区間%zu/%zu %s 舵指令%+.0f 速度%.2f "
-                "走行%.2f/%.2fm ギア%u 位置(%.1f,%.1f) yaw%.0f 壁まで%.2f",
+                "復帰追跡 区間%zu/%zu %s 舵狙い%+.0f 舵指令%+.0f 実舵%+.0f 実速度%.2f "
+                "送出[加速度%+.2f 速度%+.2f ギア%u 出=%s] "
+                "走行%.2f/%.2fm 位置(%.1f,%.1f) yaw%.0f 壁まで%.2f 経路渡し%d",
                 phase_idx_ + 1, plan_.phases.size(), ph.forward ? "前進" : "後退",
-                steer * 180.0 / M_PI,
-                latest_velocity_, phase_travelled_, ph.length, gear_now_,
+                steer * 180.0 / M_PI, sent_steer_cmd_ * 180.0 / M_PI,
+                steer_report_ * 180.0 / M_PI, latest_velocity_,
+                sent_accel_, sent_speed_, sent_gear_, cmd_src_,
+                phase_travelled_, ph.length,
                 p.x, p.y, p.yaw * 180.0 / M_PI,
-                recovery::wallClearanceAt(obstacles_, veh_, p));
+                recovery::wallClearanceAt(obstacles_, veh_, p),
+                (reverse_following_ || traj_following_) ? 1 : 0);
   }
   // ギアが入り、舵が目標へ届くまでは止めておく。
   // 入れ替えと同時に加速指令を出すと、前のギアのまま加速して逆へ進み、
@@ -2365,8 +2410,15 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   {
     const double waited = (now - gear_changed_).seconds();
     const bool gear_ready = !gear_report_seen_ || gear_report_ == gear_now_;
-    const bool steer_ready = std::abs(steer_report_ - steer) < kSteerReadyRad;
-    if ((!gear_ready || !steer_ready) && waited < kActuatorWaitMax) {
+    // --- 舵の条件を外した(2026-09-06) ---
+    // 追従を pure_pursuit へ一本化したあと、実舵角は**経路追従が毎周期動かす値**
+    // であり、`steer`(区間の代表舵角)とは一致しない。実測(20260906-034518)では
+    // 代表舵 0deg に対し追従が実舵を -3→-8→-15→-18deg と動かし、差が閾値を
+    // 超えて「準備できていない」と判定され、**後退の途中で指令が 0 になった**。
+    // 1台テストで 47エピソード中 45回がこれ。舵は pure_pursuit が持つので、
+    // 復帰側が届いたかを判定してはいけない。ギアの条件だけ残す。
+    if (!gear_ready && waited < kActuatorWaitMax) {
+      cmd_src_ = "ギア/舵の待ち";
       publishCommand(0.0, 0.0, steer);
       return true;
     }
@@ -2392,7 +2444,28 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
       }
       if (!traj_giveup_) { return false; }   // 指令は pure_pursuit のものを通す
     }
-    publishCommand(kRecoverySpeed, kRecoveryAccel, steer);
+    // --- 一定舵角の直接制御を廃止した(ユーザー指示 2026-09-06) ---
+    //
+    // 【何が問題だったか】ここは `ph.steer`(区間の代表舵角)を区間の全長に
+    // わたって出していた。目標指向の探索は経路を素片(0.5m)の列として作り、
+    // 素片ごとに舵角が違うのに、**区間にまとめるとき最初の素片の舵角を
+    // 区間全体の代表値にしていた**。
+    // その結果 7〜12m の前進区間を一定舵角(-18deg = R 3.35m)で走り、
+    // 120度以上回ってコースを横断し、向かいの壁に当たっていた
+    // (ユーザー報告「ハンドルを右に切ったまま前進を続け、向かいの壁に
+    //  ぶつかっています」)。
+    //
+    // 【なぜ廃止でよいか】追従は通常の pure_pursuit に一本化する
+    // (ユーザーの想定した流れ)。ここへ落ちる原因だった
+    // 「経路を渡しても動かない」は、`reverse_pure_pursuit` が後退のとき
+    // 負の加速度(ブレーキ)を出していたことが原因で、今日修正済み。
+    // 物理的に嵌まって何をしても動かない場合は runDesperate の
+    // 「余裕が最も増える舵角を選んで後退する」枝が受け持つ
+    // (実測でその枝が 4.7m 動かして脱出できている)。
+    //
+    // 速度と加速度だけは出す。舵は pure_pursuit の値をそのまま使う
+    // (publishCommand ではなく、素通しで通る)。
+    return false;
   } else {
     // 後退区間も経路を publish して後退用 pure_pursuit に追従させる
     // (2026-08-31・ユーザー指示)。前進とまったく同じ形にする。
@@ -2411,8 +2484,9 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
       }
       if (!traj_giveup_) { return false; }   // 指令は後退用 pure_pursuit のものを通す
     }
-    // AWSIM は後退ギアのとき「負の目標速度・正の加速度」を期待する。
-    publishCommand(-kRecoverySpeed, kRecoveryAccel, steer);
+    // 後退も同じ。一定舵角の直接制御は廃止し、後退用 pure_pursuit に任せる。
+    // ここへ落ちるのは経路が渡っていない(まだ publish していない)ときだけ。
+    return false;
   }
   return true;
 }
@@ -2425,6 +2499,24 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 // 経路の終端が目標軌道につながっているので戻りが連続になる。
 // 後退区間は pure_pursuit では表現できない(ギアと舵の符号が変わる)ので
 // 従来どおり直接制御する。
+
+// 固定した経路が、いまの他車位置でまだ通れるかを検査する。
+//
+// 【なぜ検査だけにするか】経路の内容を毎周期作り直すと追従側の進捗が壊れる
+// (外部レビュー 指摘)。一方で他車は動くので、無視することもできない。
+// そこで **内容は固定し、検査は毎周期行い、無効になったときだけ作り直す**。
+// 検査は残りの経路(いま切り詰めている位置から先)だけを見る。
+bool StuckRecoveryController::plannedPathStillClear() const
+{
+  if (!plan_.valid || plan_.path.empty()) { return true; }
+  const auto cars = const_cast<StuckRecoveryController *>(this)->carObstacles();
+  if (cars.empty()) { return true; }
+  for (std::size_t i = traj_from_; i < plan_.path.size(); ++i) {
+    if (recovery::carClearanceAt(cars, veh_, plan_.path[i]) < 0.0) { return false; }
+  }
+  return true;
+}
+
 bool StuckRecoveryController::publishRecoveryTrajectory()
 {
   if (!latest_traj_ || !recovery_start_time_.has_value() || !plan_.valid) {
@@ -2439,12 +2531,30 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
   recovery::Pose cur;
   if (!currentPose(cur)) { reverse_following_ = false; return false; }
 
-  // 計画の経路のうち、現在地より先の部分だけを使う
-  std::size_t from = 0;
-  double bd = 1e18;
-  for (std::size_t i = 0; i < plan_.path.size(); ++i) {
-    const double d = std::hypot(plan_.path[i].x - cur.x, plan_.path[i].y - cur.y);
-    if (d < bd) { bd = d; from = i; }
+  // --- 経路の内容を固定する(外部レビュー 指摘 / ユーザー確認 2026-09-06) ---
+  //
+  // 【何が問題だったか】ここは毎周期、現在地から `plan_.path` 全体の最近傍点
+  // `from` を探し直し、**そこから先だけ**を publish していた。つまり
+  // **経路の内容が毎周期変わる**。追従側(pure_pursuit)は毎回新しい経路で
+  // 最近傍探索をやり直すので、**経路上の単調な進捗が残らない**。
+  // 外部レビュー の指摘: 「車両が追っている対象が固定経路ではなく、動く経路になる」。
+  // さらに最近傍探索は姿勢も経路上の順序も見ないので、切り返しで交差する
+  // 経路では `from` が別の枝へ飛ぶ(前進区間や尾へ)ことがある。
+  //
+  // 【直し方】`from` を**単調にする**。一度進んだら戻らない。
+  // 探索範囲も直前の位置から前方に限る。これで publish する内容は
+  // 「同じ経路を、進んだぶんだけ切り詰めたもの」になり、幾何が変わらない。
+  // 計画を作り直したときだけ 0 に戻す(makePlan で traj_from_ = 0)。
+  std::size_t from = traj_from_;
+  {
+    double bd = 1e18;
+    std::size_t best = traj_from_;
+    for (std::size_t i = traj_from_; i < plan_.path.size(); ++i) {
+      const double d = std::hypot(plan_.path[i].x - cur.x, plan_.path[i].y - cur.y);
+      if (d < bd) { bd = d; best = i; }
+    }
+    from = best;
+    traj_from_ = best;   // 単調
   }
 
   auto push = [](Trajectory & t, double x, double y, double yaw, double v) {
@@ -2473,6 +2583,39 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
     for (std::size_t i = from; i < rev_n; ++i) {
       push(rev, plan_.path[i].x, plan_.path[i].y, plan_.path[i].yaw, kRecoverySpeed);
     }
+    // --- 経路は必ず目標距離より長く渡す(2026-09-06) ---
+    //
+    // 【これが「経路を渡しても動かない」の原因だった】
+    // pure pursuit は「後軸から目標距離以上離れた最初の経路点」を目標にする。
+    // `reverse_pure_pursuit` は lookahead_gain=0 / lookahead_min_distance=2.5 なので
+    // **目標距離は固定 2.5m**。ところが後退区間は 0.5〜3.0m しかない。
+    // 経路全体が目標距離に収まると目標点が見つからず、終端を目標にするしかなく、
+    // そこへ近づくと幾何が破綻して **加速度0・速度0** を出す。
+    //
+    // 実測(20260906-032551): 後退経路 4点(1.5m)を渡し、走行 0.76m の時点で
+    // 送出が [加速度+0.00 速度+0.00] になり惰性で停止。
+    // 80エピソード中 **79回**「2.0s 動かない」に落ちていた。
+    //
+    // 対策は経路の延長。**最後の姿勢から同じ舵角で弧を延ばした「尾」**を付ける。
+    // 区間の終了は走行距離で判定するので、車が尾に到達することはない。
+    // pure pursuit には常に目標点が存在するようになる。
+    {
+      constexpr double kTailLen = 4.0;    // 目標距離 2.5m より確実に長く
+      constexpr double kTailStep = 0.25;
+      if (rev.points.size() >= 1 && rev_n >= 1) {
+        const auto & last = plan_.path[rev_n - 1];
+        const double steer = plan_.phases[phase_idx_].steer;
+        double x = last.x, y = last.y, yaw = last.yaw;
+        for (double run = 0.0; run < kTailLen; run += kTailStep) {
+          const double dyaw = -kTailStep / std::max(veh_.wheel_base, 0.1) * std::tan(steer);
+          const double mid = yaw + dyaw * 0.5;
+          x += -kTailStep * std::cos(mid);
+          y += -kTailStep * std::sin(mid);
+          yaw += dyaw;
+          push(rev, x, y, yaw, kRecoverySpeed);
+        }
+      }
+    }
     publishRecoveryPathMarker(from);
     if (rev.points.size() < 2) { reverse_following_ = false; return false; }
     reverse_traj_pub_->publish(rev);
@@ -2497,6 +2640,7 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
   for (std::size_t i = f0; i < plan_.path.size(); ++i) {
     push(out, plan_.path[i].x, plan_.path[i].y, plan_.path[i].yaw, kRecoverySpeed);
   }
+  // 前進側は下で参照経路を継ぎ足すので、経路が目標距離より短くなることはない。
   if (out.points.size() < 2) { return false; }
 
   // 終端から目標軌道へつなぐ。
@@ -2934,8 +3078,18 @@ void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
   cmd.longitudinal.speed = speed;
   cmd.longitudinal.acceleration = accel;
   // 回転で抜けるときは舵が本体なので上書きする。
-  if (wall_ban_steer_valid_) { cmd.lateral.steering_tire_angle = wall_ban_steer_; }
+  if (wall_ban_steer_valid_) {
+    // wall_ban_steer_ は実舵角で作っているので、ここだけ指令の単位へ変換する。
+    cmd.lateral.steering_tire_angle =
+      static_cast<float>(wall_ban_steer_ * steer_cmd_scale_);
+  }
+  // ここを通る指令は pure_pursuit / reverse_pure_pursuit が作ったもので、
+  // **すでに指令の単位**(あちらは wheel_base=2.14 で変換を吸収している)。
+  // 二重に steer_cmd_scale_ を掛けてはいけない。
   alignGearToSpeed(cmd.longitudinal.speed);
+  sent_speed_ = cmd.longitudinal.speed;
+  sent_accel_ = cmd.longitudinal.acceleration;
+  sent_gear_ = gear_now_;
   control_pub_->publish(cmd);
 }
 
@@ -2969,6 +3123,14 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   applyWallForwardBan(speed, acceleration);
   if (wall_ban_steer_valid_) { steer = wall_ban_steer_; }
   alignGearToSpeed(speed);
+  // ここまでの steer は**実舵角**。publish する値は指令の単位なので変換する
+  // (他のノードは wheel_base=2.14 を使って式の中で同じ変換を吸収している)。
+  sent_steer_phys_ = steer;
+  steer = static_cast<float>(steer * steer_cmd_scale_);
+  sent_speed_ = speed;
+  sent_steer_cmd_ = steer;
+  sent_accel_ = acceleration;
+  sent_gear_ = gear_now_;
 
   AckermannControlCommand msg;
   msg.stamp = stamp;

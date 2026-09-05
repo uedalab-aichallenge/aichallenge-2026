@@ -192,8 +192,43 @@ void ReversePurePursuit::onTimer()
   double current_longitudinal_vel = odometry_->twist.twist.linear.x;
 
   cmd.longitudinal.speed = target_longitudinal_vel;
+  // --- 加速度は「ギアの向きへのペダル」として出す(2026-09-06) ---
+  //
+  // 【ユーザー報告】「AWSIM 上ではリバースの表記なのに実際は前進し、その後
+  // 壁にぶつかる」「P2 が復帰処理できず、リバースのまま その場に留まる」。
+  //
+  // 【公式仕様】docs/specifications/interface.ja.md の
+  // `/control/command/control_cmd`:
+  //     longitudinal.speed        -> **未使用**
+  //     longitudinal.acceleration -> 目標加速度 (m/s^2)
+  // AWSIM は speed を見ない。**進む向きはギアが決め、acceleration は
+  // そのギアの向きへのアクセル(正)/ブレーキ(負)** である。
+  // 復帰の直接制御が「REVERSE + 加速度 +1.0」で実際に後退できている
+  // (実測 速度 -0.84m/s)ことからも、この規約で確定している。
+  //
+  // 【何が間違っていたか】ここは車両前方を正とした速度差
+  //     gain * (target - current)
+  // をそのまま加速度にしていた。target は後退なので負である。
+  // 停止状態(current=0)で target=-1.5 なら **-1.5、つまり負**。
+  // **REVERSE ギアで負の加速度はブレーキ**なので、後退の推力にならない。
+  //
+  // 結果として、
+  //   ・経路による後退は一度も車を動かせない
+  //     (ログ「復帰 後退を経路で渡しても 2.0s 動かない。直接制御に戻す」が毎回出る)
+  //   ・前向きの慣性が残っていると、ギア表示は R のまま減速しながら前進し、
+  //     そのまま壁へ当たる(ユーザーが目撃した挙動)
+  // となっていた。
+  //
+  // ギアの向きで測った速度 s = -v で考えると、
+  //     ペダル = gain * (s_target - s_current)
+  //            = gain * (-target - (-current))
+  //            = gain * (current - target)
+  // つまり従来式の符号を反転したものが正しい。
+  //   停止中に target=-1.5 -> +1.5*gain (後退へ踏む)
+  //   -1.5 で走行中      -> 0          (維持)
+  //   -2.5 で走りすぎ    -> -1.0*gain  (ブレーキ)
   cmd.longitudinal.acceleration =
-    speed_proportional_gain_ * (target_longitudinal_vel - current_longitudinal_vel);
+    speed_proportional_gain_ * (current_longitudinal_vel - target_longitudinal_vel);
   // 加減速とも ±max_acceleration_ に収める。
   // 大会ルール(OVER ペナルティ): 加速度指令の絶対値が ±3 m/s^2 を超えるか
   // 250 Hz 以上で publish すると 2 秒間 5 km/h に制限される。

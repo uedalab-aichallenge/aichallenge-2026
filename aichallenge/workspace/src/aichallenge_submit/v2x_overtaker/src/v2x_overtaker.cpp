@@ -787,6 +787,7 @@ V2XOvertaker::V2XOvertaker()
   geom_front_(declare_parameter<double>("geom_front", 1.554)),
   geom_rear_(declare_parameter<double>("geom_rear", 0.510)),
   geom_half_width_(declare_parameter<double>("geom_half_width", 0.725)),
+  wall_body_span_(declare_parameter<bool>("wall_body_span", true)),
   hold_side_alongside_(declare_parameter<bool>("hold_side_alongside", true)),
   alongside_extra_(declare_parameter<double>("alongside_extra", 0.10)),
   ot_lane_use_zone_spec_(
@@ -8238,8 +8239,47 @@ void V2XOvertaker::avoidWall(const Frame & f, PlanCtx & c)
       margin = std::min(margin, straight_pass_wall_);
     }
     // 帯は必ず走行ラインを含める(142 の失敗を繰り返さない)
-    double wall_lo = std::min(corridor_.lo[ei] + margin, 0.0);
-    double wall_hi = std::max(corridor_.hi[ei] - margin, 0.0);
+    // --- 壁の境界は「車体が占める区間」の最も狭いところで取る(2026-09-06) ---
+    //
+    // 【ユーザー指摘】「本当に内輪差を考慮した処理が入っているのであれば、
+    // ヘアピンカーブであっても車体の側面をカーブにぶつける ということは
+    // 起こらないと思います」。
+    //
+    // 【確認した事実】そのとおり、足りていなかった。姿勢ぶんの余裕は
+    // **経路に対する方位差**しか見ていない。実測(4レース)では余裕が効いた
+    // 場面の方位差は中央 4.8度で、**線に沿って走れている場面がほとんど**。
+    // つまりヘアピンで線に沿っていれば余裕はほぼ 0 になる。
+    //
+    // ところが壁の境界は `corridor_.lo[ei]` つまり**いまいる 1 点の値**だけ。
+    // 車体は後軸中心から前へ 1.554m・後ろへ 0.510m あり、1点あたり約1.38m の
+    // 経路上では **前後で約1.5点ぶん**にまたがる。ヘアピン(半径 4〜18m)では
+    // その区間でコリドアが急に狭くなるので、中心が今の点の帯に入っていても
+    // 前隅が壁を削る。
+    //
+    // 車体が占める区間で最も狭い帯を使う。区間は自車の長さぶんだけなので
+    // 直線では今までと同じ値になり、狭まるのはカーブだけ。
+    double wall_lo_raw = corridor_.lo[ei];
+    double wall_hi_raw = corridor_.hi[ei];
+    if (wall_body_span_) {
+      double back = 0.0;
+      for (std::size_t k = 1; k < n && back < geom_rear_; ++k) {
+        const std::size_t i0 = (ei + n - k + 1) % n, i1 = (ei + n - k) % n;
+        back += std::hypot(in.points[i0].pose.position.x - in.points[i1].pose.position.x,
+                           in.points[i0].pose.position.y - in.points[i1].pose.position.y);
+        wall_lo_raw = std::max(wall_lo_raw, corridor_.lo[i1]);
+        wall_hi_raw = std::min(wall_hi_raw, corridor_.hi[i1]);
+      }
+      double fwd = 0.0;
+      for (std::size_t k = 0; k < n && fwd < geom_front_; ++k) {
+        const std::size_t i0 = (ei + k) % n, i1 = (ei + k + 1) % n;
+        fwd += std::hypot(in.points[i1].pose.position.x - in.points[i0].pose.position.x,
+                          in.points[i1].pose.position.y - in.points[i0].pose.position.y);
+        wall_lo_raw = std::max(wall_lo_raw, corridor_.lo[i1]);
+        wall_hi_raw = std::min(wall_hi_raw, corridor_.hi[i1]);
+      }
+    }
+    double wall_lo = std::min(wall_lo_raw + margin, 0.0);
+    double wall_hi = std::max(wall_hi_raw - margin, 0.0);
     if (wall_hi > wall_lo) {
       const double want = c.latWant();
       const double safe = std::clamp(want, wall_lo, wall_hi);
@@ -10267,10 +10307,11 @@ void V2XOvertaker::publishTrajectory(const Frame & f, PlanCtx & c)
       (f.ei < f.in.points.size())
         ? f.in.points[f.ei].longitudinal_velocity_mps * 3.6 : -1.0;
     diagLog("速度上限", "速度上限 %.1fkm/h 決め手=%s 要求数=%zu 状態=%s 自車=%.1fkm/h "
-                "相手=%.1fkm/h 経路速度=%.1fkm/h 横=%.2fm idx=%zu",
+                "相手=%.1fkm/h 経路速度=%.1fkm/h 横=%.2fm 実横=%.2fm idx=%zu",
                 (c.speed_cap < 0.0) ? -1.0 : c.speed_cap * 3.6,
                 c.cap_why, c.cap_reqs.size(), ovStateName(),
-                std::abs(f.ev) * 3.6, ov_sp, ref_kmh, offset_, f.ei);
+                std::abs(f.ev) * 3.6, ov_sp, ref_kmh, offset_,
+                my_lat_for_target_, f.ei);
   }
 
   // --- 速度上限の下げ方に、全層まとめてレート制限を掛ける(調停の後の後処理)
