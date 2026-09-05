@@ -514,33 +514,35 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
   // それ以降は食い込み 0 を要求する。**
   const double start_wall_vio = wallViolation(obstacles, corridor, veh, start);
   const double start_car_vio = carViolation(cars, veh, start);
-  // 【減衰では足りなかった 2026-09-06】許容を距離で線形に減衰させたが、
-  // 開始時点の食い込みが大きい(実測 -0.50m)と減衰の途中でも許容が残り、
-  // **終端で -0.10m 食い込む経路**が通っていた。食い込んだ経路は実行できず、
-  // 引き直して同じ答えが返る。
+  // --- 許容は「悪化させない」ことで表す(2026-09-06) ---
   //
-  // 許容は「離れる向きへ動き出すため」にだけ要る。したがって
-  //   ・開始から kAllowLen[m] までは、**開始時点より悪化しない**ことだけを求める
-  //   ・それ以降は食い込み 0 を求める
-  // とする。減衰させず、条件そのものを切り替える。
-  // 【まだ緩すぎた 2026-09-06】開始から kAllowLen[m] のあいだ
-  // 「開始時点の食い込みを許す」としたが、開始時点で 0.85m 食い込んでいると
-  // その 1.5m の窓に**第1区間(前進1.5m)が丸ごと収まり**、
-  // `余裕壁 -0.40` の経路が通っていた。実測ではその計画が70回返り、
+  // 【距離で切り替えるのが誤りだった】「開始から kAllowLen[m] までは開始時の
+  // 食い込みを許し、それ以降は 0 を要求する」としていたが、
+  // **壁に 0.85m 食い込んだ状態から 0.6m 走って完全に領域内へ**は不可能。
+  // その結果 0.6m より先のすべての素片が棄却され、**経路が1本も作れなかった**
+  // (ユーザー指摘「切り返しを行えば基本的に計画が出ないとはならないはず」)。
+  //
+  // 正しい条件は距離ではない。**食い込んでいる間は深くしない**、
+  // **一度抜けたらもう食い込まない**、の2つで表せる。
+  // これなら 0.85m 入った車は何m後退しても離れる向きなら通り、
+  // 深くなる向きは1歩でも棄却される。距離の閾値は要らない。
+  // 【「悪化させない」では足りなかった 2026-09-06】
+  // 悪化させないだけでは **「壁に 1.12m 食い込んだまま、深さを変えずに
+  // 前進する 7m の経路」** が通る。実測でそれが採用され、切り返しが 0 回、
   // 壁前進禁止に毎回止められて位置が 1mm も変わらなかった。
   //
-  // 許容は「離れる向きへ動き出すため」にだけ要る。したがって
-  //   ・出だしは**開始時点より悪化しない**ことだけを求める(許容は据え置き)
-  //   ・そのぶん **kAllowLen を車体が抜け出せる最小限(0.6m)に縮める**
-  //   ・そして下で **経路全体の最小余裕が負の案は採らない**
-  constexpr double kAllowLen = 0.6;
-  auto wall_allow_at = [&](double run) {
-    return (run < kAllowLen) ? start_wall_vio : 0.0;
+  // 食い込んでいる間に求めるべきは「悪化させない」ではなく
+  // **「改善する向きへ動く」**。食い込み量が減る素片だけを通す。
+  // 壁に食い込んだ状態から改善する向きは多くの場合 後退なので、
+  // 切り返しが自然に出る。前進は領域内へ出てから始まる。
+  //
+  //   食い込んでいる(vio > 0)   -> 直前より減っていることを求める
+  //   食い込んでいない(vio = 0) -> 0 のままであることを求める
+  constexpr double kImprove = 0.01;   // 改善とみなす最小量[m]
+  auto ok_step = [&](double vio, double prev_vio) {
+    if (prev_vio > 1e-6) { return vio <= prev_vio - kImprove; }
+    return vio <= 1e-3;
   };
-  auto car_allow_at = [&](double run) {
-    return (run < kAllowLen) ? start_car_vio : 0.0;
-  };
-
   // --- 素片。舵は最大舵角を5段階 ---
   const double steers[5] = {-veh.max_steer, -veh.max_steer * 0.5, 0.0,
                             veh.max_steer * 0.5, veh.max_steer};
@@ -551,7 +553,9 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
     double g{0.0};        // ここまでの所要時間[s]
     double f{0.0};        // g + ヒューリスティック
     double v{0.0};        // その姿勢での進行方向の速さ[m/s]
-    double run{0.0};      // 開始からの走行距離[m](許容の減衰に使う)
+    double run{0.0};      // 開始からの走行距離[m]
+    double wall_vio{0.0}; // その姿勢での壁への食い込み[m]。悪化の判定に使う
+    double car_vio{0.0};  // 同 他車との重なり[m]
     int dir{0};           // 直前の素片の向き +1 前進 / -1 後退 / 0 開始
     int switches{0};      // ここまでの切り返し回数
     int parent{-1};
@@ -591,6 +595,8 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
   nodes.reserve(4096);
   Node s0;
   s0.pose = start;
+  s0.wall_vio = start_wall_vio;
+  s0.car_vio = start_car_vio;
   s0.g = 0.0;
   s0.v = 0.0;          // 復帰に入る時点では止まっている前提
   s0.f = heuristic(start);
@@ -640,15 +646,20 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
         bool ok = true;
         const int sub = std::max(1, static_cast<int>(std::ceil(prm.step / kStep)));
         const double ds = (dir > 0 ? 1.0 : -1.0) * (prm.step / sub);
-        // 開始からの走行距離。許容はこれで減衰させる。
+        // 直前の姿勢での食い込み量を基準に、悪化しないことを求める。
         double run = nodes[ci].run;
+        double prev_wall = nodes[ci].wall_vio;
+        double prev_car = nodes[ci].car_vio;
         for (int k = 0; k < sub; ++k) {
           p = advance(p, ds, st, veh.wheel_base);
           run += std::abs(ds);
-          if (wallViolation(obstacles, corridor, veh, p) > wall_allow_at(run)) {
-            ok = false; break;
-          }
-          if (carViolation(cars, veh, p) > car_allow_at(run)) { ok = false; break; }
+          const double wv = wallViolation(obstacles, corridor, veh, p);
+          const double cv = carViolation(cars, veh, p);
+          // 食い込んでいる間は改善する向きだけを通す。
+          if (!ok_step(wv, prev_wall)) { ok = false; break; }
+          if (!ok_step(cv, prev_car)) { ok = false; break; }
+          prev_wall = wv;
+          prev_car = cv;
         }
         if (!ok) { continue; }
         // --- この素片に要る時間を見積る ---
@@ -685,6 +696,8 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
         nd.g = ng;
         nd.v = v1;
         nd.run = run;
+        nd.wall_vio = prev_wall;
+        nd.car_vio = prev_car;
         nd.f = ng + heuristic(p);
         nd.dir = dir;
         nd.switches = sw;
@@ -751,7 +764,13 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
   // 実測: `余裕壁 -0.40` の案を70回返し、壁前進禁止に毎回止められて
   // 位置が変わらないまま無限に引き直していた。
   // 採れないなら「計画なし」を返す。そのほうが上位が停止を選べる。
-  if (out.min_wall_clear < 0.0) {
+  // 【条件を緩めた 2026-09-06】「前進区間の最小余裕が負なら採らない」は
+  // 厳しすぎた。上の「悪化させない」条件で深くなる経路は既に棄却されており、
+  // 残るのは「食い込んだまま離れていく」経路。それは実行してよい。
+  // 終端で食い込んでいる案だけを落とす(戻った先が壁の中では意味がない)。
+  if (!out.path.empty() &&
+      wallViolation(obstacles, corridor, veh, out.path.back()) > 1e-3)
+  {
     out.phases.clear();
     out.path.clear();
     out.valid = false;

@@ -359,6 +359,7 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
     "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
     wall_forward_ban_ ? "する" : "しない", wall_forward_ban_hold_, wall_forward_ban_gain_);
   goal_plan_enable_ = declare_parameter<bool>("goal_plan_enable", true);
+  desperate_enable_ = declare_parameter<bool>("desperate_enable", false);
   path_check_enable_ = declare_parameter<bool>("path_check_enable", true);
   path_check_bad_sec_ = declare_parameter<double>("path_check_bad_sec", 0.4);
   // 実測で「指令を倍にしても実舵角は変わらない」ことが分かったので 1.0 に戻す。
@@ -875,7 +876,7 @@ void StuckRecoveryController::onNominalCommand(
             RCLCPP_WARN(get_logger(),
               "壁前進禁止が %d回 前進を止めた。引き直しでは解けないので"
               "後退での脱出に切り替える", replan_count_);
-            desperate_ = true;
+            desperate_ = desperate_enable_;
             desperate_since_ = now;
             desperate_swing_ = -1;
           }
@@ -1665,7 +1666,7 @@ void StuckRecoveryController::beginRecovery(
   //   復帰 状況= 後方車 ... 壁-0.30          <- 開始時点で既に 0.30m 食い込み
   //   復帰追跡 前進 舵指令+18 速度0.00 走行0.00/4.50m 壁まで-0.30
   //   (同じ行が2秒間くり返し、走行は 0.06m のみ)
-  //   復帰 経路で渡しても 2.0s 動かない。直接制御に戻す
+  //   復帰 経路で渡しても 2.0s 動かない
   //   復帰 前進 で動けない。後退から引き直す
   //   → 後退へ切り替えた途端に動いた(速度 -0.22→-1.12、壁まで -0.30→+0.28)
   //
@@ -1879,7 +1880,7 @@ std::optional<bool> StuckRecoveryController::replanOrEscalate(
       RCLCPP_WARN(get_logger(),
                   "復帰 計画%d回で %.2fm しか動けない。強引な脱出に切り替える",
                   replan_count_, moved);
-      desperate_ = true;
+      desperate_ = desperate_enable_;
       desperate_since_ = now;
       desperate_swing_ = -1;
       desperate_ref_clear_ = -1e9;
@@ -1935,7 +1936,7 @@ std::optional<bool> StuckRecoveryController::replanOrEscalate(
     RCLCPP_WARN(get_logger(),
                 "復帰 経路が出せない(%d回目)。強引な脱出に切り替える 状況= %s",
                 replan_count_, situation_.c_str());
-    desperate_ = true;
+    desperate_ = desperate_enable_;
     desperate_since_ = now;
     desperate_swing_ = -1;
     desperate_ref_clear_ = -1e9;
@@ -2163,7 +2164,7 @@ std::optional<bool> StuckRecoveryController::waitForRearRoom(
       RCLCPP_WARN(get_logger(),
                   "復帰 やり直し%d回、後方待ち %.1fs。強引な脱出に切り替える",
                   replan_count_, (now - rear_wait_since_).seconds());
-      desperate_ = true;
+      desperate_ = desperate_enable_;
       desperate_since_ = now;
       desperate_swing_ = -1;
       desperate_ref_clear_ = -1e9;
@@ -2218,7 +2219,7 @@ std::optional<bool> StuckRecoveryController::handleStall(
         RCLCPP_WARN(get_logger(),
                     "復帰 やり直し%d回で %.2fm しか動けない。強引な脱出に切り替える",
                     replan_count_, moved);
-        desperate_ = true;
+        desperate_ = desperate_enable_;
         desperate_since_ = now;
         desperate_swing_ = -1;
         return true;
@@ -2438,7 +2439,7 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
         else if ((now - traj_still_since_).seconds() > kTrajStillSec) {
           traj_giveup_ = true;
           RCLCPP_WARN(get_logger(),
-                      "復帰 経路で渡しても %.1fs 動かない。直接制御に戻す",
+                      "復帰 経路で渡しても %.1fs 動かない(追従は続ける)",
                       kTrajStillSec);
         }
       }
@@ -2469,7 +2470,10 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   } else {
     // 後退区間も経路を publish して後退用 pure_pursuit に追従させる
     // (2026-08-31・ユーザー指示)。前進とまったく同じ形にする。
-    // 追従できずに止まったままなら、従来どおり直接制御へ戻す。
+    // 【訂正 2026-09-06】以前はここで自前の一定舵角制御へ落としていたが、
+    // その制御は区間の代表舵角を区間全体に適用するもので、7〜15m の円弧を
+    // 描いて向かいの壁に当たっていた。**削除済み**。
+    // いまは追従を続けるだけ(舵は pure_pursuit が持つ)。
     if (reverse_following_ && !traj_giveup_) {
       if (std::abs(latest_velocity_) > kMovingSpeedThreshold) {
         traj_still_ = false;
@@ -2478,7 +2482,7 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
         else if ((now - traj_still_since_).seconds() > kTrajStillSec) {
           traj_giveup_ = true;
           RCLCPP_WARN(get_logger(),
-                      "復帰 後退を経路で渡しても %.1fs 動かない。直接制御に戻す",
+                      "復帰 後退を経路で渡しても %.1fs 動かない(追従は続ける)",
                       kTrajStillSec);
         }
       }
@@ -2497,8 +2501,13 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 // 瞬間に不連続が生じ、pure_pursuit が急に遠くの目標を向いて壁へ寄っていた。
 // 前進区間を経路として渡せば pure_pursuit がそのまま追従し、
 // 経路の終端が目標軌道につながっているので戻りが連続になる。
-// 後退区間は pure_pursuit では表現できない(ギアと舵の符号が変わる)ので
-// 従来どおり直接制御する。
+// 【訂正 2026-09-06】「後退区間は pure_pursuit では表現できないので直接制御する」
+// と書いていたが誤り。専用ノード `reverse_pure_pursuit` が後退経路を追従できる。
+// できていなかった原因は次の3つで、いずれも修正済み。
+//   1. 加速度の符号が逆(REVERSE ギアで負 = 常にブレーキ)
+//   2. 経路が pure_pursuit の目標距離より短い(1.5m < 2.5m)ので目標点が無い
+//   3. 舵の符号が二重反転(前方基準の角度に後方基準の反転を掛けていた)
+// 1 が 2 と 3 を隠していた(動かない車の舵の向きは観測できない)。
 
 // 固定した経路が、いまの他車位置でまだ通れるかを検査する。
 //
@@ -2604,10 +2613,28 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
       constexpr double kTailStep = 0.25;
       if (rev.points.size() >= 1 && rev_n >= 1) {
         const auto & last = plan_.path[rev_n - 1];
-        const double steer = plan_.phases[phase_idx_].steer;
+        // --- 尾は「最後の2点から求めた実際の曲率」で延ばす(2026-09-06) ---
+        //
+        // 【バグだった点】区間の**代表舵角**(最初の素片の舵)で延ばしていた。
+        // 後退区間の舵が途中で変わる場合、尾は最後の姿勢から**間違った向き**へ
+        // 曲がる。`reverse_pure_pursuit` はその尾を目標にするので、
+        // 逆向きに舵を切る(ユーザー報告「後退の経路が、車体前方が通常の経路の
+        // 向きに向かない方にハンドルを切っていた」)。
+        // 代表値を使わず、経路そのものの曲率を継ぐ。
+        double curv = 0.0;   // [rad/m]
+        if (rev_n >= 2) {
+          const auto & prev = plan_.path[rev_n - 2];
+          const double ds = std::hypot(last.x - prev.x, last.y - prev.y);
+          if (ds > 1e-6) {
+            double dy = last.yaw - prev.yaw;
+            while (dy > M_PI) { dy -= 2.0 * M_PI; }
+            while (dy < -M_PI) { dy += 2.0 * M_PI; }
+            curv = dy / ds;
+          }
+        }
         double x = last.x, y = last.y, yaw = last.yaw;
         for (double run = 0.0; run < kTailLen; run += kTailStep) {
-          const double dyaw = -kTailStep / std::max(veh_.wheel_base, 0.1) * std::tan(steer);
+          const double dyaw = -kTailStep * curv;
           const double mid = yaw + dyaw * 0.5;
           x += -kTailStep * std::cos(mid);
           y += -kTailStep * std::sin(mid);

@@ -51,6 +51,7 @@ x-autoware-base: &autoware-base
     - OT_LANE_INSET=${OT_LANE_INSET:-0.35}
     - BODY_ASYM=${BODY_ASYM:-true}
     - HOLD_ALONGSIDE=${HOLD_ALONGSIDE:-true}
+    - WALL_BODY_SPAN=${WALL_BODY_SPAN:-true}
     - OT_LANE_USE=${OT_LANE_USE:-239:17}
     - OPP_MODEL=${OPP_MODEL:-true}
     - SPOT_ALL=${SPOT_ALL:-true}

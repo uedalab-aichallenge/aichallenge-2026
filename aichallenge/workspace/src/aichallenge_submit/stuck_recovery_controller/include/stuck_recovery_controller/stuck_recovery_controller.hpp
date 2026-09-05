@@ -136,6 +136,10 @@ private:
   // --- 最終手段の上限(2026-09-06) ---
   // 終了条件が「復帰開始地点から 1.2m 動けたら」の1つだけで、
   // 動けない間は**時間の上限なく後退し続けた**。
+  // 最終手段(強引な脱出)を使うか。**デバッグの邪魔になるので既定 off**
+  // (ユーザー指示 2026-09-06)。切り返しの計画で解けるべき問題を、
+  // 最終手段が隠してしまうため。
+  bool desperate_enable_{false};
   double desperate_max_sec_{10.0};
   double desperate_stall_sec_{3.0};
   double desperate_ref_clear_{-1e9};
