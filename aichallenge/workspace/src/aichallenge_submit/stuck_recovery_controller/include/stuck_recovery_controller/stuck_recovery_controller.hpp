@@ -275,6 +275,19 @@ private:
   double recovery_start_x_{0.0}, recovery_start_y_{0.0};
   rclcpp::Time phase_start_{0, 0, RCL_ROS_TIME};
   double stall_x_{0.0}, stall_y_{0.0};   // 動けているかの確認用
+  // 計画を採用した地点。走り切った計画が実際に前進できたかを見て、
+  // 「やり直し」に数えるかどうかを決める。
+  double plan_x_{0.0}, plan_y_{0.0};
+  // 計画を採用した時点の壁との余裕[m]。走り切った計画を「進めた」と数えるには、
+  // 距離だけでなく状況が改善していることも要る。
+  double plan_wall_clear_{0.0};
+  // 出口の壁前進禁止が実際に前進を止めたか。
+  // 【外部レビュー の最優先指摘 2026-09-05】
+  //   「出口が前進を拒否したまま、論理上の区間を FORWARD に残さない」
+  //   「出口から直接ギアや後退指令を作らない。後退の方向・舵・ギアは復帰制御が所有する」
+  // 出口は拒否したことを**報告するだけ**。それを受けて向きを変えるのは復帰制御。
+  bool wall_ban_hit_{false};
+  rclcpp::Time wall_ban_hit_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time stall_since_{0, 0, RCL_ROS_TIME};
   // ギアを入れ替えた時刻。AWSIM のギアは切り替わるまで間があるので、
   // 入れ替え直後に動けないことを「詰まっている」と誤判定しないために持つ。

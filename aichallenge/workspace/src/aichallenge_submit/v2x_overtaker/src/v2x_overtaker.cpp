@@ -779,6 +779,10 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_guard_time_(declare_parameter<double>("ot_lane_guard_time", 0.5)),
   // 27km/h がアタッカーの閾値。境界で振動しないよう 1km/h の余裕を持たせる。
   ot_lane_min_kmh_(declare_parameter<double>("ot_lane_min_kmh", 28.0)),
+  ot_lane_prepare_(declare_parameter<bool>("ot_lane_prepare", true)),
+  ot_lane_prepare_look_(declare_parameter<double>("ot_lane_prepare_look", 18.0)),
+  ot_lane_prepare_time_(declare_parameter<double>("ot_lane_prepare_time", 0.8)),
+  ot_lane_target_lat_(declare_parameter<double>("ot_lane_target_lat", -3.30)),
   // レーンは自車ラインの右 2.15m から始まる(実測)。
   // 速度が足りないときはその手前で止める。
   ot_lane_guard_lat_(declare_parameter<double>("ot_lane_guard_lat", 2.0)),
@@ -3983,6 +3987,7 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
     side_flip_cnt_ = 0;           // 対象車が変わったら側の変更枠を戻す
     side_flip_at_ = now.seconds();
     side_unfit_since_ = -1.0;
+    side_other_fit_since_ = -1.0;
     // 側の優先順位: イン > 相手の反対側。
     // イン側を先に押さえると相手は避けざるを得ず、アウトから被せるより
     // 成立しやすい(ユーザー方針: 攻められるならイン、無理なら反対側)。
@@ -4062,7 +4067,10 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
     // 実測済み(2026-09-04: 反転0%->21%で追い越し 0.50->0.00)だが、
     // レーンは242点中34点しかなく、しかも運営が側を決めている区間なので
     // 「場所ごとに側を選び直す」ことにはならない。
-    const bool ot_lane_side = ot_lane_side_right_ && otLaneUsable(ei);
+    // レーンの中に入ってから側を右に決めても、横位置は約20m遅れて実現するので
+    // 帯に入れない。入口の手前から右に決める(otLaneApproach のコメント参照)。
+    const bool ot_lane_side =
+      ot_lane_side_right_ && otLaneApproach(ei, my_speed_for_gap_, rankSpeedCap());
     if (ot_lane_side) { want = -1.0; }        // 右
     const bool in_right_zone = by_room || ot_lane_side;   // 録画で決めた側は曲率より優先する
     // 【修正 2026-09-04】上のコメント「録画で決めた側は曲率より優先する」が
@@ -4242,13 +4250,39 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
     }
   }
   const bool other_fits = (side_sign_ > 0.0) ? fit_right : fit_left;
+  // --- 反対側にも「連続して」余地があることを求める(2026-09-05) ---
+  //
+  // 【実測 4レース(決勝構成・16台レース)】
+  //   「追越 側を変更」は **201回**(1台1レースあたり 12.6回)出ている。
+  //   一方で「側の余地なし」で却下された 159 窓のうち **71窓(45%)は
+  //   反対側なら成立していた**のに回れておらず、その **42窓(59%)は
+  //   変更枠を使い切った状態(枠=4/4)** だった。
+  //
+  // つまり枠は「効かない反転」に使い果たされ、**本当に回るべき場面で
+  // 残っていない**。枠(回数)は良し悪しを区別できない指標である。
+  //
+  // 区別できる指標は時間のほう。選んだ側の余地なしは side_flip_hold 秒の
+  // 連続を求めているのに、**反対側の成立は瞬間値で見ていた**。
+  // 横位置は指令から約20m遅れて実現するので、一瞬空いた側へ回っても
+  // 寄り切る前に閉じ、また戻ることになる。これが 201回の実体である。
+  //
+  // 反対側にも同じ連続時間を求めて、無駄な反転を減らす。
+  // 枠は増やさない(反転が減れば同じ枠で足りるはず。増減は別々に測る)。
+  if (other_fits) {
+    if (side_other_fit_since_ < 0.0) { side_other_fit_since_ = now.seconds(); }
+  } else {
+    side_other_fit_since_ = -1.0;
+  }
+  const bool other_fits_held =
+    other_fits && side_other_fit_since_ >= 0.0 &&
+    (now.seconds() - side_other_fit_since_) >= side_flip_hold_;
   // 試行開始後に側を反転すると、横目標が左右へ1〜3秒周期で振られ、
   // どちら側にも必要な横間隔を作れない。実測3レースでは側変更38/31/61回、
   // 失敗66件中36件が allow/feasible/latch 全成立なのに横間隔0.34m未満だった。
   // 狭区間では後段の latch_width_ok が試行を終了させるので、ここでは
   // 試行が失敗・終了するまで選んだ側を固定する。
   const bool committed = attempt_active_;
-  if (!side_fits_ && side_flip_cnt_ < side_flip_max_ && other_fits && !committed &&
+  if (!side_fits_ && side_flip_cnt_ < side_flip_max_ && other_fits_held && !committed &&
       side_unfit_since_ >= 0.0 &&
       (now.seconds() - side_unfit_since_) >= side_flip_hold_)
   {
@@ -4257,6 +4291,7 @@ void V2XOvertaker::chooseSide(const Frame & f, PlanCtx & c, const OtherState & o
     side_flip_cnt_++;
     side_flip_at_ = now.seconds();
     side_unfit_since_ = -1.0;
+    side_other_fit_since_ = -1.0;
     side_decided_at_ = now.seconds();
     RCLCPP_INFO(get_logger(),
       "追越 側を変更(%d/%d) target=%s 側=%s 相手横=%.2f 余地=[%.2f,%.2f] offset=%.2f",
@@ -4628,7 +4663,10 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   // 実測(20260905-003852、4台・決勝条件): レーン内(idx234-21)で追い越しが
   // 始まらない理由は全車とも「開始車間不足」12件が最多で、
   // 却下理由の全体1位は「ゾーン外」だった。レーンにいても許可が下りていない。
-  const bool ot_lane_here = otLaneUsable(ei);
+  // レーンの中だけでなく、入口の手前も許可する(otLaneApproach のコメント参照)。
+  // 側の決定(ot_lane_side)や BLOCK ガードは従来どおり otLaneUsable/otLaneAhead
+  // を使うので、ここで広げるのは「仕掛けてよい」の判定だけ。
+  const bool ot_lane_here = otLaneApproach(ei, my_speed_for_gap_, rank_cap);
   const bool zone_ok = spot_ready || ot_lane_here ||
                        (zone_fallback_enable_ && c.in_zone && !require_spot_plan);
 
@@ -5007,6 +5045,19 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
                 tgt, pushed, room_lo_, room_hi_);
       }
       tgt = pushed;
+    }
+    // --- 公式オーバーテイクレーンを使うなら、車体を丸ごと帯へ入れる ---
+    //
+    // 帯は自車ラインの右 2.15〜5.0m。攻撃側として認められるのは
+    // 「車体が丸ごと帯の中」かつ「27km/h 以上」のときで、攻撃側がいる間だけ
+    // 遅い車に退避義務(3秒)が生じる。**相手を動かせるのはこの条件だけ**なので、
+    // 帯の縁に半分だけ入る中途半端な横位置には意味がない。
+    // コリドアの実測(idx239以降で lo -2.85〜-4.35)では -3.30 は入る。
+    // 帯へ入れない区間では下の clamp が自動的に手前で止める。
+    if (ot_lane_target_lat_ < 0.0 && side_sign_ < 0.0 &&
+        otLaneApproach(f.ei, my_speed_for_gap_, rankSpeedCap()))
+    {
+      tgt = std::min(tgt, ot_lane_target_lat_);
     }
     tgt_lat = std::clamp(tgt, room_lo_, room_hi_);
     c.requestLat(tgt_lat, PlanCtx::LatPrio::kOvertake, "追越");
@@ -5823,6 +5874,59 @@ bool V2XOvertaker::inOtLane(std::size_t idx) const
 // 自動的にレーンを使わない側に回る。順位推定はずれることが分かっているので、
 // 推定に依存しないこの形にしてある(ユーザー指摘: 左寄りのおかげで
 // 1位は今まで BLOCK を受けていない。その性質は壊さない)。
+double V2XOvertaker::rankSpeedCap() const
+{
+  return ((rank_ == 1) ? leader_speed_cap_ : rank2_speed_cap_) / 3.6;
+}
+
+double V2XOvertaker::otLaneEntryDistance(std::size_t idx, double look) const
+{
+  if (ot_lane_zones_.empty() || line_x_.empty()) { return -1.0; }
+  if (inOtLane(idx)) { return -1.0; }
+  const std::size_t n = line_x_.size();
+  double acc = 0.0;
+  for (std::size_t k = 0; k < n; ++k) {
+    const std::size_t a = (idx + k) % n;
+    const std::size_t b = (idx + k + 1) % n;
+    acc += std::hypot(line_x_[b] - line_x_[a], line_y_[b] - line_y_[a]);
+    if (acc > look) { return -1.0; }
+    if (inOtLane(b)) { return acc; }
+  }
+  return -1.0;
+}
+
+// --- レーンの手前から追い越しを許可する(2026-09-05) ---
+//
+// 【なぜ必要か】横位置は指令から**約20m先で実現する**(実測。横移動レート
+// 1.2m/s、速度10m/s)。レーンは長さ36m しかないので、「レーンの中にいる」を
+// 許可の条件にすると、許可が下りた時点で寄せ始めても**レーンの中で車体が
+// レーンに収まらない**。許可が無いから横へ出ない、横へ出ていないから
+// レーンを使えない、という循環になる。
+//
+// 【実測 4レース(決勝構成)】走行順位1位を抜いた成功は0回。
+// 2位はレースの 62〜67% を1位の10m以内で過ごし、最接近は 0.3〜0.8m。
+// 1位に対する却下 649件のうち最多は「ゾーン外」276件だった。
+//
+// 【入口で 27km/h 未満だと即座に BLOCK(20秒)】なので、手前で許可するときは
+// 「入口までに攻撃側の速度へ到達できるか」を確かめる。全開加速の到達速度
+// (順位ごとの速度上限で頭打ち)で判定する。到達できないなら許可しない
+// ＝ ot_lane_guard がレーンへの低速進入を止める側に回る。
+bool V2XOvertaker::otLaneApproach(std::size_t idx, double v_now, double v_cap) const
+{
+  if (!ot_lane_enable_ || ot_lane_zones_.empty()) { return false; }
+  if (inOtLane(idx)) { return v_now * 3.6 >= ot_lane_min_kmh_; }
+  if (!ot_lane_prepare_) { return false; }
+  const double look = ot_lane_prepare_look_ +
+                      std::max(v_now, 0.0) * ot_lane_prepare_time_;
+  const double d = otLaneEntryDistance(idx, look);
+  if (d < 0.0) { return false; }
+  // 入口での到達速度。加速度は spot 計画と同じ前提値を使う。
+  const double v_entry = std::min(
+    std::sqrt(std::max(v_now, 0.5) * std::max(v_now, 0.5) + 2.0 * 1.2 * d),
+    (v_cap > 0.0) ? v_cap : 1e9);
+  return v_entry * 3.6 >= ot_lane_min_kmh_;
+}
+
 bool V2XOvertaker::otLaneUsable(std::size_t idx) const
 {
   if (!ot_lane_enable_ || ot_lane_zones_.empty()) { return false; }

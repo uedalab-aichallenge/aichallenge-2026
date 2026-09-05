@@ -67,7 +67,17 @@
        description="オーバーテイクレーンの idx 範囲"/>
   <arg name="ot_lane_min_kmh" default="$(env OT_LANE_MIN 28.0)"
        description="レーンを使うのに要る自車速度[km/h]。27がルール上の閾値"/>
-  <arg name="ot_lane_guard_lat" default="$(env OT_LANE_GUARD 2.0)"
+
+  <!-- レーンの手前から追い越しを許可する。横位置は指令から約20m先で実現するので、
+       「レーンの中にいる」を条件にすると許可でレーンへ入れない循環になる。 -->
+  <arg name="ot_lane_prepare" default="$(env OT_LANE_PREP true)"
+       description="オーバーテイクレーンの入口手前から許可を出す"/>
+  <arg name="ot_lane_prepare_look" default="$(env OT_LANE_PREP_LOOK 18.0)"
+       description="入口の何m手前から許可するかの基本値"/>
+  <arg name="ot_lane_target_lat" default="$(env OT_LANE_TGT -3.30)"
+       description="レーンを使うときに狙う横位置[m]。車体を丸ごと帯へ入れる"/>
+  <arg name="ot_lane_prepare_time" default="$(env OT_LANE_PREP_TIME 0.8)"
+       description="上に足す「速度×この秒数」"/>  <arg name="ot_lane_guard_lat" default="$(env OT_LANE_GUARD 2.0)"
        description="上記未満のときレーン側(右)へ許す最大量[m]"/>
   <arg name="ot_lane_side_right" default="$(env OT_LANE_SIDE true)"
        description="レーン内では側を右に固定するか"/>
@@ -343,6 +353,10 @@
             <param name="ot_lane_enable" value="$(var ot_lane_enable)"/>
             <param name="ot_lane_zones" type="str" value="$(var ot_lane_zones)"/>
             <param name="ot_lane_min_kmh" value="$(var ot_lane_min_kmh)"/>
+            <param name="ot_lane_prepare" value="$(var ot_lane_prepare)"/>
+            <param name="ot_lane_prepare_look" value="$(var ot_lane_prepare_look)"/>
+            <param name="ot_lane_prepare_time" value="$(var ot_lane_prepare_time)"/>
+            <param name="ot_lane_target_lat" value="$(var ot_lane_target_lat)"/>
             <param name="ot_lane_guard_lat" value="$(var ot_lane_guard_lat)"/>
             <param name="ot_lane_side_right" value="$(var ot_lane_side_right)"/>
             <param name="no_pass_zones" type="str" value="$(var no_pass_zones)"/>

@@ -515,6 +515,15 @@ private:
   bool otLaneAhead(std::size_t idx, double look) const;
   // いま公式オーバーテイクレーンを使ってよいか(位置と自車速度で判定)。
   bool otLaneUsable(std::size_t idx) const;
+  // idx から公式オーバーテイクレーンの入口までの距離[m]。
+  // look[m] 以内に入口が無い(またはレーンの中にいる)なら負を返す。
+  double otLaneEntryDistance(std::size_t idx, double look) const;
+  // レーンの中にいる、または「入口までに攻撃側の速度へ到達できる位置にいる」か。
+  // 横位置は指令から約20m先で実現するので、レーンに入ってから許可を出しても
+  // その許可ではレーンへ入れない。入口の手前から許可する必要がある。
+  bool otLaneApproach(std::size_t idx, double v_now, double v_cap) const;
+  // いまの順位で許される速度上限[m/s]。
+  double rankSpeedCap() const;
   void avoidStoppedCars(const Frame & f, PlanCtx & c);
   void avoidCollision(const Frame & f, PlanCtx & c);
   void repulseFromNearCars(const Frame & f, PlanCtx & c);
@@ -1152,6 +1161,12 @@ private:
   const double ot_lane_guard_look_;  // ガードを効かせ始める先読み距離[m]
   const double ot_lane_guard_time_;  // 同、速度に比例して足す時間[s]
   const double ot_lane_min_kmh_;   // レーンを使うのに要る自車速度[km/h]
+  const bool ot_lane_prepare_;         // レーンの手前から許可を出すか
+  const double ot_lane_prepare_look_;  // 入口の何m手前から許可するかの基本値
+  const double ot_lane_prepare_time_;  // それに足す「速度×この秒数」
+  // レーンを使うときに狙う横位置[m](自車ラインからの符号つきオフセット)。
+  // 帯は右 2.15〜5.0m。車体を丸ごと帯へ入れるには -2.80 より右へ寄せる必要がある。
+  const double ot_lane_target_lat_;
   const double ot_lane_guard_lat_; // 上記未満のとき許す右への最大量[m]
   const bool ot_lane_side_right_;  // レーン内では側を右に固定するか
   const bool side_pick_over_curve_;  // 録画で決めた側を曲率より優先するか
@@ -1353,7 +1368,10 @@ private:
   double side_decided_at_{0.0};
   int side_flip_cnt_{0};           // この対象車で側を変更した回数(side_flip_max まで)
   double side_flip_at_{0.0};       // 枠の回復を数える基準時刻[s]
-  double side_unfit_since_{-1.0};  // 余地なしが始まった時刻[s]。負なら余地あり
+  double side_unfit_since_{-1.0};
+  // 反対側が「連続して」余地を持っている時間の起点。
+  // 瞬間的に反対側が空いた瞬間を捉えて回り込むと、寄せ切る前にまた戻ることになる。
+  double side_other_fit_since_{-1.0};  // 余地なしが始まった時刻[s]。負なら余地あり
   double deadlock_since_{-1.0};    // 停止車両の前で動けなくなった時刻[s]。負なら動いている
   // スタート時のグリッド横位置の保持
   int start_slot_{0};                  // スタート時の並び順(1=P1)
