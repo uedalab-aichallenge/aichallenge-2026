@@ -511,6 +511,8 @@ private:
   void preventRearEnd(const Frame & f, PlanCtx & c);
   // 指定 idx が公式オーバーテイクレーンの中か。
   bool inOtLane(std::size_t idx) const;
+  // idx から先 look[m] の範囲にレーンがあるか(横移動の遅れを織り込むため)。
+  bool otLaneAhead(std::size_t idx, double look) const;
   // いま公式オーバーテイクレーンを使ってよいか(位置と自車速度で判定)。
   bool otLaneUsable(std::size_t idx) const;
   void avoidStoppedCars(const Frame & f, PlanCtx & c);
@@ -1144,6 +1146,8 @@ private:
   //   (順位推定に依存しない。順位推定はずれることが分かっている)。
   const bool ot_lane_enable_;      // オーバーテイクレーンを使うか
   const bool ot_lane_guard_;       // 低速でレーンへ入らないガード(常時有効)
+  const double ot_lane_guard_look_;  // ガードを効かせ始める先読み距離[m]
+  const double ot_lane_guard_time_;  // 同、速度に比例して足す時間[s]
   const double ot_lane_min_kmh_;   // レーンを使うのに要る自車速度[km/h]
   const double ot_lane_guard_lat_; // 上記未満のとき許す右への最大量[m]
   const bool ot_lane_side_right_;  // レーン内では側を右に固定するか

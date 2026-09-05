@@ -762,6 +762,9 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_enable_(declare_parameter<bool>("ot_lane_enable", false)),
   // BLOCK(20秒)を避けるガード。レーンを追い越しに使うかとは独立に常時有効。
   ot_lane_guard_(declare_parameter<bool>("ot_lane_guard", true)),
+  // ガードを効かせ始める先読み距離。横位置が実現するまでの約20m。
+  ot_lane_guard_look_(declare_parameter<double>("ot_lane_guard_look", 20.0)),
+  ot_lane_guard_time_(declare_parameter<double>("ot_lane_guard_time", 0.5)),
   // 27km/h がアタッカーの閾値。境界で振動しないよう 1km/h の余裕を持たせる。
   ot_lane_min_kmh_(declare_parameter<double>("ot_lane_min_kmh", 28.0)),
   // レーンは自車ラインの右 2.15m から始まる(実測)。
@@ -1441,7 +1444,10 @@ void V2XOvertaker::onTimer()
   // **BLOCK が発生した**(4レース中1件)。レーンはコース上に実在するので、
   // 使わない選択をしても低速で触れれば違反になる。
   // したがってガードは「レーンを使うか」とは独立に常時効かせる。
-  if (ot_lane_guard_ && !ot_lane_zones_.empty() && inOtLane(f.ei) &&
+  // 手前から効かせる。必要な先読みは「横位置が実現するまでの距離」。
+  const double ot_look = ot_lane_guard_look_ +
+                         std::max(my_speed_for_gap_, 0.0) * ot_lane_guard_time_;
+  if (ot_lane_guard_ && !ot_lane_zones_.empty() && otLaneAhead(f.ei, ot_look) &&
       my_speed_for_gap_ * 3.6 < ot_lane_min_kmh_)
   {
     const double before = c.latWant();
@@ -5684,6 +5690,27 @@ void V2XOvertaker::followAndCommit(const Frame & f, PlanCtx & c,
 // ここでは全車を見て、自分の車体が通る帯に入っている車のうち最も近いものに対し、
 // 「止まれる速度」まで上限を落とす。抜き切りの判断より後に置いてあるので、
 // どの層が上限を外していても最後にここで抑えられる。
+// 指定 idx から先 look[m] の範囲にレーンがあるか。
+//
+// 【なぜ先読みが要るか(実測 2026-09-05)】BLOCK が1件出た(ハンデ中の先頭)。
+// ガードは「レーンの idx にいて 28km/h 未満なら右へ出ない」だが、
+// **横位置は指令から約20m走ってから実現する**ので、ゾーンに入ってから
+// 引き戻しても間に合わない。入る前から寄せておく必要がある。
+bool V2XOvertaker::otLaneAhead(std::size_t idx, double look) const
+{
+  if (ot_lane_zones_.empty() || line_x_.empty()) { return false; }
+  const std::size_t n = line_x_.size();
+  double acc = 0.0;
+  for (std::size_t k = 0; k < n; ++k) {
+    const std::size_t a = (idx + k) % n;
+    if (inOtLane(a)) { return true; }
+    const std::size_t b = (idx + k + 1) % n;
+    acc += std::hypot(line_x_[b] - line_x_[a], line_y_[b] - line_y_[a]);
+    if (acc > look) { break; }
+  }
+  return false;
+}
+
 // 指定 idx が公式オーバーテイクレーンの中か。0 またぎは no_pass_zones と同じ扱い。
 bool V2XOvertaker::inOtLane(std::size_t idx) const
 {
