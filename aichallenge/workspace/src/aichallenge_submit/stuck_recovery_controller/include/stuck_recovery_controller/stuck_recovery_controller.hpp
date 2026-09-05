@@ -103,6 +103,8 @@ private:
   bool canSteerAround();
   float avoidSteerDirection();
   void publishGear(std::uint8_t command);
+  // 指令速度の符号にギアを合わせる(出口の不変条件)。
+  void alignGearToSpeed(float speed);
 
   rclcpp::Publisher<AckermannControlCommand>::SharedPtr control_pub_;
   rclcpp::Publisher<GearCommand>::SharedPtr gear_pub_;
@@ -293,6 +295,13 @@ private:
   unsigned long plan_seq_{0};
   unsigned long wall_ban_acted_seq_{0};
   bool wall_ban_acted_{false};
+  // 壁に触れたまま前進指令が出ていて動かない状態の計測。
+  // 側面だけの接触は食い込みが浅く、壁前進禁止(深さ 0.15m 必要)が発火しない。
+  // 理由不問の膠着(hard_stall_sec=4秒)を待つと、その間ずっと壁を押し続ける。
+  double wall_contact_stall_sec_{1.5};
+  bool wall_stall_valid_{false};
+  double wall_stall_x_{0.0}, wall_stall_y_{0.0};
+  rclcpp::Time wall_stall_since_{0, 0, RCL_ROS_TIME};
   double wall_ban_acted_at_{-1.0};
   rclcpp::Time stall_since_{0, 0, RCL_ROS_TIME};
   // ギアを入れ替えた時刻。AWSIM のギアは切り替わるまで間があるので、

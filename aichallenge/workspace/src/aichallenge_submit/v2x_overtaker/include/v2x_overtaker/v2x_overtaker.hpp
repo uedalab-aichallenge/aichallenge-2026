@@ -183,6 +183,93 @@ struct OtherState
     spd_cnt[bin]++;
   }
 
+  // ================================================================
+  // 相手の走り方のモデル(ユーザー指示 2026-09-05)
+  //
+  // 【なぜ録画をやめるか】従来は「地点ごとの横位置と速度」を録画した表
+  // (kLatBins=256 の lat_sum/spd_sum)だけを使っていた。**決勝の相手は
+  // 他チームの車で、事前に録画する機会がない。** 実測(決勝構成4レース)では
+  // 抜きどころ計画の不成立 163回のうち **83% が「対象車の学習点0」**だった。
+  //
+  // 【代わりに何をするか】相手の挙動を**モデル**で表し、その少数の
+  // パラメータを**走行中に相手ごとに当てはめる**。
+  //
+  //   縦: v(i) = min(v_top, sqrt(ay_max * R(i)))
+  //       レーシングカートの速度は「最高速」と「横加速度の限界」で決まる。
+  //       R(i) はコースの曲率半径で既知。v_top と ay_max を実測から当てる。
+  //   横: lat(i) = bias + gain * inside(i)
+  //       inside(i) は「その地点でイン側がどちらか、どれだけ強いか」を
+  //       -1..+1 で表した既知量。bias(全体の寄り)と gain(インを取る度合い)を
+  //       最小二乗で当てる。
+  //
+  // どちらも**1周目の途中から値を返せる**。地点ごとの表と違い、
+  // 一度も通っていない地点でも予測できるのが要点。
+  // 録画した値がある地点ではそちらを優先し、モデルは受け皿として使う。
+  // ================================================================
+  double m_v_top{-1.0};      // 観測した最高速[m/s](緩やかに減衰させる)
+  double m_ay_max{-1.0};     // 観測した最大横加速度[m/s^2](同上)
+  // lat = bias + gain * inside の最小二乗用
+  double m_n{0.0}, m_sx{0.0}, m_sy{0.0}, m_sxx{0.0}, m_sxy{0.0};
+  int    m_samples{0};
+
+  // 1サンプル取り込む。radius はその地点の曲率半径[m]、
+  // inside は「イン側がどちらでどれだけ強いか」(-1..+1)。
+  void noteModel(double v, double radius, double lat, double inside)
+  {
+    if (v > 0.3 && v < 30.0) {
+      // 最高速は「最大値」で当てる。平均だと行列で遅い相手を過小評価する。
+      // ただし固定の最大値だと一度の外れ値が残るので、緩やかに減衰させる。
+      // 減衰は「1周(約47秒・約2400サンプル)で 0.5m/s 落ちる」程度にする。
+      // 0.002/サンプルだと 30秒で 39.8 -> 35.5km/h まで落ちてしまい(実測)、
+      // 相手の実力を過小評価して「抜けない」と判断してしまう。
+      m_v_top = (m_v_top < 0.0) ? v : std::max(v, m_v_top - 0.0002);
+      if (radius > 1.0 && radius < 1e6) {
+        const double ay = v * v / radius;
+        if (ay < 40.0) {
+          m_ay_max = (m_ay_max < 0.0) ? ay : std::max(ay, m_ay_max - 0.0004);
+        }
+      }
+    }
+    if (std::abs(lat) <= 6.0 && std::abs(inside) <= 1.0) {
+      // 直近を重く見るため、たまってきたら古い寄与を薄める。
+      if (m_n > 400.0) {
+        const double k = 0.995;
+        m_n *= k; m_sx *= k; m_sy *= k; m_sxx *= k; m_sxy *= k;
+      }
+      m_n += 1.0; m_sx += inside; m_sy += lat;
+      m_sxx += inside * inside; m_sxy += inside * lat;
+      m_samples++;
+    }
+  }
+
+  bool modelReady() const { return m_samples >= 30 && m_v_top > 0.0; }
+
+  // その地点で相手が出せると見込む速度[m/s]。当てはめ前は負を返す。
+  double modelSpd(double radius) const
+  {
+    if (m_v_top <= 0.0) { return -1.0; }
+    double v = m_v_top;
+    if (m_ay_max > 0.0 && radius > 1.0 && radius < 1e6) {
+      v = std::min(v, std::sqrt(m_ay_max * radius));
+    }
+    return std::max(v, 0.5);
+  }
+
+  // その地点で相手がいると見込む横位置[m]。当てはめ前は 1e9 を返す。
+  double modelLat(double inside) const
+  {
+    if (m_samples < 30 || m_n < 5.0) { return 1e9; }
+    const double det = m_n * m_sxx - m_sx * m_sx;
+    const double bias = (std::abs(det) < 1e-6)
+                          ? (m_sy / m_n)
+                          : (m_sxx * m_sy - m_sx * m_sxy) / det;
+    const double gain = (std::abs(det) < 1e-6)
+                          ? 0.0
+                          : (m_n * m_sxy - m_sx * m_sy) / det;
+    // 当てはめが暴れても現実的な範囲に収める。
+    return std::clamp(bias + std::clamp(gain, -3.0, 3.0) * inside, -5.0, 5.0);
+  }
+
   // その区間で相手が普段出している速度[m/s]。データが無ければ負を返す。
   double sectionSpeed(int sec) const
   {
@@ -524,6 +611,18 @@ private:
   bool otLaneApproach(std::size_t idx, double v_now, double v_cap) const;
   // いまの順位で許される速度上限[m/s]。
   double rankSpeedCap() const;
+
+  // --- 相手の走り方のモデル(ユーザー指示 2026-09-05) ---
+  // 「イン側がどちらで、どれだけ強いか」を地点ごとに -1..+1 で表した表。
+  // 曲率の符号(左旋回で +1)に、曲率半径から作った強さを掛けたもの。
+  // モデルの横位置の説明変数になる。経路の点数が変わったときだけ作り直す。
+  void buildInsideTable(const Trajectory & in);
+  double insideAt(std::size_t idx) const;
+  // その地点で相手がいると見込む横位置[m]。録画があればそれを優先し、
+  // 無ければモデルで埋める。どちらも無ければ 1e9。
+  double oppLatAt(const OtherState & o, std::size_t idx, std::size_t n) const;
+  // その地点で相手が出すと見込む速度[m/s]。同様に録画優先・モデル受け皿。負で無効。
+  double oppSpdAt(const OtherState & o, std::size_t idx, std::size_t n) const;
   void avoidStoppedCars(const Frame & f, PlanCtx & c);
   void avoidCollision(const Frame & f, PlanCtx & c);
   void repulseFromNearCars(const Frame & f, PlanCtx & c);
@@ -1167,6 +1266,13 @@ private:
   // レーンを使うときに狙う横位置[m](自車ラインからの符号つきオフセット)。
   // 帯は右 2.15〜5.0m。車体を丸ごと帯へ入れるには -2.80 より右へ寄せる必要がある。
   const double ot_lane_target_lat_;
+  // 相手の走り方をモデルで予測するか。false にすると録画だけの旧挙動に戻る。
+  const bool opp_model_enable_;
+  // 抜きどころ計画をグリッド最後尾(slot 1)以外にも作るか。
+  // 予選(3台・NPCあり)の名残で slot 1 だけに限定されていた。
+  const bool spot_all_slots_;
+  std::vector<double> inside_at_;      // 地点ごとのイン側の向きと強さ(-1..+1)
+  rclcpp::Time last_opp_model_log_{0, 0, RCL_ROS_TIME};
   const double ot_lane_guard_lat_; // 上記未満のとき許す右への最大量[m]
   const bool ot_lane_side_right_;  // レーン内では側を右に固定するか
   const bool side_pick_over_curve_;  // 録画で決めた側を曲率より優先するか

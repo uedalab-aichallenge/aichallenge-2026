@@ -74,6 +74,12 @@
        description="オーバーテイクレーンの入口手前から許可を出す"/>
   <arg name="ot_lane_prepare_look" default="$(env OT_LANE_PREP_LOOK 18.0)"
        description="入口の何m手前から許可するかの基本値"/>
+  <!-- 相手の軌道予測をモデル(走行中に相手ごとに当てはめる)で行うか。
+       false にすると録画した表だけを使う旧挙動に戻る。 -->
+  <arg name="opp_model_enable" default="$(env OPP_MODEL true)"
+       description="相手の走り方をモデルで予測する"/>
+  <arg name="spot_all_slots" default="$(env SPOT_ALL true)"
+       description="抜きどころ計画を全グリッド位置で作る(予選は slot1 だけだった)"/>
   <arg name="ot_lane_target_lat" default="$(env OT_LANE_TGT -3.30)"
        description="レーンを使うときに狙う横位置[m]。車体を丸ごと帯へ入れる"/>
   <arg name="ot_lane_prepare_time" default="$(env OT_LANE_PREP_TIME 0.8)"
@@ -357,6 +363,8 @@
             <param name="ot_lane_prepare_look" value="$(var ot_lane_prepare_look)"/>
             <param name="ot_lane_prepare_time" value="$(var ot_lane_prepare_time)"/>
             <param name="ot_lane_target_lat" value="$(var ot_lane_target_lat)"/>
+            <param name="opp_model_enable" value="$(var opp_model_enable)"/>
+            <param name="spot_all_slots" value="$(var spot_all_slots)"/>
             <param name="ot_lane_guard_lat" value="$(var ot_lane_guard_lat)"/>
             <param name="ot_lane_side_right" value="$(var ot_lane_side_right)"/>
             <param name="no_pass_zones" type="str" value="$(var no_pass_zones)"/>

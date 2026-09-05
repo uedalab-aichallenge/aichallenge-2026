@@ -325,6 +325,8 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
     "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
     wall_forward_ban_ ? "する" : "しない", wall_forward_ban_hold_, wall_forward_ban_gain_);
   hard_stall_sec_ = declare_parameter<double>("hard_stall_sec", 0.0);
+  wall_contact_stall_sec_ =
+    declare_parameter<double>("wall_contact_stall_sec", 1.5);
   hard_stall_dist_ = declare_parameter<double>("hard_stall_dist", 0.8);
   const auto raceline = declare_parameter<std::string>("raceline_csv", "");
   const auto corridor = declare_parameter<std::string>("corridor_csv", "");
@@ -809,11 +811,26 @@ void StuckRecoveryController::onNominalCommand(
                  plan_.phases[phase_idx_].forward)
       {
         blocked_dir_ = +1;
-        if (replan_count_ < kReplanMax) { ++replan_count_; }
-        RCLCPP_WARN(get_logger(),
-          "壁前進禁止が復帰の前進区間を止めた。後退から引き直す(%d回目)",
-          replan_count_);
-        makePlan(now, -1);
+        // 引き直しても出口が拒否し続けるなら、引き直しでは解けない。
+        // 実測(20260905-214826/d1): 「後退から引き直す(6回目)」が
+        // 28秒間くり返され、毎回同じ前進案が返っていた。
+        // 上限に達したら最終手段(食い込み中は後退か待機しか出さない)へ移す。
+        if (replan_count_ >= kReplanMax) {
+          if (!desperate_) {
+            RCLCPP_WARN(get_logger(),
+              "壁前進禁止が %d回 前進を止めた。引き直しでは解けないので"
+              "後退での脱出に切り替える", replan_count_);
+            desperate_ = true;
+            desperate_since_ = now;
+            desperate_swing_ = -1;
+          }
+        } else {
+          ++replan_count_;
+          RCLCPP_WARN(get_logger(),
+            "壁前進禁止が復帰の前進区間を止めた。後退から引き直す(%d回目)",
+            replan_count_);
+          makePlan(now, -1);
+        }
         if (runRecovery(now)) { return; }
       }
     }
@@ -1079,6 +1096,49 @@ void StuckRecoveryController::updateStuckDetection(
       }
     }
   }
+  // --- 壁に触れたまま前進して動かないなら、理由不問の膠着より早く拾う ---
+  //
+  // 【ユーザー報告 2026-09-05】「側面だけ壁に当たり動けなくなったとき、
+  // すぐに復帰処理に入らずしばらく無理に前進しようとする動きが見える」。
+  //
+  // 【なぜ遅いか】壁前進禁止は食い込みの深さ 0.15m 以上を要求する
+  // (地図誤差で誤発火しないため)。**側面をこするだけの接触はそれより浅い**ので
+  // 発火しない。すると理由不問の膠着(hard_stall_sec = 4.0秒)まで待つことになり、
+  // その4秒はずっと壁を押している。壁ペナルティは接触が続く間ずっと加算される。
+  //
+  // 【条件】車体が走行可能領域の外にある(=壁に触れている)、前進を指令している、
+  // それでも車体が進んでいない。この3つが揃った状態が続いた時間だけを測る。
+  // 深さは問わない代わりに時間を短く(1.5秒)する。
+  bool wall_stall = false;
+  if (wall_contact_stall_sec_ > 0.0 && moving_observed_ &&
+      command.longitudinal.speed > 0.5f && std::abs(velocity) < 0.3)
+  {
+    recovery::Pose wp;
+    if (currentPose(wp) && obstacles_.valid() &&
+        recovery::wallClearanceAt(obstacles_, veh_, wp) < 0.0)
+    {
+      if (!wall_stall_valid_ ||
+          std::hypot(wp.x - wall_stall_x_, wp.y - wall_stall_y_) > 0.20)
+      {
+        wall_stall_x_ = wp.x; wall_stall_y_ = wp.y;
+        wall_stall_since_ = now; wall_stall_valid_ = true;
+      } else if ((now - wall_stall_since_).seconds() >= wall_contact_stall_sec_) {
+        wall_stall = true;
+      }
+    } else {
+      wall_stall_valid_ = false;
+    }
+  } else {
+    wall_stall_valid_ = false;
+  }
+  if (wall_stall) {
+    RCLCPP_WARN(get_logger(),
+                "壁に触れたまま %.1f秒 前進しても動かない(指令%.2f 実速度%.2f)。"
+                "膠着として復帰へ入る",
+                wall_contact_stall_sec_, command.longitudinal.speed, velocity);
+    hard_stall = true;
+  }
+
   // 復帰直後は通常制御に発進の機会を与える(既存の kCooldownSec と同じ扱い)
   if (recovery_end_time_ &&
       (now - recovery_end_time_.value()).seconds() < kCooldownSec) {
@@ -1352,7 +1412,23 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
     // 最後のフォールバック。ここでも解が無いなら best_effort を立てて、
     // 棄却条件を全て外した上で「一番離れられる案」を採らせる
     // (kCarRadius を 1.49m に拡げた副作用で解なしになる距離が伸びたぶんの受け皿)。
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0, 0, 0.0, 0.0, 0.0,
+    //
+    // --- 【重大なバグの修正 2026-09-05】ここは first_phase を 0 に決め打ちして
+    // いた。**壁へ食い込んでいても前進から始まる案を返す。**
+    // しかも下の却下は `!plan_best_effort` で総当りを除外するので、
+    // その前進案がそのまま採用される。
+    //
+    // 実測(20260905-214826/d1。ユーザー報告「P1がまたずっと後退し続ける」):
+    //   計画6: 前進舵+0deg 2.5m 余裕壁**-0.36** 車**-0.97** 総当り1
+    //   → 出口の壁前進禁止が拒否 → 後退から引き直す → **同じ前進案** → 以下無限
+    // 1レースで計画140回・完了0回。壁 -0.22m のまま 28秒。
+    //
+    // 食い込んでいるなら総当りにも後退を要求する。
+    // 後退の解も無いなら計画は出さない。**そのときは止まって待つのが正しい**
+    // (ユーザーの目標「絶対に通過することができない場合はぶつからないように停止」)。
+    // desperate の食い込み時の枝が「方向を選んだ後退」か「舵を向けて待つ」を出す。
+    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+                           clear_at_plan < 0.0 ? -1 : 0, 0.0, 0.0, 0.0,
                            8.0, cars, 0.0, 0.0, true);
     plan_best_effort = plan_.valid;
   }
@@ -2698,6 +2774,34 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
 }
 
 // control_pub_ への唯一の出口。素通しの指令もここを通す。
+
+// ギアと指令速度の符号を必ず一致させる(2026-09-05)。
+//
+// 【ユーザー報告】「ごくたまに AWSIM 上のギアの表示がリバースになっているのに
+// 前進をすることがある。ギアチェンジの処理にバグが起きている可能性は?」
+//
+// 【何が起きうるか】ギアを publish するのは復帰の直接制御・desperate・
+// 復帰の終了だけで、**経路を素通しする経路(publishFiltered)ではギアを出さない。**
+// 後退区間の途中で計画が差し替わる・素通しへ切り替わると、
+// ギアが REVERSE のまま前向きの指令が流れる状態が生じる。
+// AWSIM の表示は最後に送ったギアなので、報告どおり「表示は R、動きは前進」になる。
+//
+// 【直し方】速度指令の符号でギアを決める、を**出口の不変条件**にする。
+// publishGear は値が変わったときだけ送るので毎周期呼んでも負荷にならない。
+// ここは新しい行動を作っていない(すでに出す指令に正しい札を付けるだけ)ので、
+// 「出口は拒否だけ」の原則にも反しない。
+void StuckRecoveryController::alignGearToSpeed(float speed)
+{
+  constexpr float kDeadband = 0.05f;
+  if (speed > kDeadband) {
+    publishGear(GearCommand::DRIVE);
+  } else if (speed < -kDeadband) {
+    publishGear(GearCommand::REVERSE);
+  }
+  // 停止指令のときはギアを触らない。切り返しの待ち時間中に
+  // 意図した向きのギアを保つ必要がある。
+}
+
 void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
 {
   float speed = cmd.longitudinal.speed;
@@ -2708,6 +2812,7 @@ void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
   cmd.longitudinal.acceleration = accel;
   // 回転で抜けるときは舵が本体なので上書きする。
   if (wall_ban_steer_valid_) { cmd.lateral.steering_tire_angle = wall_ban_steer_; }
+  alignGearToSpeed(cmd.longitudinal.speed);
   control_pub_->publish(cmd);
 }
 
@@ -2740,6 +2845,7 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   wall_ban_steer_valid_ = false;
   applyWallForwardBan(speed, acceleration);
   if (wall_ban_steer_valid_) { steer = wall_ban_steer_; }
+  alignGearToSpeed(speed);
 
   AckermannControlCommand msg;
   msg.stamp = stamp;

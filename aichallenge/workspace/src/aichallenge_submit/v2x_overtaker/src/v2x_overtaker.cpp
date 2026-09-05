@@ -783,6 +783,8 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_prepare_look_(declare_parameter<double>("ot_lane_prepare_look", 18.0)),
   ot_lane_prepare_time_(declare_parameter<double>("ot_lane_prepare_time", 0.8)),
   ot_lane_target_lat_(declare_parameter<double>("ot_lane_target_lat", -3.30)),
+  opp_model_enable_(declare_parameter<bool>("opp_model_enable", true)),
+  spot_all_slots_(declare_parameter<bool>("spot_all_slots", true)),
   // レーンは自車ラインの右 2.15m から始まる(実測)。
   // 速度が足りないときはその手前で止める。
   ot_lane_guard_lat_(declare_parameter<double>("ot_lane_guard_lat", 2.0)),
@@ -2233,6 +2235,80 @@ void V2XOvertaker::findFrontCar(const Frame & f)
   }
 }
 
+
+// ===================================================================
+// 相手の走り方のモデル(ユーザー指示 2026-09-05)
+//
+// 【指示の内容】「相手の軌道予測はモデルを用いて、細かいパラメータは
+// 走行中に相手それぞれの動きを見て最適化する」。
+//
+// 【従来が駄目だった理由】地点ごとの横位置と速度を録画した表しか使っておらず、
+// **相手が一度通った地点しか予測できなかった。** 決勝の相手は他チームの車で
+// 事前に録画できない。実測(決勝構成4レース)では抜きどころ計画の不成立163回の
+// **83%が「対象車の学習点0」**で、成立率は 5.5% しかなかった。
+//
+// 【モデル】コースの形(曲率半径)は既知なので、相手ごとに当てるのは
+//   ・v_top   最高速[m/s]
+//   ・ay_max  横加速度の限界[m/s^2]
+//   ・bias    全体としての横の寄り[m]
+//   ・gain    イン側を取る度合い(無次元)
+// の4つだけ。少数なので**数秒の観測で当てはまり、一度も通っていない地点でも
+// 予測できる。** 詳細は OtherState のコメント。
+// ===================================================================
+void V2XOvertaker::buildInsideTable(const Trajectory & in)
+{
+  const std::size_t n = in.points.size();
+  if (n < 24) { inside_at_.clear(); return; }
+  if (inside_at_.size() == n) { return; }   // 点数が変わらない間は作り直さない
+  inside_at_.assign(n, 0.0);
+  // イン側の強さの基準になる曲率半径[m]。これより小さいほど強く 1.0 へ寄る。
+  constexpr double kRefRadius = 25.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto & a = in.points[i].pose.position;
+    const auto & b = in.points[(i + 8) % n].pose.position;
+    const auto & c = in.points[(i + 16) % n].pose.position;
+    // 外積の符号が正なら左旋回。左旋回のイン側は左(横位置が正)。
+    const double cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    const double sign = (std::abs(cross) < 0.5) ? 0.0 : ((cross > 0.0) ? 1.0 : -1.0);
+    double strength = 0.0;
+    if (corridor_.radius.size() == n) {
+      const double r = corridor_.radius[i];
+      if (r > 1.0 && r < 1e6) { strength = std::clamp(kRefRadius / r, 0.0, 1.0); }
+    }
+    inside_at_[i] = sign * strength;
+  }
+  RCLCPP_INFO(get_logger(), "相手モデルのイン側の表を作成 %zu 点", n);
+}
+
+double V2XOvertaker::insideAt(std::size_t idx) const
+{
+  if (idx >= inside_at_.size()) { return 0.0; }
+  return inside_at_[idx];
+}
+
+double V2XOvertaker::oppLatAt(
+  const OtherState & o, std::size_t idx, std::size_t n) const
+{
+  const int bin = (n > 0)
+                    ? static_cast<int>(idx * OtherState::kLatBins / n) : -1;
+  const double rec = o.laneLatProvisional(bin);
+  if (rec < 1e8) { return rec; }            // 実際に通った地点の観測を優先
+  if (!opp_model_enable_) { return 1e9; }
+  return o.modelLat(insideAt(idx));
+}
+
+double V2XOvertaker::oppSpdAt(
+  const OtherState & o, std::size_t idx, std::size_t n) const
+{
+  const int bin = (n > 0)
+                    ? static_cast<int>(idx * OtherState::kLatBins / n) : -1;
+  const double rec = o.laneSpdProvisional(bin);
+  if (rec > 0.0) { return rec; }
+  if (!opp_model_enable_) { return -1.0; }
+  const double r = (corridor_.radius.size() > idx) ? corridor_.radius[idx] : 1e9;
+  return o.modelSpd(r);
+}
+
 // 相手の走行ラインを学習する(前方かどうかに関係なく毎周期)。
 // あわせてブースト要求を毎周期作り直す。
 void V2XOvertaker::learnOpponentLine(const Frame & f)
@@ -2259,6 +2335,14 @@ void V2XOvertaker::learnOpponentLine(const Frame & f)
       if (std::abs(llat) > 6.0) { continue; }
       const int lbin = static_cast<int>(li * OtherState::kLatBins / n);
       os.noteLat(lbin, llat);
+      // --- 同じサンプルをモデルの当てはめにも渡す(ユーザー指示 2026-09-05) ---
+      // 表(地点ごと)は通った地点しか埋まらないが、モデルの4つの
+      // パラメータはどの地点のサンプルからでも改善する。
+      if (opp_model_enable_) {
+        buildInsideTable(in);
+        const double lr = (corridor_.radius.size() == n) ? corridor_.radius[li] : 1e9;
+        os.noteModel(std::hypot(os.vx, os.vy), lr, llat, insideAt(li));
+      }
       // 横位置と同じ地点分解能で**速度も**録る(ユーザー指示の「録画」)。
       // 抜きどころを決めるとき、相手が遅い場所ほど詰めやすいため。
       {
@@ -2656,12 +2740,22 @@ void V2XOvertaker::planPassSpot(const Frame & f)
   spot_len_ = 0.0;
   spot_ospeed_ = -1.0;
 
-  // submit_11 の公式結果では P2 は 5戦5勝だった一方、唯一の敗戦は P1。
-  // 新しい時刻同期型の抜きどころ計画を P2 にも適用すると、勝っていた判断を
-  // 不要に変えてしまう。さらに公式第6戦ではグリッド確定の約0.7秒前に P2 を
-  // 対象とした誤試行が始まっていた。スロットが確定するまで計画を作らず、
-  // 現段階では問題が再現している P1 のみに限定する。
-  if (!slots_assigned_ || start_slot_ != 1) { return; }
+  // --- 抜きどころ計画を全スロットで作る(2026-09-05) ---
+  //
+  // 【元の制限とその理由】予選(3台・最前列は運営NPC)では
+  // 「submit_11 で P2 は5戦5勝、唯一の敗戦は P1」だったので、勝っていた
+  // P2 の判断を変えないよう、新しい抜きどころ計画を **P1 だけ**に限定した。
+  // グリッド確定の0.7秒前に誤試行が始まる不具合もあり、`slots_assigned_` の
+  // ガードと合わせて入れてあった。
+  //
+  // 【決勝では誤り】決勝は4台で運営NPCがおらず、**自分のグリッド位置は
+  // 事前に分からない。** この制限があると **4台のうち3台は抜きどころ計画を
+  // 一度も作らない**(実測: `抜きどころ target=` が 1レースで 0件)。
+  // 許可の主経路が `spot_ready` なので、3台は構造的に追い越せない。
+  // 誤試行のほうは `slots_assigned_` が担保しているので、そちらは残す。
+  // spot_all_slots=false で予選の挙動に戻せる。
+  if (!slots_assigned_) { return; }
+  if (!spot_all_slots_ && start_slot_ != 1) { return; }
 
   const Trajectory & in = f.in;
   const size_t n = f.n;
@@ -2759,8 +2853,8 @@ void V2XOvertaker::planPassSpot(const Frame & f)
       const size_t nx = (cur + 1) % n;
       double ds = f.s[nx] - f.s[cur];
       if (ds < 0.0) { ds += f.total; }
-      const int bin = static_cast<int>(cur * OtherState::kLatBins / n);
-      double vop = tgt->laneSpdProvisional(bin);
+      // 録画があればそれを、無ければモデルの予測を使う(ユーザー指示 2026-09-05)。
+      double vop = oppSpdAt(*tgt, cur, n);
       const bool have_learned_v = vop > 0.0;
       if (!have_learned_v) { vop = (op_mean > 0.0) ? op_mean : std::hypot(tgt->vx, tgt->vy); }
       // 【修正O 2026-09-02】O-1 と同じ理由。相手の到着時刻も地点別の学習速度で
@@ -2922,11 +3016,15 @@ void V2XOvertaker::planPassSpot(const Frame & f)
     const bool interceptable = after_opponent && op_arrival[b] < 1e17 &&
                                arrival_delta >= -20.0 && arrival_delta <= 4.0;
 
-    const int bin = static_cast<int>(b * OtherState::kLatBins / n);
     // 1周目の観測も候補探索には使う。最終的な側判定や衝突バンドは従来どおり
     // 3サンプル値を使い、ここでは15m連続条件で単発ノイズを排除する。
-    double ol = tgt->laneLatProvisional(bin);
-    const double ov = tgt->laneSpdProvisional(bin);
+    //
+    // 【ユーザー指示 2026-09-05】録画した表だけでは**一度も通っていない地点を
+    // 予測できない。** 決勝の相手は録画できないので、表が無い地点は
+    // 走行中に当てはめたモデル(最高速・横加速度の限界・横の寄り・インの取り方)
+    // で埋める。実測ではここが埋まらないために抜きどころの成立率が 5.5% だった。
+    double ol = oppLatAt(*tgt, b, n);
+    const double ov = oppSpdAt(*tgt, b, n);
     // 【修正O 2026-09-02】ここも学習した地点別速度を周回平均で床張りして
     // いた。相手が自分の平均より遅い地点(=抜くべき場所)の情報が消え、
     // required_distance が過大になって候補が落ちる。この値は vsum/vcnt を
@@ -3211,8 +3309,7 @@ double V2XOvertaker::latestPassAccelDelay(
       const double self_path_cap = std::max<double>(
         std::min<double>(self_rank_cap,
                          f.in.points[si].longitudinal_velocity_mps), 0.5);
-      const int obin = static_cast<int>(oi * OtherState::kLatBins / f.n);
-      double learned = o.laneSpdProvisional(obin);
+      double learned = oppSpdAt(o, oi, f.n);
       const bool have_learned = learned > 0.0;
       if (!have_learned) { learned = (op_mean > 0.0) ? op_mean : op_now; }
       // 【修正O 2026-09-02】学習した地点別速度を主に使う。以前は
@@ -3380,6 +3477,27 @@ void V2XOvertaker::dumpTrace(const Frame & f)
       kv.first.c_str(), o.slot, known, OtherState::kLatBins,
       o.meanSpeed() > 0.0 ? o.meanSpeed() * 3.6 : -1.0, o.last_lap_time,
       lat_s.c_str(), spd_s.c_str());
+  }
+  // --- 当てはめたモデルのパラメータを残す(検証用) ---
+  // これが出ていないとモデルが効いているのか録画が効いているのか分からない。
+  if (opp_model_enable_ &&
+      (this->now() - last_opp_model_log_).seconds() > 5.0)
+  {
+    last_opp_model_log_ = this->now();
+    for (const auto & kv : others_) {
+      const OtherState & o = kv.second;
+      if (!o.valid || o.m_samples < 5) { continue; }
+      const double det = o.m_n * o.m_sxx - o.m_sx * o.m_sx;
+      const double bias = (std::abs(det) < 1e-6) ? (o.m_sy / std::max(o.m_n, 1.0))
+                          : (o.m_sxx * o.m_sy - o.m_sx * o.m_sxy) / det;
+      const double gain = (std::abs(det) < 1e-6) ? 0.0
+                          : (o.m_n * o.m_sxy - o.m_sx * o.m_sy) / det;
+      RCLCPP_INFO(get_logger(),
+        "相手モデル %s: 最高速%.1fkm/h 横加速度の限界%.1fm/s^2 "
+        "横の寄り%+.2fm インの取り方%+.2f (サンプル%d 当てはまり%d)",
+        kv.first.c_str(), o.m_v_top * 3.6, o.m_ay_max, bias, gain,
+        o.m_samples, o.modelReady() ? 1 : 0);
+    }
   }
   if (spot_valid_) {
     RCLCPP_INFO(get_logger(),

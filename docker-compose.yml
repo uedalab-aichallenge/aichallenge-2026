@@ -35,6 +35,7 @@ x-autoware-base: &autoware-base
     # 公式オーバーテイクレーン(SIM決勝)。既定は無効。A/B で確かめてから入れる。
     - WALL_FWD_BAN=${WALL_FWD_BAN:-true}
     - WALL_FWD_BAN_HOLD=${WALL_FWD_BAN_HOLD:-0.8}
+    - WALL_STALL_SEC=${WALL_STALL_SEC:-1.5}
     - STOP_AVOID_FIX=${STOP_AVOID_FIX:-true}
     - LATCH_HARD=${LATCH_HARD:-false}
     - REAR_END_BRAKE_K=${REAR_END_BRAKE_K:-0.22}
@@ -48,6 +49,8 @@ x-autoware-base: &autoware-base
     - OT_LANE_PREP_LOOK=${OT_LANE_PREP_LOOK:-18.0}
     - OT_LANE_PREP_TIME=${OT_LANE_PREP_TIME:-0.8}
     - OT_LANE_TGT=${OT_LANE_TGT:--3.30}
+    - OPP_MODEL=${OPP_MODEL:-true}
+    - SPOT_ALL=${SPOT_ALL:-true}
     - NO_PASS_ZONES=${NO_PASS_ZONES:-18:30,89:95}
     - SPOT_ENTRY_GAP=${SPOT_ENTRY_GAP:--1.0}
     - SPOT_PASS_LEN_GAIN=${SPOT_PASS_LEN_GAIN:-1.0}
