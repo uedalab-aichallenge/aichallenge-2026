@@ -644,7 +644,12 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
   // 評価は「経路上の全点での壁クリアランスと車クリアランスの最小値」とし、
   // それが最大の候補(同点なら短いほう)を採用する。1回目の挙動には影響しない。
   if (best_effort && !best.valid) {
-    double best_score = -1e18;
+    // 開始時点の方位差。総当りで「向きが直る案」を選ぶための基準。
+  std::size_t syi = 0; double syl = 0.0;
+  const bool start_yaw_ok = corridor.locate(start.x, start.y, syi, syl);
+  const double start_yaw_err =
+    start_yaw_ok ? std::abs(wrap(start.yaw - trackYaw(corridor, syi))) : 0.0;
+  double best_score = -1e18;
     double best_len = 1e18;
 
     for (double rl : rev_len) {
@@ -688,10 +693,34 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
               score = std::min(score, wallClearanceAt(obstacles, veh, fpath[k]));
               score = std::min(score, carClearanceAt(cars, veh, fpath[k]));
             }
+            // --- 総当りでも方位差を見る(実測 2026-09-05) ---
+            //
+            // 【なぜ必要か】壁ペナルティの原因を実測で切り分けた結果、
+            // 経路(コリドア)でも追従でもなく **車体の姿勢**だった。
+            //   方位差 < 10度 : 壁に接触 0 / 545 周期 (0%)
+            //   方位差 >= 45度: 4123 / 4123 周期 (100%)
+            // ある車はレースの 87% を「横向きのまま壁際で速度0」で過ごした。
+            //
+            // 主評価(cost)は方位差を見ている(`yaw_over * 12.0`)が、
+            // **解が無いときに落ちるこの総当りは方位差を一切見ていない**
+            // (余裕と長さだけ)。横向きで壁際にいる状況はまさに解が無い状況なので、
+            // **そこで回転が評価されない。** 回転そのものが脱出になる場面
+            // (1.30 x 2.2m の車体は45度で必要半幅 1.24m、揃えば 0.65m)を
+            // 選べるようにする。
+            const Pose & ep = fpath[fn - 1];
+            std::size_t eyi = 0; double eyl = 0.0;
+            double yaw_gain = 0.0;
+            if (corridor.locate(ep.x, ep.y, eyi, eyl) && start_yaw_ok) {
+              const double end_yaw_err = std::abs(wrap(ep.yaw - trackYaw(corridor, eyi)));
+              yaw_gain = std::max(0.0, start_yaw_err - end_yaw_err);
+            }
+            // 余裕を主、方位差の改善を従にする。余裕がほぼ同じなら向きが直る案を採る。
+            const double obj = score + 0.30 * yaw_gain;
             const double length = rl + fl;
-            const bool better = score > best_score + 1e-9 ||
-              (std::abs(score - best_score) <= 1e-9 && length < best_len);
+            const bool better = obj > best_score + 1e-9 ||
+              (std::abs(obj - best_score) <= 1e-9 && length < best_len);
             if (!better) { continue; }
+            score = obj;
 
             best_score = score;
             best_len = length;

@@ -140,6 +140,15 @@ private:
   // 2つの条件で場面を限定する。
   double wall_forward_ban_speed_{1.0};   // この速度[m/s]未満のときだけ効かせる
   double wall_forward_ban_depth_{0.15};  // この深さ[m]を超えて食い込んだときだけ
+  // 止めた後に「後退しながら回転して抜ける」。止めるだけでは姿勢が直らない
+  // (実測: 前進を止めた146回に対し復帰の計画が3回しか出ず、壁ペナ236秒)。
+  bool wall_ban_reverse_{true};          // 後退で回転して抜けるか
+  double wall_ban_reverse_after_{1.5};   // 止めてからこの秒数で後退へ移る
+  double wall_ban_reverse_speed_{1.0};   // 後退の速度[m/s]
+  double wall_ban_reverse_rear_{2.0};    // 後方にこれだけ[m]空いていないと出さない
+  float wall_ban_steer_{0.0f};           // 回転で抜けるときの舵
+  bool wall_ban_steer_valid_{false};
+  rclcpp::Time last_wall_ban_rev_log_{0, 0, RCL_ROS_TIME};
   // 他車と重なる評価の前進計画も却下するか(既定 false。計測で退行したため)
   bool reject_car_overlap_plan_{false};
   double wall_ban_ref_clear_{1e9};       // 基準にしている壁の余裕[m]

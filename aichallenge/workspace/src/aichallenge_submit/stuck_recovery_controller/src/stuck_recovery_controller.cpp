@@ -267,6 +267,10 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   wall_forward_ban_gain_ = declare_parameter<double>("wall_forward_ban_gain", 0.03);
   wall_forward_ban_speed_ = declare_parameter<double>("wall_forward_ban_speed", 1.0);
   wall_forward_ban_depth_ = declare_parameter<double>("wall_forward_ban_depth", 0.15);
+  wall_ban_reverse_ = declare_parameter<bool>("wall_ban_reverse", true);
+  wall_ban_reverse_after_ = declare_parameter<double>("wall_ban_reverse_after", 1.5);
+  wall_ban_reverse_speed_ = declare_parameter<double>("wall_ban_reverse_speed", 1.0);
+  wall_ban_reverse_rear_ = declare_parameter<double>("wall_ban_reverse_rear", 2.0);
   reject_car_overlap_plan_ = declare_parameter<bool>("reject_car_overlap_plan", false);
   RCLCPP_INFO(get_logger(),
     "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
@@ -2159,6 +2163,60 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
       "(指令 %.2fm/s -> 0 実速度 %.2fm/s)。実機ではこの前進継続が再起不能になる",
       wall_ban_ref_clear_, held, static_cast<double>(speed), latest_velocity_);
   }
+  // --- 止めるだけでは姿勢が直らない。後退しながら回転して抜ける ---
+  //
+  // 【実測 2026-09-05】崩壊したレースの内訳:
+  //   d2: 「前進を止めた」146回 / 復帰の計画 3回 / 壁ペナ 236秒
+  //   d3: 123回 / 5回
+  // **止められたまま放置されている。** カートは速度0では回転できないので、
+  // 止めるだけでは方位差が永久に残る。壁ペナルティは接触が続く間ずっと加算される。
+  //
+  // 壁接触の原因は姿勢だと実測で分かっている
+  // (方位差 <10度で接触0% / >=45度で100%)。**回転そのものが脱出**になる。
+  // 前進は禁じたままにして、**後退で回転する**。後退はこの禁止を受けない。
+  //
+  // 後方に車がいるときは出さない。後退での接触は自分と相手の双方に
+  // CRASH 10秒が付く(公式のペナルティ表)。
+  if (wall_ban_reverse_ && held > wall_ban_reverse_after_) {
+    if (rearRoom() >= wall_ban_reverse_rear_) {
+      // 舵は「後退したときに壁から離れる向き」を選ぶ。
+      // 後軸基準の自転車モデルで 1m ぶん後退させ、車体の余裕が増える側を採る。
+      recovery::Pose p;
+      if (currentPose(p)) {
+        double best = -1e9; float best_steer = 0.0f;
+        for (double sg : {-1.0, 0.0, 1.0}) {
+          const double st = sg * kMaxSteerRad;
+          recovery::Pose q = p;
+          const double ds = -0.1;               // 後退 0.1m 刻み
+          for (int i = 0; i < 10; ++i) {
+            q.x += ds * std::cos(q.yaw);
+            q.y += ds * std::sin(q.yaw);
+            q.yaw += ds * std::tan(st) / std::max(veh_.wheel_base, 0.1);
+          }
+          const double cl = recovery::wallClearanceAt(obstacles_, veh_, q);
+          if (cl > best) { best = cl; best_steer = static_cast<float>(st); }
+        }
+        speed = static_cast<float>(-wall_ban_reverse_speed_);
+        acceleration = 0.0f;
+        if ((this->now() - last_wall_ban_rev_log_).seconds() > 1.0) {
+          last_wall_ban_rev_log_ = this->now();
+          RCLCPP_WARN(get_logger(),
+            "壁へ食い込んだまま %.1fs。後退して回転で抜ける(舵 %+.0fdeg / "
+            "見込みの余裕 %.2fm / 後方 %.1fm)",
+            held, best_steer * 180.0 / M_PI, best, rearRoom());
+        }
+        // 舵は呼び出し側の値を上書きする。回転が目的なので舵が本体。
+        wall_ban_steer_ = best_steer;
+        wall_ban_steer_valid_ = true;
+        return;
+      }
+    } else if ((this->now() - last_wall_ban_rev_log_).seconds() > 2.0) {
+      last_wall_ban_rev_log_ = this->now();
+      RCLCPP_WARN(get_logger(),
+        "壁へ食い込んだまま %.1fs だが後方に余地が無い(%.1fm)。"
+        "後退での接触は双方に CRASH が付くので待つ", held, rearRoom());
+    }
+  }
   speed = 0.0f;
   acceleration = kBrakeAccel;
 }
@@ -2168,9 +2226,12 @@ void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
 {
   float speed = cmd.longitudinal.speed;
   float accel = cmd.longitudinal.acceleration;
+  wall_ban_steer_valid_ = false;
   applyWallForwardBan(speed, accel);
   cmd.longitudinal.speed = speed;
   cmd.longitudinal.acceleration = accel;
+  // 回転で抜けるときは舵が本体なので上書きする。
+  if (wall_ban_steer_valid_) { cmd.lateral.steering_tire_angle = wall_ban_steer_; }
   control_pub_->publish(cmd);
 }
 
@@ -2200,7 +2261,9 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   acceleration = std::clamp(acceleration, -kOutMaxAccel, kOutMaxAccel);
   speed = std::clamp(speed, -kOutMaxSpeed, kOutMaxSpeed);
 
+  wall_ban_steer_valid_ = false;
   applyWallForwardBan(speed, acceleration);
+  if (wall_ban_steer_valid_) { steer = wall_ban_steer_; }
 
   AckermannControlCommand msg;
   msg.stamp = stamp;
