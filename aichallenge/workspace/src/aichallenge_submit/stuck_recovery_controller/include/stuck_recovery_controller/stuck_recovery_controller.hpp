@@ -287,7 +287,13 @@ private:
   //   「出口から直接ギアや後退指令を作らない。後退の方向・舵・ギアは復帰制御が所有する」
   // 出口は拒否したことを**報告するだけ**。それを受けて向きを変えるのは復帰制御。
   bool wall_ban_hit_{false};
-  rclcpp::Time wall_ban_hit_at_{0, 0, RCL_ROS_TIME};
+  // 計画の通し番号。出口の拒否に反応するのは「1つの計画につき1回だけ」。
+  // 拒否は毎周期成立するので、無条件に反応すると毎周期引き直すことになる
+  // (実測: 1レースで 引き直し200回・計画207回・完了0回)。
+  unsigned long plan_seq_{0};
+  unsigned long wall_ban_acted_seq_{0};
+  bool wall_ban_acted_{false};
+  double wall_ban_acted_at_{-1.0};
   rclcpp::Time stall_since_{0, 0, RCL_ROS_TIME};
   // ギアを入れ替えた時刻。AWSIM のギアは切り替わるまで間があるので、
   // 入れ替え直後に動けないことを「詰まっている」と誤判定しないために持つ。

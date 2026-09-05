@@ -780,28 +780,42 @@ void StuckRecoveryController::onNominalCommand(
   // リタイアを 20%→35% に増やした失敗として実測済み)。
   if (wall_ban_hit_) {
     wall_ban_hit_ = false;
+    // 拒否は毎周期成立する。反応するのは
+    //   ・まだこの計画で反応していない、かつ
+    //   ・前回の反応から 1 秒以上経っている
+    // ときだけ。そうしないと毎周期引き直して計画だけが増える
+    // (実測 20260905-201209/d2: 引き直し200回・計画207回・完了0回)。
+    const double tnow = now.seconds();
+    const bool fresh = (!wall_ban_acted_ || wall_ban_acted_seq_ != plan_seq_) &&
+                       (wall_ban_acted_at_ < 0.0 ||
+                        tnow - wall_ban_acted_at_ >= 1.0);
     const bool in_cooldown =
       recovery_end_time_ &&
       (now - recovery_end_time_.value()).seconds() < kCooldownSec;
-    if (!recovery_start_time_.has_value() && !in_cooldown) {
-      RCLCPP_WARN(get_logger(),
-        "壁前進禁止が前進を止めた。前進が塞がれているとみて復帰を始める");
-      stuck_start_time_.reset();
-      blocked_vehicle_start_time_.reset();
-      recovery_start_time_ = now;
-      beginRecovery(now, true);
-      if (runRecovery(now)) { return; }
-    } else if (recovery_start_time_.has_value() &&
-               plan_.valid && phase_idx_ < plan_.phases.size() &&
-               plan_.phases[phase_idx_].forward)
-    {
-      blocked_dir_ = +1;
-      if (replan_count_ < kReplanMax) { ++replan_count_; }
-      RCLCPP_WARN(get_logger(),
-        "壁前進禁止が復帰の前進区間を止めた。後退から引き直す(%d回目)",
-        replan_count_);
-      makePlan(now, -1);
-      if (runRecovery(now)) { return; }
+    if (fresh) {
+      wall_ban_acted_ = true;
+      wall_ban_acted_seq_ = plan_seq_;
+      wall_ban_acted_at_ = tnow;
+      if (!recovery_start_time_.has_value() && !in_cooldown) {
+        RCLCPP_WARN(get_logger(),
+          "壁前進禁止が前進を止めた。前進が塞がれているとみて復帰を始める");
+        stuck_start_time_.reset();
+        blocked_vehicle_start_time_.reset();
+        recovery_start_time_ = now;
+        beginRecovery(now, true);
+        if (runRecovery(now)) { return; }
+      } else if (recovery_start_time_.has_value() &&
+                 plan_.valid && phase_idx_ < plan_.phases.size() &&
+                 plan_.phases[phase_idx_].forward)
+      {
+        blocked_dir_ = +1;
+        if (replan_count_ < kReplanMax) { ++replan_count_; }
+        RCLCPP_WARN(get_logger(),
+          "壁前進禁止が復帰の前進区間を止めた。後退から引き直す(%d回目)",
+          replan_count_);
+        makePlan(now, -1);
+        if (runRecovery(now)) { return; }
+      }
     }
   }
   if (runRecovery(now)) {
@@ -1508,6 +1522,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   plan_x_ = p.x;
   plan_y_ = p.y;
   plan_wall_clear_ = recovery::wallClearanceAt(obstacles_, veh_, p);
+  ++plan_seq_;
   stall_since_ = now;
   if (!plan_.valid) {
     RCLCPP_WARN(get_logger(), "復帰 経路を計算できない");
@@ -2592,7 +2607,6 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
   if (held <= wall_forward_ban_hold_) { return; }
   // 拒否したという事実だけを残す。ここでは向きもギアも作らない。
   wall_ban_hit_ = true;
-  wall_ban_hit_at_ = this->now();
   if ((this->now() - last_wall_ban_log_).seconds() > 1.0) {
     last_wall_ban_log_ = this->now();
     RCLCPP_WARN(get_logger(),
