@@ -49,7 +49,8 @@ constexpr double kFwdAbortCarDist = 0.25;
 // 「閾値を割った」だけでは降りず、区間開始よりこれだけ[m]悪化したときに降りる。
 // これが無いと、もともと狭い所で出だしに必ず降りて同じ計画を引き直し続ける
 // (ユーザー報告「何もないのに何度も切り返す」の一因)。
-constexpr double kFwdAbortWorsen = 0.08;
+// 悪化の判定に余裕を持たせる。わずかな悪化で降りると切り返しが増える。
+constexpr double kFwdAbortWorsen = 0.15;
 // 前後左右を問わず、この距離[m]以内に他車がいれば「近接」とみなす。
 // 横並びで押し合っている接触を拾うために要る(前方の箱だけでは取りこぼす)。
 constexpr double kBlockedVehicleAnyDirRange = 2.5;
@@ -65,11 +66,12 @@ constexpr double kFrontObstacleHalf = 1.5;  // 前方障害物とみなす横幅
 
 // --- 計画追従の定数 ---
 constexpr double kRecoveryMaxSec = 30.0;   // 復帰全体の上限[s]。超えたら通常制御へ返す
-constexpr double kReplanMax = 4;           // 計画のやり直し上限
+// 上限に達したら止まるのではなく、動かない打切り側で 0 に戻して作り直す。
+constexpr double kReplanMax = 6;           // 計画のやり直し上限
 // 動けているかの判定は「ギアが入ってから」「舵を入れ終わってから」数える。
 // 1.2s では、停止 -> ギア切替 -> 舵を入れる の途中で毎回「動けない」と判定され、
 // 実測では69回の判定すべてが計画を1つも実行しないまま向きを反転させていた。
-constexpr double kStallSec = 3.0;          // この時間[s]動けなければ計画をやり直す
+constexpr double kStallSec = 4.0;          // この時間[s]動けなければ計画をやり直す
 constexpr double kPhaseMinSec = 1.2;       // 区間を始めてこの時間[s]は停滞判定をしない
 // 実ギア・実舵角が指令に追いつくのを待つ上限[s]。
 // 実測(gearlat2.py): 実ギアの切替 0.012〜0.099s、舵は角速度上限 2.0rad/s なので
@@ -77,7 +79,10 @@ constexpr double kPhaseMinSec = 1.2;       // 区間を始めてこの時間[s]�
 constexpr double kActuatorWaitMax = 0.45;
 constexpr double kSteerReadyRad = 0.05;    // 舵が目標に届いたとみなす差[rad](2.9deg)
 constexpr double kStallDist = 0.15;        // 動けているとみなす距離[m]
-constexpr double kPhaseDoneSlack = 0.10;   // 区間の走破判定の余裕[m]
+// 【余裕を広げた 2026-09-05 ユーザー指示】区間の走破判定が厳しいと、
+// あと少しで終わる区間を「未完了」のまま打ち切って計画を作り直し、
+// **数回の切り返し**になる。実測では完走率が 0% だった。
+constexpr double kPhaseDoneSlack = 0.30;   // 区間の走破判定の余裕[m]
 // 20deg で返していたところ、実測4件のうち3件が「ちょうど20deg」で
 // 制御を返していた。計画の終端は方位差 0〜2deg まで直せているので、
 // 途中で切り上げず、走り出せる向きになるまで握り続ける。
@@ -108,6 +113,11 @@ constexpr double kFwdAbortClearance = 0.20;
 // 区間の出だしは姿勢が定まらないので、少し走ってから見る。
 // 0.05m は姿勢が定まる前で、実測では引き直しの全件がこの距離で起きていた。
 constexpr double kFwdAbortMinTravel = 0.15;
+// 前進を指令しているのに動かない、と判断する条件。
+// 走行距離の条件(kFwdAbortMinTravel)は「動かない」場合に永久に成立しないので、
+// 時間で見る枝を別に持つ(2026-09-05 の 340秒の凍結対策)。
+constexpr double kFwdNoMoveDist = 0.05;   // これ未満しか走っていない[m]
+constexpr double kFwdNoMoveSec = 2.0;     // その状態がこれだけ続いたら[s]
 // 復帰の開始時点で壁までの余裕がこれを割っていたら、前進を試さず後退から始める。
 // 0.0 は「走行可能領域の縁」。負は既に食い込んでいる状態。
 constexpr double kWedgedWallClear = 0.0;
@@ -262,7 +272,20 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   // 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始めるか。
   // false で 2026-09-04 以前の挙動(前進を2秒試してから切り返す)。
   wedge_backward_first_ = declare_parameter<bool>("wedge_backward_first", true);
-  wall_forward_ban_ = declare_parameter<bool>("wall_forward_ban", true);
+  // 【既定を切った 2026-09-05 / ユーザー報告「P1P3が全く動かず最悪の状況」】
+  //
+  // この禁止が**復帰計画の前進区間を毎回0にし**、2秒後に「動かない打切り」で
+  // 再計画 → また前進区間 → 0、というライブロックを作っていた。
+  // 実測(凍結した車): 前進禁止 216回 / 復帰の計画 104回 / 動かない打切 87回
+  // (経路を計算できないは 0。**計画は作れているのに実行できない**)
+  //
+  // しかも「動かない打切り」を 2秒に速めたことで、30秒待ちだった詰まりが
+  // 2秒周期の高速ループに変わり、症状が悪化した。
+  //
+  // 禁止と計画が矛盾したまま、どちらも譲らない構造が誤り。
+  // 壁への前進継続を止める狙い自体は正しい(実機で再起不能)が、
+  // **計画側が「後退から始める」ことを保証できるようになるまで既定は false。**
+  wall_forward_ban_ = declare_parameter<bool>("wall_forward_ban", false);
   wall_forward_ban_hold_ = declare_parameter<double>("wall_forward_ban_hold", 0.8);
   wall_forward_ban_gain_ = declare_parameter<double>("wall_forward_ban_gain", 0.03);
   wall_forward_ban_speed_ = declare_parameter<double>("wall_forward_ban_speed", 1.0);
@@ -282,6 +305,12 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   wall_ban_reverse_after_ = declare_parameter<double>("wall_ban_reverse_after", 1.5);
   wall_ban_reverse_speed_ = declare_parameter<double>("wall_ban_reverse_speed", 1.0);
   wall_ban_reverse_rear_ = declare_parameter<double>("wall_ban_reverse_rear", 2.0);
+  // 前が詰まっているだけの車を復帰にかけない条件。
+  queue_wait_enable_ = declare_parameter<bool>("queue_wait_enable", true);
+  queue_wait_margin_ = declare_parameter<double>("queue_wait_margin", 0.20);
+  queue_wait_yaw_ = declare_parameter<double>("queue_wait_yaw", 0.35);   // 20度
+  queue_wait_wall_ = declare_parameter<double>("queue_wait_wall", 0.30);
+  queue_wait_max_ = declare_parameter<double>("queue_wait_max", 12.0);
   reject_car_overlap_plan_ = declare_parameter<bool>("reject_car_overlap_plan", false);
   RCLCPP_INFO(get_logger(),
     "壁へ食い込んだままの前進を禁じる: %s (改善猶予 %.1fs / 改善とみなす増分 %.2fm)",
@@ -892,7 +921,64 @@ void StuckRecoveryController::updateStuckDetection(
     std::abs(command.longitudinal.speed) < kCommandSpeedThreshold &&
     std::abs(velocity) <= kStuckSpeedThreshold &&
     car_near;
-  if (blocked_by_vehicle) {
+  // --- 前の車に詰まって待っているだけの車を「スタック」にしない ---
+  //
+  // 【ユーザー報告 2026-09-05】「P1 が必要のない後退を続け、壁に後ろ向きに垂直に
+  // ぶつかった。さらに P1 を避けられず他の車両が進めない。」
+  //
+  // 【実測(20260905-152454 d4)】
+  //   stuck detected: velocity=0.070 横=-0.29 [-1.00,1.900] **領域内**
+  //                   方位差=**3.719deg** 原因=前進不能 前方車=**2.01m**
+  //   復帰 状況= 前方車 近傍2台 前2.0 後2.3 **壁0.80**
+  // **領域内・方位差3.7度・壁まで0.80m。この車はスタックしていない。**
+  // 前の車に詰まって待っているだけ。それを復帰にかけると、
+  // 立つ計画はすべて前の車と重なる評価(車-0.84/-0.80/-0.40)なので動けず、
+  // 最後に後退へ escalate して壁へ刺さる。**コース中央で切り返すので
+  // 他車も通れなくなる。** 報告の2件はどちらもこれが原因。
+  //
+  // 車体が健全(走行可能領域の内側 / 向きが揃っている / 壁から離れている)なら、
+  // 前が空くのを待つのが正しい。復帰を始めてはいけない。
+  bool healthy_wait = false;
+  if (queue_wait_enable_ && blocked_by_vehicle) {
+    double lat = 0.0, lo = 0.0, hi = 0.0, yerr = 0.0;
+    recovery::Pose p;
+    const bool inside = lateralNow(lat, lo, hi) &&
+                        lat > lo + queue_wait_margin_ && lat < hi - queue_wait_margin_;
+    const bool aligned = headingErrorToTrack(yerr) && yerr < queue_wait_yaw_;
+    const bool wall_ok = currentPose(p) && obstacles_.valid() &&
+                         recovery::wallClearanceAt(obstacles_, veh_, p) > queue_wait_wall_;
+    healthy_wait = inside && aligned && wall_ok;
+    if (healthy_wait && (now - last_queue_wait_log_).seconds() > 3.0) {
+      last_queue_wait_log_ = now;
+      RCLCPP_INFO(get_logger(),
+        "前が詰まっているだけ(領域内 横%.2f[%.2f,%.2f] 方位差%.1fdeg 壁%.2fm)。"
+        "復帰は始めず前が空くのを待つ",
+        lat, lo, hi, yerr * 180.0 / M_PI,
+        recovery::wallClearanceAt(obstacles_, veh_, p));
+    }
+  }
+  // --- 待機にも上限を置く(安全網) ---
+  //
+  // 「健全なら待つ」は正しいが、**4台が互いに詰まって全員が健全になると
+  // 誰も復帰を始めない永久待機**になる(ユーザー報告「P1P3が全く動かず、
+  // それのせいで P2P4 も進めない」に該当しうる)。
+  // 列の根本にいる車は普通「健全でない」ので復帰が発火して列は流れるが、
+  // 全員健全な配置は起こりうる。長めの上限を置いて、そのときだけ復帰させる。
+  if (healthy_wait) {
+    if (!healthy_wait_since_) { healthy_wait_since_ = now; }
+    else if ((now - healthy_wait_since_.value()).seconds() > queue_wait_max_) {
+      healthy_wait = false;          // 待ちすぎ。復帰を始めさせる
+      if ((now - last_queue_wait_log_).seconds() > 3.0) {
+        last_queue_wait_log_ = now;
+        RCLCPP_WARN(get_logger(),
+          "前が詰まって %.0f秒 待った。全員が健全な永久待機を避けるため復帰を始める",
+          queue_wait_max_);
+      }
+    }
+  } else {
+    healthy_wait_since_.reset();
+  }
+  if (blocked_by_vehicle && !healthy_wait) {
     if (!blocked_vehicle_start_time_) { blocked_vehicle_start_time_ = now; }
   } else {
     blocked_vehicle_start_time_.reset();
@@ -1105,7 +1191,10 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   // やり直しのときは「今より改善する計画」だけを求める。
   // 同じ姿勢から同じ条件で引き直しても同じ答えが出るだけで、
   // 実測では前進の計画を5回続けて出して25秒を使い切った。
-  const double gain = (replan_count_ > 0) ? 0.05 : 0.0;
+  // 【外部レビュー 指摘 2026-09-05】改善量が 0.05 固定だと、同じ姿勢からは同じ計画が
+  // 通り続ける(実測: 同一計画 50回)。やり直すたびに要求を上げ、
+  // **別の戦略へ単調に遷移させる。** 候補が尽きれば総当りへ落ち、別の案が出る。
+  const double gain = std::min(0.05 * static_cast<double>(replan_count_), 0.60);
   // 地図では動けるはずなのに動けなかったぶん、後退の下限を上げる。
   const double min_rev = std::min(kBlockedReverseMax,
                                   kBlockedReverseStep * unexplained_block_);
@@ -1230,7 +1319,21 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   // 4レースで ペナルティ回数 1.58 -> 2.00 / 壁 7.8 -> 12.1s/車レース と退行した。
   // 指摘(ログは「壁と車」と書いているのに条件は壁だけ)は正しいので、
   // **フラグとして残す。** 有効にする前に desperate 側の受け皿を安全にすること。
-  if (plan_.valid && !plan_.phases.empty() && plan_.phases.front().forward &&
+  // 【重大な誤りを訂正 2026-09-05】この却下が **desperate(強引な脱出)を
+  // 呼ぶ原因**だった。14レースの実測:
+  //   「経路を計算できない」 8028回 / 「強引な脱出へ切替」 8677回
+  //   (復帰の計画は 273回、復帰 完了は 46回)
+  // desperate は**壁も後方の車も無視して前後に ±4m/s で振る**最終手段。
+  // ユーザー報告「ずっと壁に向かって後退し続ける」の実体はこれ。
+  //
+  // 原因は、**最後の手段である総当り(best_effort)の計画まで却下していた**こと。
+  // 却下すると `plan_.valid=false` になり計画が何も残らないので desperate に落ちる。
+  // **安全のための却下が、より危険なモードを呼んでいた。**
+  //
+  // 総当りは棄却条件を全部外して「一番離れられる案」を出す最後の受け皿なので、
+  // ここで却下してはいけない。前進の押し付けは `wall_forward_ban` が出口で止める。
+  if (plan_.valid && !plan_best_effort &&
+      !plan_.phases.empty() && plan_.phases.front().forward &&
       (plan_.min_wall_clear < 0.0 || clear_at_plan < 0.0 ||
        (reject_car_overlap_plan_ && plan_.min_car_clear < 0.0)))
   {
@@ -1256,7 +1359,8 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   // 却下してしまうと計画が無くなり desperate へ落ちる(それは以前の計測で退行した)。
   // 後退区間そのものは壁から離れる正しい動作なので、**後退だけ実行して
   // 良い姿勢から立て直す。** 前進は次の計画で改めて評価する。
-  if (plan_.valid && plan_.min_wall_clear < 0.0 && plan_.phases.size() >= 2 &&
+  if (plan_.valid && !plan_best_effort &&
+      plan_.min_wall_clear < 0.0 && plan_.phases.size() >= 2 &&
       !plan_.phases.front().forward)
   {
     RCLCPP_WARN(get_logger(),
@@ -1269,6 +1373,31 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
     // 前進区間が無くなったので、前進の見込み余裕は「無し」として扱う。
     plan_.min_wall_clear = 1e9;
     plan_.min_car_clear = 1e9;
+  }
+
+  // --- 却下で計画が消えたら、最後の受け皿(総当り)をやり直す(2026-09-05) ---
+  //
+  // 【順序の誤り】総当りの呼び出しは上の `if (!plan_.valid)` の中にあり、
+  // **却下より前に一度だけ**評価される。却下で無効化すると総当りをやり直さないまま
+  // 「経路を計算できない」に落ちていた(1レースで 1538回)。
+  // 計画がゼロだと復帰そのものが動かないので、必ず受け皿へ回す。
+  if (!plan_.valid) {
+    // 食い込んでいるなら総当りにも「後退から始める」を要求する。
+    // 壁に車体が入っている状態から前進しても物理的に出られない。
+    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+                           clear_at_plan < 0.0 ? -1 : 0, 0.0, 0.0, 0.0,
+                           8.0, cars, 0.0, 0.0, true);
+    if (!plan_.valid && clear_at_plan < 0.0) {
+      // 後退の解が無いなら縛りを外して何かを出す(計画ゼロは凍結になる)。
+      plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0, 0, 0.0, 0.0, 0.0,
+                             8.0, cars, 0.0, 0.0, true);
+    }
+    plan_best_effort = plan_.valid;
+    if (plan_.valid) {
+      RCLCPP_WARN(get_logger(),
+        "復帰 却下で計画が消えたので総当りへ回した(見込み余裕 壁%.2f 車%.2f)",
+        plan_.min_wall_clear, plan_.min_car_clear);
+    }
   }
 
   // 採用した計画が前進区間で見込んだ余裕を、追従中の中断閾値に使えるよう保存する。
@@ -1411,6 +1540,62 @@ void StuckRecoveryController::runDesperate(
     desperate_swing_ = swing;
     RCLCPP_WARN(get_logger(), "復帰 強引な脱出 %d回目 (最終手段)", swing + 1);
   }
+  // --- 壁へ食い込んでいる間は強引な脱出を使わない(2026-09-05) ---
+  //
+  // desperate は壁も後方の車も無視して ±4m/s で前後に振る。
+  // 壁へ食い込んだ状態でこれをやると、押し付けたまま振り続けることになり
+  // 壁ペナルティが加算され続ける(実機では再起不能)。
+  // 食い込んでいる間は舵だけ振って待つ。食い込みが解けたら通常の振りに戻る。
+  // --- 壁へ食い込んでいる間は「振る」のではなく「下がって回す」(2026-09-05) ---
+  //
+  // 【なぜ振ってはいけないか】desperate は壁も後方の車も無視して ±4m/s で
+  // 前後に振る。壁へ食い込んだ状態でやると押し付けたまま振り続けることになり、
+  // 壁ペナルティが加算され続ける(実機では再起不能)。
+  //
+  // 【ただし止めるだけでも駄目】ユーザー報告「前進も後退もしない。前方には
+  // 何もない」。危険な脱出を封じただけで代わりを用意しないと、計画が作れない
+  // 状態(実測 1レースで 1538回)と重なって**完全停止**になる。
+  //
+  // したがって**方向を選んだ後退**を出す。前進は壁へ押し付けるので出さない。
+  // 舵は後軸基準の自転車モデルで 2.5m 後退させ、車体の余裕が最も増える側。
+  // 後方に車が近いときは出さない(後退の接触は自分と相手の双方に CRASH 10秒)。
+  // ここは復帰制御自身の制御経路なので、ギアの管理も自分が持てる
+  // (出口のガードから後退させて復帰と競合させた失敗を繰り返さない)。
+  {
+    recovery::Pose dp;
+    if (currentPose(dp) && obstacles_.valid() &&
+        recovery::wallClearanceAt(obstacles_, veh_, dp) < 0.0) {
+      const double now_clear = recovery::wallClearanceAt(obstacles_, veh_, dp);
+      const bool rear_ok = rearRoom() >= wall_ban_reverse_rear_;
+      float best_steer = 0.0f; double best = -1e9;
+      for (double sg : {-1.0, -0.5, 0.0, 0.5, 1.0}) {
+        const double st = sg * kMaxSteerRad;
+        recovery::Pose q = dp; double worst = 1e9;
+        for (int i = 0; i < 25; ++i) {
+          q.x += -0.1 * std::cos(q.yaw);
+          q.y += -0.1 * std::sin(q.yaw);
+          q.yaw += -0.1 * std::tan(st) / std::max(veh_.wheel_base, 0.1);
+          worst = std::min(worst, recovery::wallClearanceAt(obstacles_, veh_, q));
+        }
+        if (worst > best) { best = worst; best_steer = static_cast<float>(st); }
+      }
+      if (rear_ok) {
+        publishGear(GearCommand::REVERSE);
+        publishCommand(static_cast<float>(-wall_ban_reverse_speed_), 0.0f, best_steer);
+      } else {
+        publishGear(GearCommand::DRIVE);
+        publishCommand(0.0f, kBrakeAccel, best_steer);
+      }
+      if ((now - last_desperate_hold_log_).seconds() > 1.5) {
+        last_desperate_hold_log_ = now;
+        RCLCPP_WARN(get_logger(),
+          "壁へ %.2fm 食い込んでいる。振らずに%s(舵 %+.0fdeg / 見込みの余裕 %.2fm / 後方 %.1fm)",
+          now_clear, rear_ok ? "後退して回す" : "待つ(後方に余地なし)",
+          best_steer * 180.0 / M_PI, best, rearRoom());
+      }
+      return;
+    }
+  }
   // 前後を交互に、舵も交互に振る。同じ当て方を続けても抜けないため。
   const bool fwd = (swing % 2) == 0;
   const float steer = static_cast<float>(
@@ -1505,6 +1690,43 @@ bool StuckRecoveryController::replanIfWallNear(
   // 【対策】計画の妥当性をモデルに任せきりにせず、**実測のクリアランス**で
   // 見張る。前進中に余裕が閾値を割ったら、停滞を待たずに即座に後退から引き直す。
   // 停滞判定(kStallSec)を待つと、その頃には壁に押し付けられて動けない。
+  // --- 前進を指令しているのに1mmも動かないなら、待たずに後退から引き直す ---
+  //
+  // 【実測 2026-09-05 / ユーザー報告「前進も後退もしない」】
+  //   +0s   後退 ギア20 位置(89655.30,43132.10) 壁まで+0.20   <- 後退は成功していた
+  //   +20s  前進 ギア2  速度+0.00 位置(89654.80,43134.40) 壁まで-0.30
+  //   +361s 前進 ギア2  速度+0.00 位置(89654.70,43134.60) 壁まで-0.50
+  //   **340秒 まったく動かず。** ギアの内訳は DRIVE 461 / REVERSE 52。
+  //
+  // 前進区間に入り、壁へ食い込んでいるので `wall_forward_ban` が速度を0にする。
+  // ところが**下の打切り条件は「0.15m 以上走った」を要求している**ので、
+  // 動かないと成立せず、前進区間のまま永久に待つ。
+  // (前セッションの引き継ぎに記録があった問題を、壁前進禁止が永久化させた)
+  //
+  // 走行距離ではなく**時間**で見る。前進を指令しているのに動かないのは、
+  // それ自体が「その前進は成立しない」という十分な証拠。
+  // 【重要】ここに `replan_count_ < kReplanMax` を掛けてはいけない。
+  // 上限に達した後は打切りが止まり、**前進区間のまま永久に凍結する**
+  // (ユーザー報告「P2 が前進も後退もしない」の再発)。
+  // 動かない前進を出し続けることに価値は無いので、回数に関係なく降りる。
+  if (ph.forward && !desperate_ &&
+      phase_travelled_ < kFwdNoMoveDist &&
+      (now - phase_start_).seconds() > kFwdNoMoveSec)
+  {
+    // 【外部レビュー 指摘 2026-09-05】カウンタを 0 に戻してはいけない。
+    // 戻すと要求する改善量が最小に戻り、**同じ計画を再生成する**。
+    // 実測: d1 は 70回の計画のうち **50回が完全に同一**
+    // (後退舵+18deg 0.8m 前進舵-35deg 1.5m)。後退 0.8m を繰り返すので
+    // 外から見ると「永遠に後退し続ける」ように見える。
+    ++replan_count_;
+    RCLCPP_WARN(get_logger(),
+      "復帰 前進を指令して %.1fs 動かない(走行 %.3fm 壁まで %.2f)。後退から引き直す(%d回目)",
+      (now - phase_start_).seconds(), phase_travelled_,
+      recovery::wallClearanceAt(obstacles_, veh_, p), replan_count_);
+    makePlan(now, -1);
+    return true;
+  }
+
   if (ph.forward && !desperate_ && replan_count_ < kReplanMax) {
   const double clear_now = recovery::wallClearanceAt(obstacles_, veh_, p);
   // 計画が見込んだ余裕より下げない。計画が「0.05m しかない所を通す」と決めたなら、

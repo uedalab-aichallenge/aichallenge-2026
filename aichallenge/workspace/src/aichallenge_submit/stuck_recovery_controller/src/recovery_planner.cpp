@@ -18,6 +18,9 @@ constexpr double kStep = 0.25;
 // これ以上そろえても通常制御には効かない、とみなす線。
 // ここを超えて詰めにいくと、そのぶん後退が伸びて時間を失う。
 constexpr double kYawGoodEnough = 0.15;   // [rad] 8.6deg
+// 総当りで方位差の改善に与える重み。0 で無効(既定)。
+// 0.30 は余裕 0.94m 相当に化けて後退を選び続けたため戻した。
+constexpr double kYawGainWeight = 0.0;
 constexpr double kLatGoodEnough = 0.5;    // [m] 中心線からの横ずれ
 
 double wrap(double a)
@@ -715,7 +718,14 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
               yaw_gain = std::max(0.0, start_yaw_err - end_yaw_err);
             }
             // 余裕を主、方位差の改善を従にする。余裕がほぼ同じなら向きが直る案を採る。
-            const double obj = score + 0.30 * yaw_gain;
+            // 【計測とユーザー報告で戻した 2026-09-05】重み 0.30 は
+            // 方位差の改善(最大 π rad)を最大 0.94m 相当の余裕に化けさせるので、
+            // **実際の余裕が 0.94m 悪くても「よく回る案」が勝つ。**
+            // 長い後退は大きく回るので選ばれ続け、
+            // ユーザー報告「ずっと後ろに下がり続けて前進しない」になった。
+            // 完走できなかった車も 10% -> 25% に増えていた。
+            // 余裕を主にするという設計自体は正しいので、重みは残して既定を 0 にする。
+            const double obj = score + kYawGainWeight * yaw_gain;
             const double length = rl + fl;
             const bool better = obj > best_score + 1e-9 ||
               (std::abs(obj - best_score) <= 1e-9 && length < best_len);

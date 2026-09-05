@@ -164,6 +164,9 @@ V2XOvertaker::V2XOvertaker()
   occ_enable_(declare_parameter<bool>("occ_enable", true)),
   occ_map_yaml_(declare_parameter<std::string>(
     "occ_map_yaml",
+    // 【撤回 2026-09-05】一時 merged へ向けたが戻した。
+    // final_ver3 は MPC 用で CONTROL_METHOD の既定(pure_pursuit)では誰も使わない。
+    // 占有格子を使うのはこのノードと復帰の2つで、どちらも同じ地図を読んでいた。
     "/aichallenge/workspace/install/multi_purpose_mpc_ros/share/multi_purpose_mpc_ros"
     "/env/ten_final_ver3/ten_occupancy_grid_map.yaml")),
   occ_sample_step_(declare_parameter<double>("occ_sample_step", 0.15)),
@@ -334,6 +337,10 @@ V2XOvertaker::V2XOvertaker()
   rear_end_free_full_(declare_parameter<double>("rear_end_free_full", 2.20)),
   rear_end_free_speed_(declare_parameter<double>("rear_end_free_speed", 10.0)),
   min_pass_sep_(declare_parameter<double>("min_pass_sep", 1.15)),
+  // 追い越しで相手から確保する横間隔の下限[m]。0 で無効。
+  // 追突防止の解除条件(rear_end_free_min=1.66)を下回ると速度差が作れないので、
+  // それより少し上に置く。コリドアで丸めるので狭い場所では効かない。
+  pass_sep_floor_(declare_parameter<double>("pass_sep_floor", 1.80)),
   // --- 同速の相手には仕掛けない ---
   // 実測(3レース): 同型の僚車(自分と同じ速度)への試行は抜き切るのに
   // 46〜90m 必要で、事実上成立しない。一方 MPC(遅い)は 42〜46m で足りる。
@@ -4955,7 +4962,7 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
     // 予測地点で選んだ固定ラインを最後まで使う。現在の相手位置を基準に
     // 毎周期目標を作ると、相手が同じ側へ動いたときにその後を追いかけ、
     // 広い側を選んだはずなのに横間隔が増えない。
-    const double tgt = execute_spot
+    double tgt = execute_spot
                          ? spot_offset_
                          : ((pass_center_ && has_room)
                               ? 0.5 * (near_p + far_p)
@@ -4963,6 +4970,44 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
     // コリドアの余地(room_lo_/room_hi_)は先読み区間の交差であり、
     // **この意図の内部の丸め**として掛ける。全層に効く制約にすると、
     // 停止車回避や発進レーンまで先読みの狭さで縛ってしまう。
+    // --- 相手から「追突防止が解除される」横間隔を狙う(実測 2026-09-05) ---
+    //
+    // 【実測】追越の横位置ログ n=327 を相手の横位置と突き合わせた結果:
+    //   **指令**した横間隔 |意図 - 相手横| : 中央 **0.80m**(1.66m 以上は 25% のみ)
+    //   **実際**の横間隔                  : 中央 0.73m
+    //   意図と実横の差(追従の遅れ)        : 中央 **0.00m**(p90 0.50)
+    //   コリドアの端に張り付いた割合      : **2%**
+    // **遅れでもコリドアの制約でもなく、狙っている値そのものが小さい。**
+    //
+    // `execute_spot` のとき `spot_offset_`(録画から決めた固定の横位置)を
+    // そのまま使うので、**相手が実際にどこにいるかを見ていない。**
+    // 相手がその線の近くにいれば横間隔は小さくなる。
+    //
+    // 追突防止の解除条件は横間隔 `rear_end_free_min`(1.66m)。そこに届かないと
+    // 速度が相手に張り付いたままで **速度差が作れず抜けない**。
+    // 実測でも追い越し中の 84% は横間隔が車幅 1.30m 未満(車体が重なっている)。
+    //
+    // したがって「相手から最低これだけ離れる」を下限として掛ける。
+    // コリドアで丸めるので、余地が無い場所では従来どおり狭いまま
+    // (そこは `side_fits_` が別に落とす)。**抜きにくくする変更ではなく、
+    // 解除できる横間隔を狙う変更。**
+    if (pass_sep_floor_ > 0.0) {
+      const double need = std::max(sep_min, pass_sep_floor_);
+      const double pushed = (side_sign_ > 0.0)
+                              ? std::max(tgt, olat + need)
+                              : std::min(tgt, olat - need);
+      if (std::abs(pushed - tgt) > 0.01 &&
+          (f.now - last_sep_floor_log_).seconds() > 2.0)
+      {
+        last_sep_floor_log_ = f.now;
+        diagLog("横間隔の下限",
+                "横間隔の下限 target=%s 側=%s 相手横=%.2f 要る間隔=%.2f "
+                "横目標 %.2f -> %.2f (帯[%.2f,%.2f])",
+                name.c_str(), side_sign_ > 0.0 ? "左" : "右", olat, need,
+                tgt, pushed, room_lo_, room_hi_);
+      }
+      tgt = pushed;
+    }
     tgt_lat = std::clamp(tgt, room_lo_, room_hi_);
     c.requestLat(tgt_lat, PlanCtx::LatPrio::kOvertake, "追越");
     // 試行中の横位置は「試行」が持つ。ここは値を作る場所であって、
@@ -6216,7 +6261,6 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       // 「安全中断 理由=停止車回避」が中断理由の最多(10件中4件)を占め、
       // 抜こうとしている当の相手を停止車として回避していた。
       // 第三者の停止車に対する回避は従来どおり効く。
-      if (ovPassingTarget(kv.first)) { continue; }
       const size_t oi = nearest(in, o.x, o.y);
       double gap = s[oi] - s[ei];
       if (gap < 0) {
@@ -6229,6 +6273,25 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       normalAt(in, oi, nxo, nyo);
       const auto & lpo = in.points[oi].pose.position;
       const double olat_s = (o.x - lpo.x) * nxo + (o.y - lpo.y) * nyo;
+      // --- 止まっている車を「追い越し対象」にしても停止車回避を止めない ---
+      //
+      // 【ユーザー報告 2026-09-05】「全く動いていない P2 を避けられずにぶつかる」。
+      //
+      // 【実測】停止車回避の判断は **中央 2.9m 手前**、3m 以内が 62%(517/835)。
+      // `stopped_look_ahead` は 40m あるのに近くでしか判断していない。
+      // 原因はここで **追い越し対象を除外していた**こと。
+      // 遠くにいるうちは追い越し対象なので停止車回避が動かず、
+      // 追い越し側が出す横間隔は実測 0.80m しかない(解除閾値 1.66m に届かない)。
+      // 対象から外れて初めて停止車回避が動くが、そのとき既に 2.9m。
+      // **横位置は約20m 遅れて実現するので、2.9m 手前では避けられない。**
+      //
+      // 止まっている車を抜くには停止車回避が計算する横経路がそのまま要る。
+      // したがって除外は「**実際に横へ出られているとき**」だけにする。
+      // 停止車回避の「通過」は速度を落とさないので、抜けなくなる方向ではない。
+      if (ovPassingTarget(kv.first) &&
+          std::abs(my_lat_for_target_ - olat_s) >= band_car_w_) {
+        continue;
+      }
       stopped.push_back({gap, olat_s, oi, std::hypot(o.vx, o.vy), kv.first});
     }
 
@@ -6474,10 +6537,24 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
         c.requestLat(band_center, PlanCtx::LatPrio::kStoppedCar, "停止車回避");
         c.stop_avoid_active = true;
         c.stop_avoid_v_stop = v_stop;
-        // 【2026-09-05】「通れない」とラッチされている間は have_gap を主張しない。
-        // これは preventRearEnd の「通れる帯があるので微速を許す」免除に効く。
-        // 通れないのに微速で寄っていくと、壁と相手の間へ押し込まれる。
-        c.stop_avoid_have_gap = !(stop_avoid_fix_ && stop_nopass_latched_);
+        // 【重大な誤りを訂正 2026-09-05】ここで have_gap を false にしていた。
+        //
+        // **それが 23秒の凍結を作っていた。**
+        // 追突防止は `room = 車間 - rear_end_margin(3.5) - 反応距離` なので、
+        // **停止車の 3.5m 手前で必ず上限 0 を出す。** それを救っているのが
+        // `stop_creep`(微速 1.4m/s)で、その発動条件が `stop_avoid_have_gap`。
+        // false にすると微速すら禁止され、車は 3.5m 手前で完全に固まる。
+        //
+        // 実測(20260905-152454 d4):
+        //   追突防止 d1 まで 3.0m 横間隔 1.69m 要求上限 **0.0km/h**
+        //   膠着 停止車両 d1 まで 3.0m 自車 0.38m/s が **23.2秒**
+        // そのあと stuck 判定が誤った理由(前方車=inf)で復帰を起動し、
+        // 動ける計画が無いので後退へ escalate して壁へ刺さる。
+        // ユーザー報告「P1 が無駄に後退し壁に後ろ向きに垂直にぶつかる」の実体。
+        //
+        // **「通れない」は横に抜けることを諦める意味であって、
+        //   動くのを諦める意味ではない。** 微速は常に許す。
+        c.stop_avoid_have_gap = true;
         c.stop_avoid_lo = best_a;
         c.stop_avoid_hi = best_b;
         c.stop_avoid_dist = base;

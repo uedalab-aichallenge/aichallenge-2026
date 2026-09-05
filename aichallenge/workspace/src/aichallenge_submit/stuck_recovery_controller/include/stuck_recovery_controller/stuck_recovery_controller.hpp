@@ -149,6 +149,18 @@ private:
   float wall_ban_steer_{0.0f};           // 回転で抜けるときの舵
   bool wall_ban_steer_valid_{false};
   bool wall_ban_gear_rev_{false};   // 後退で抜けるためにギアを後退へ入れたか
+
+  // 前の車に詰まって待っているだけの車を「スタック」にしないための条件。
+  // 車体が健全(領域内 / 向きが揃う / 壁から離れている)なら待つのが正しい。
+  bool queue_wait_enable_{true};
+  double queue_wait_margin_{0.20};   // 走行可能領域の端からこれだけ内側なら健全[m]
+  double queue_wait_yaw_{0.35};      // 方位差がこれ未満なら健全[rad](20度)
+  double queue_wait_wall_{0.30};     // 壁までこれ以上あれば健全[m]
+  // 待機の上限[s]。全員が健全な永久待機を避けるための安全網。
+  double queue_wait_max_{12.0};
+  std::optional<rclcpp::Time> healthy_wait_since_;
+  rclcpp::Time last_queue_wait_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_desperate_hold_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_wall_ban_rev_log_{0, 0, RCL_ROS_TIME};
   // 他車と重なる評価の前進計画も却下するか(既定 false。計測で退行したため)
   bool reject_car_overlap_plan_{false};

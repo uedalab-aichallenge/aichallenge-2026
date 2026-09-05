@@ -79,7 +79,19 @@
     <!-- 壁の判定に使う占有格子。コリドア(中心線に対する横方向だけ)では
          ヘアピンで鼻先が壁に当たっている状態を表現できないため。 -->
     <param name="occupancy_grid_yaml"
-           value="$(find-pkg-share multi_purpose_mpc_ros)/env/ten_final_ver3/ten_occupancy_grid_map.yaml"/>
+           value="$(env RECOVERY_GRID $(find-pkg-share multi_purpose_mpc_ros)/env/ten_final_ver3/ten_occupancy_grid_map.yaml)"/>
+    <!-- 【撤回 2026-09-05】一時 merged_occupancy_grid_map(手編集 ∪ final_ver3)へ
+         向けたが根拠が無いので戻した。final_ver3 は MPC 用の地図で、
+         CONTROL_METHOD の既定は pure_pursuit なので**誰も使っていない**。
+         占有格子を使うのは v2x_overtaker と復帰の2つだけで、どちらも同じ
+         手編集の地図を読んでいた(矛盾は無かった)。
+         後退の原因でもなかった(後退中の記録1110点のうち食い違いは1点)。
+         RECOVERY_GRID で差し替えられるようにはしてある。 -->
+    <!-- 【重要 2026-09-05】ここは手編集の ten_occupancy_grid_map を指していた。
+         その地図には通常制御の地図では壁なのに「自由」なセルが 3872個(38.7m^2)あり、
+         復帰が「後ろは空いている」と信じて壁へ後退し続ける原因になっていた
+         (ユーザー報告「ずっと壁に向かって後退し続ける」)。
+         merged は「どちらかが壁なら壁」を取った統合地図で、手編集の意図的な閉塞は残す。 -->
     <!-- 復帰の前進区間は、指令を直接作るのではなく経路を渡して pure_pursuit に
          追従させる。通常制御への戻りが連続になり、後退に頼る量も減る。
          そのため軌道の経路にも入る(v2x_overtaker の出力を受け、

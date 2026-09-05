@@ -802,7 +802,8 @@ private:
   const double rear_end_free_full_;   // ここまで離れたら完全に開放[m]
   const double rear_end_free_speed_;  // 完全に外れたときに許す速度[m/s]
   rclcpp::Time last_release_log_{0, 0, RCL_ROS_TIME};
-  const double min_pass_sep_;   // 並走時に必要な横間隔[m](カート幅 1.45)
+  const double min_pass_sep_;
+  const double pass_sep_floor_;   // 追い越しで確保する横間隔の下限[m]   // 並走時に必要な横間隔[m](カート幅 1.45)
   const double min_closing_kmh_;  // これ未満[km/h]の速度差では仕掛けない(同速対策)
   const double pass_dist_max_;    // 抜き切るのにこれ以上[m]要るなら仕掛けない
   const double stopped_speed_;       // これ以下なら「止まっている」[m/s]
@@ -1491,6 +1492,7 @@ private:
   rclcpp::Time last_stats_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_ot_lane_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_yaw_margin_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_sep_floor_log_{0, 0, RCL_ROS_TIME};
   std::vector<std::pair<std::size_t, std::size_t>> boost_zones_;
   std::string no_pass_zone_spec_;
   std::string ot_lane_zone_spec_;
