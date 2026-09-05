@@ -598,6 +598,8 @@ private:
   void preventRearEnd(const Frame & f, PlanCtx & c);
   // 指定 idx が公式オーバーテイクレーンの中か。
   bool inOtLane(std::size_t idx) const;
+  // 車体を丸ごとレーンへ入れられる区間の中か。
+  bool inOtLaneUse(std::size_t idx) const;
   // idx から先 look[m] の範囲にレーンがあるか(横移動の遅れを織り込むため)。
   bool otLaneAhead(std::size_t idx, double look) const;
   // いま公式オーバーテイクレーンを使ってよいか(位置と自車速度で判定)。
@@ -623,6 +625,9 @@ private:
   double oppLatAt(const OtherState & o, std::size_t idx, std::size_t n) const;
   // その地点で相手が出すと見込む速度[m/s]。同様に録画優先・モデル受け皿。負で無効。
   double oppSpdAt(const OtherState & o, std::size_t idx, std::size_t n) const;
+  // その車の前方 look[m] 以内にいる車の速度[m/s]。いなければ負。
+  // 「その車が遅いのは能力ではなく前が詰まっているから」を判定するのに使う。
+  double queueCapFor(const OtherState & o, double look) const;
   void avoidStoppedCars(const Frame & f, PlanCtx & c);
   void avoidCollision(const Frame & f, PlanCtx & c);
   void repulseFromNearCars(const Frame & f, PlanCtx & c);
@@ -1265,7 +1270,10 @@ private:
   const double ot_lane_prepare_time_;  // それに足す「速度×この秒数」
   // レーンを使うときに狙う横位置[m](自車ラインからの符号つきオフセット)。
   // 帯は右 2.15〜5.0m。車体を丸ごと帯へ入れるには -2.80 より右へ寄せる必要がある。
-  const double ot_lane_target_lat_;
+  // レーンへ入るとき、コリドアの右端からどれだけ内側を狙うか[m]。
+  // 端に張り付けると壁に触れる。
+  const double ot_lane_inset_;
+  const std::string ot_lane_use_zone_spec_;
   // 相手の走り方をモデルで予測するか。false にすると録画だけの旧挙動に戻る。
   const bool opp_model_enable_;
   // 抜きどころ計画をグリッド最後尾(slot 1)以外にも作るか。
@@ -1625,6 +1633,9 @@ private:
   std::vector<std::pair<double, double>> grid_slots_;  // 記録したグリッド座標
   std::vector<std::pair<std::size_t, std::size_t>> no_pass_zones_;  // 追い越し禁止区間
   std::vector<std::pair<std::size_t, std::size_t>> ot_lane_zones_;  // 公式オーバーテイクレーン
+  // レーンへ実際に「車体を丸ごと入れられる」区間。公式のルール区間(ot_lane_zones_)
+  // より狭い。理由は下の inOtLaneUse のコメント。
+  std::vector<std::pair<std::size_t, std::size_t>> ot_lane_use_zones_;
   std::vector<std::pair<std::size_t, std::size_t>> right_zones_;   // 右から抜く区間
   std::vector<std::pair<std::size_t, std::size_t>> side_pick_zones_;  // 側を録画で決める区間
   double slow_rival_ratio_{0.85};

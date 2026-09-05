@@ -80,8 +80,10 @@
        description="相手の走り方をモデルで予測する"/>
   <arg name="spot_all_slots" default="$(env SPOT_ALL true)"
        description="抜きどころ計画を全グリッド位置で作る(予選は slot1 だけだった)"/>
-  <arg name="ot_lane_target_lat" default="$(env OT_LANE_TGT -3.30)"
-       description="レーンを使うときに狙う横位置[m]。車体を丸ごと帯へ入れる"/>
+  <arg name="ot_lane_inset" default="$(env OT_LANE_INSET 0.35)"
+       description="レーンで狙う横位置。コリドアの右端からこれだけ内側"/>
+  <arg name="ot_lane_use_zones" default="$(env OT_LANE_USE 239:17)"
+       description="車体を丸ごとレーンへ入れられる区間(公式のルール区間より狭い)"/>
   <arg name="ot_lane_prepare_time" default="$(env OT_LANE_PREP_TIME 0.8)"
        description="上に足す「速度×この秒数」"/>  <arg name="ot_lane_guard_lat" default="$(env OT_LANE_GUARD 2.0)"
        description="上記未満のときレーン側(右)へ許す最大量[m]"/>
@@ -362,7 +364,8 @@
             <param name="ot_lane_prepare" value="$(var ot_lane_prepare)"/>
             <param name="ot_lane_prepare_look" value="$(var ot_lane_prepare_look)"/>
             <param name="ot_lane_prepare_time" value="$(var ot_lane_prepare_time)"/>
-            <param name="ot_lane_target_lat" value="$(var ot_lane_target_lat)"/>
+            <param name="ot_lane_inset" value="$(var ot_lane_inset)"/>
+            <param name="ot_lane_use_zones" type="str" value="$(var ot_lane_use_zones)"/>
             <param name="opp_model_enable" value="$(var opp_model_enable)"/>
             <param name="spot_all_slots" value="$(var spot_all_slots)"/>
             <param name="ot_lane_guard_lat" value="$(var ot_lane_guard_lat)"/>

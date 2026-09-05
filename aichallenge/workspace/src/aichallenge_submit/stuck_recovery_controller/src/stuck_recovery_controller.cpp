@@ -788,7 +788,21 @@ void StuckRecoveryController::onNominalCommand(
     // ときだけ。そうしないと毎周期引き直して計画だけが増える
     // (実測 20260905-201209/d2: 引き直し200回・計画207回・完了0回)。
     const double tnow = now.seconds();
-    const bool fresh = (!wall_ban_acted_ || wall_ban_acted_seq_ != plan_seq_) &&
+    // 【直したバグ 2026-09-05】「1計画につき1回」を復帰していないときにも
+    // 掛けていた。計画を作らない間は plan_seq_ が動かないので `fresh` が
+    // 永久に偽になり、**拒否され続けているのに何も起きない**状態になる。
+    //
+    // 実測(20260905-222851/d4。ユーザー報告「P4 スタートした瞬間壁に
+    // ぶつかり動かなくなった」): 復帰の上限30秒で通常制御へ返した後、
+    //   「壁へ -0.22m 食い込んだまま N秒 改善しない。前進を止める
+    //    (指令 11.67m/s -> 0)」
+    // が1秒ごとに15回以上続き、復帰が一度も再開しなかった。
+    //
+    // 「1計画につき1回」は**復帰中の引き直しを抑えるための規則**なので、
+    // 復帰中だけに適用する。復帰していないときは時間だけで見る。
+    const bool in_recovery = recovery_start_time_.has_value();
+    const bool fresh = (!in_recovery ||
+                        !wall_ban_acted_ || wall_ban_acted_seq_ != plan_seq_) &&
                        (wall_ban_acted_at_ < 0.0 ||
                         tnow - wall_ban_acted_at_ >= 1.0);
     const bool in_cooldown =
@@ -2647,6 +2661,21 @@ void StuckRecoveryController::updateWallBanState()
 // 斜めに刺さっている場合は前進で抜けられるので、改善している間は通す。
 void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceleration)
 {
+  // --- 一度も走り出していない間は効かせない(2026-09-05) ---
+  //
+  // 【ユーザー報告】「P4 スタートした瞬間壁にぶつかり動かなくなりました」。
+  //
+  // 【実測 20260905-222851/d4】止まっていた位置 (89630.8, 43134.9) は
+  // **P4 のグリッド座標そのもの**(launch の grid_slots の4番目と一致)。
+  // 車は一度も動いていない。ところが復帰用の占有格子はその地点を
+  // 「壁へ -0.36m 食い込んでいる」と判定する。**地図がグリッドを壁の中に
+  // 置いている。** その結果:
+  //   合図 → 全開 11.67m/s → 禁止が「食い込んだまま0.8秒改善しない」と判断
+  //   → スロットルを0 → 一度も発進できない → 復帰 → 30秒上限 → 以下無限
+  //
+  // この禁止の意味は「ぶつかった後に押し付け続けない」ことなので、
+  // **まだ一度も走っていない車には適用しない。** 一度動けば有効になる。
+  if (!moving_observed_) { return; }
   if (!wall_forward_ban_ || speed <= 0.05f) {
     if (wall_ban_gear_rev_ && speed > 0.05f) {
       publishGear(GearCommand::DRIVE);

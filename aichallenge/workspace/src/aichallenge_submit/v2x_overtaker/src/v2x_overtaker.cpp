@@ -782,7 +782,9 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_prepare_(declare_parameter<bool>("ot_lane_prepare", true)),
   ot_lane_prepare_look_(declare_parameter<double>("ot_lane_prepare_look", 18.0)),
   ot_lane_prepare_time_(declare_parameter<double>("ot_lane_prepare_time", 0.8)),
-  ot_lane_target_lat_(declare_parameter<double>("ot_lane_target_lat", -3.30)),
+  ot_lane_inset_(declare_parameter<double>("ot_lane_inset", 0.35)),
+  ot_lane_use_zone_spec_(
+    declare_parameter<std::string>("ot_lane_use_zones", "239:17")),
   opp_model_enable_(declare_parameter<bool>("opp_model_enable", true)),
   spot_all_slots_(declare_parameter<bool>("spot_all_slots", true)),
   // レーンは自車ラインの右 2.15m から始まる(実測)。
@@ -870,6 +872,34 @@ V2XOvertaker::V2XOvertaker()
       RCLCPP_INFO(get_logger(),
         "オーバーテイクレーン idx%zu-%zu 使用=%s 要速度=%.0fkm/h 低速時の右上限=%.2fm",
         a, b, ot_lane_enable_ ? "する" : "しない", ot_lane_min_kmh_, ot_lane_guard_lat_);
+    }
+  }
+  // --- 車体を丸ごとレーンへ入れられる区間(2026-09-05) ---
+  //
+  // 【実測(local_script/overtaking_zone.py)】レーンの横範囲と
+  // コリドアの右端(lo)を突き合わせると、両方を満たす帯は区間で大きく違う。
+  //   idx234  レーン -2.55..-2.30 (幅0.25m) / lo -0.90  → **車体は入らない**
+  //   idx238  レーン -4.00..-1.50          / lo -2.55  → ほぼ入らない
+  //   idx0    レーン -4.60..-2.15          / lo -3.20  → 中心 -2.80..-3.20 で入る
+  //   idx15   レーン -5.45..-3.00          / lo -4.35  → 中心 -3.65..-4.35 で入る
+  //
+  // つまり**レーンの入口側(234-238)ではコリドアが右へ寄れない。**
+  // ここで無理に右を狙うとコリドアの端に張り付き、壁に触れる
+  // (ユーザー報告「P4 スタートした瞬間壁にぶつかり動かなくなった」の地点は
+  //  この区間だった)。狙うのは 239 以降に限る。
+  // 退避義務のガード(ot_lane_guard)は公式のルール区間のまま使う。
+  {
+    std::stringstream ss(ot_lane_use_zone_spec_);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      const std::size_t c = item.find(':');
+      if (c == std::string::npos) { continue; }
+      const auto a = static_cast<std::size_t>(std::stoul(item.substr(0, c)));
+      const auto b = static_cast<std::size_t>(std::stoul(item.substr(c + 1)));
+      ot_lane_use_zones_.emplace_back(a, b);
+      RCLCPP_INFO(get_logger(),
+        "レーンで車体を入れられる区間 idx%zu-%zu (コリドアの右端から %.2fm 内側を狙う)",
+        a, b, ot_lane_inset_);
     }
   }
   {
@@ -2297,6 +2327,38 @@ double V2XOvertaker::oppLatAt(
   return o.modelLat(insideAt(idx));
 }
 
+// その車の前方に別の車がいるなら、その車の速度で頭を押さえる。
+//
+// 【なぜ必要か】モデルの `v_top` はその車の**能力**(観測した最高速)である。
+// ところが行列の中では、相手の実速度は自分の能力ではなく**前の車**で決まる。
+// 能力をそのまま「これから出す速度」として使うと、
+//   ・相手の到着時刻を早く見積もる → 並ぶ地点がずれる
+//   ・「相手は速いから抜けない」と判断する
+// のどちらにも転ぶ。能力と「いま出せる速度」を分ける。
+double V2XOvertaker::queueCapFor(const OtherState & o, double look) const
+{
+  if (line_x_.empty() || !o.prog_init) { return -1.0; }
+  double cap = -1.0;
+  for (const auto & kv : others_) {
+    const OtherState & q = kv.second;
+    if (&q == &o || !q.valid || !q.prog_init) { continue; }
+    const double d = q.prog - o.prog;
+    if (d > 0.0 && d <= look) {
+      const double v = std::hypot(q.vx, q.vy);
+      cap = (cap < 0.0) ? v : std::min(cap, v);
+    }
+  }
+  // 自分が相手の前にいる場合も同じ(相手はこちらに詰まっている)。
+  if (my_prog_init_) {
+    const double d = my_prog_ - o.prog;
+    if (d > 0.0 && d <= look) {
+      const double v = std::max(my_speed_for_gap_, 0.0);
+      cap = (cap < 0.0) ? v : std::min(cap, v);
+    }
+  }
+  return cap;
+}
+
 double V2XOvertaker::oppSpdAt(
   const OtherState & o, std::size_t idx, std::size_t n) const
 {
@@ -2306,7 +2368,12 @@ double V2XOvertaker::oppSpdAt(
   if (rec > 0.0) { return rec; }
   if (!opp_model_enable_) { return -1.0; }
   const double r = (corridor_.radius.size() > idx) ? corridor_.radius[idx] : 1e9;
-  return o.modelSpd(r);
+  double v = o.modelSpd(r);
+  if (v <= 0.0) { return v; }
+  // 前が詰まっているなら、その車の速度を超えることはできない。
+  const double cap = queueCapFor(o, 12.0);
+  if (cap >= 0.0) { v = std::min(v, std::max(cap, 0.5)); }
+  return v;
 }
 
 // 相手の走行ラインを学習する(前方かどうかに関係なく毎周期)。
@@ -5172,10 +5239,15 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
     // 帯の縁に半分だけ入る中途半端な横位置には意味がない。
     // コリドアの実測(idx239以降で lo -2.85〜-4.35)では -3.30 は入る。
     // 帯へ入れない区間では下の clamp が自動的に手前で止める。
-    if (ot_lane_target_lat_ < 0.0 && side_sign_ < 0.0 &&
+    // 【修正 2026-09-05】固定値 -3.30m をやめる。
+    // レーンの入口側(idx234-238)はコリドアが右へ 0.9〜2.55m しか寄れないので、
+    // 固定値を狙うと clamp でコリドアの端に張り付き、壁に触れる。
+    // 狙うのは「コリドアの右端から ot_lane_inset 内側」。区間ごとに変わるので
+    // 端に張り付かず、しかも 239 以降ではレーンの中に入る(実測の突き合わせ済み)。
+    if (ot_lane_inset_ >= 0.0 && side_sign_ < 0.0 &&
         otLaneApproach(f.ei, my_speed_for_gap_, rankSpeedCap()))
     {
-      tgt = std::min(tgt, ot_lane_target_lat_);
+      tgt = std::min(tgt, room_lo_ + ot_lane_inset_);
     }
     tgt_lat = std::clamp(tgt, room_lo_, room_hi_);
     c.requestLat(tgt_lat, PlanCtx::LatPrio::kOvertake, "追越");
@@ -5985,6 +6057,19 @@ bool V2XOvertaker::inOtLane(std::size_t idx) const
   return false;
 }
 
+// 車体を丸ごとレーンへ入れられる区間の中か(読み込み時のコメント参照)。
+bool V2XOvertaker::inOtLaneUse(std::size_t idx) const
+{
+  const auto & zs = ot_lane_use_zones_.empty() ? ot_lane_zones_ : ot_lane_use_zones_;
+  for (const auto & z : zs) {
+    const bool inside = (z.first <= z.second)
+                          ? (idx >= z.first && idx <= z.second)
+                          : (idx >= z.first || idx <= z.second);
+    if (inside) { return true; }
+  }
+  return false;
+}
+
 // いま公式オーバーテイクレーンを使ってよいか。
 //
 // 判定は「レーンの中の idx にいる」かつ「27km/h(+余裕) 以上出ている」だけ。
@@ -6000,7 +6085,7 @@ double V2XOvertaker::rankSpeedCap() const
 double V2XOvertaker::otLaneEntryDistance(std::size_t idx, double look) const
 {
   if (ot_lane_zones_.empty() || line_x_.empty()) { return -1.0; }
-  if (inOtLane(idx)) { return -1.0; }
+  if (inOtLaneUse(idx)) { return -1.0; }
   const std::size_t n = line_x_.size();
   double acc = 0.0;
   for (std::size_t k = 0; k < n; ++k) {
@@ -6008,7 +6093,7 @@ double V2XOvertaker::otLaneEntryDistance(std::size_t idx, double look) const
     const std::size_t b = (idx + k + 1) % n;
     acc += std::hypot(line_x_[b] - line_x_[a], line_y_[b] - line_y_[a]);
     if (acc > look) { return -1.0; }
-    if (inOtLane(b)) { return acc; }
+    if (inOtLaneUse(b)) { return acc; }
   }
   return -1.0;
 }
@@ -6032,7 +6117,7 @@ double V2XOvertaker::otLaneEntryDistance(std::size_t idx, double look) const
 bool V2XOvertaker::otLaneApproach(std::size_t idx, double v_now, double v_cap) const
 {
   if (!ot_lane_enable_ || ot_lane_zones_.empty()) { return false; }
-  if (inOtLane(idx)) { return v_now * 3.6 >= ot_lane_min_kmh_; }
+  if (inOtLaneUse(idx)) { return v_now * 3.6 >= ot_lane_min_kmh_; }
   if (!ot_lane_prepare_) { return false; }
   const double look = ot_lane_prepare_look_ +
                       std::max(v_now, 0.0) * ot_lane_prepare_time_;
