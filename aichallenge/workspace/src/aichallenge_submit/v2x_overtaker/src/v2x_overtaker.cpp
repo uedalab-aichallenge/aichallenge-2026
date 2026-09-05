@@ -762,6 +762,11 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_enable_(declare_parameter<bool>("ot_lane_enable", false)),
   // BLOCK(20秒)を避けるガード。レーンを追い越しに使うかとは独立に常時有効。
   ot_lane_guard_(declare_parameter<bool>("ot_lane_guard", true)),
+  // 車体の向きが崩れているぶん横の許容範囲を狭める。
+  yaw_margin_enable_(declare_parameter<bool>("yaw_margin_enable", true)),
+  // 車体の半長[m]。原点(後軸)から前端 1.60 / 後端 0.60 なので、
+  // 回転で横に張り出す量としては前側の 1.60 を使う(安全側)。
+  yaw_margin_half_len_(declare_parameter<double>("yaw_margin_half_len", 1.60)),
   // ガードを効かせ始める先読み距離。横位置が実現するまでの約20m。
   ot_lane_guard_look_(declare_parameter<double>("ot_lane_guard_look", 20.0)),
   ot_lane_guard_time_(declare_parameter<double>("ot_lane_guard_time", 0.5)),
@@ -1422,6 +1427,49 @@ void V2XOvertaker::onTimer()
   // 0.35秒後に 上限=10.8km/h)。速度上限を下げる層は、上げる層より後に
   // 置かなければ効かない。
   preventRearEnd(f, c);
+
+  // --- 車体の向きが崩れているぶん、横に使える範囲を狭める(実測 2026-09-05) ---
+  //
+  // 【実測で分かったこと】公式の壁ペナルティ29件を発生の0.3〜5秒前で調べると
+  //   ・**コリドアの外へ出ていたのは 0件(0%)**。29件すべて内側で、余裕は中央 0.82m
+  //   ・横位置の追従誤差は 中央 0.00m / p90 0.03m。**追従はほぼ完璧**
+  // それでも当たる理由は姿勢。バッグから車体四隅と占有格子の距離を測ると、
+  //   方位差 < 10 度 : 壁に接触 0 / 545 件 (0%)
+  //   方位差 >= 20 度: 4284 / 4287 件 (99.9%)
+  //   方位差 >= 45 度: 4123 / 4123 件 (100%)
+  // **コリドアは「車体が経路に沿った姿勢」を前提にした幅**なので、
+  // 姿勢が崩れると中心が内側でも角が外へ出る。
+  //
+  // 必要な半幅は 半幅*cos|θ| + 半長*sin|θ|。45度なら 0.65 → 約1.24m(約2倍)。
+  // その差分だけ横の許容範囲を狭める。姿勢が揃っているときは何も変わらない。
+  if (yaw_margin_enable_) {
+    const auto & q = odom_->pose.pose.orientation;
+    const double myyaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const size_t a = (f.ei + f.n - 1) % f.n, b = (f.ei + 1) % f.n;
+    const double tth = std::atan2(
+      f.in.points[b].pose.position.y - f.in.points[a].pose.position.y,
+      f.in.points[b].pose.position.x - f.in.points[a].pose.position.x);
+    double e = myyaw - tth;
+    while (e > M_PI) { e -= 2.0 * M_PI; }
+    while (e < -M_PI) { e += 2.0 * M_PI; }
+    const double ae = std::abs(e);
+    const double need = kCarWidth * 0.5 * std::cos(ae) + yaw_margin_half_len_ * std::sin(ae);
+    const double extra = std::max(need - kCarWidth * 0.5, 0.0);
+    if (extra > 0.02) {
+      const double before = c.latWant();
+      c.boundLat(c.lat_lo + extra, c.lat_hi - extra, "姿勢ぶんの余裕");
+      const double after = c.latWant();
+      if (std::abs(before - after) > 0.05 &&
+          (now - last_yaw_margin_log_).seconds() > 2.0)
+      {
+        last_yaw_margin_log_ = now;
+        diagLog("姿勢余裕",
+                "姿勢余裕 方位差=%.1fdeg 要る半幅=%.2fm(+%.2f) 横目標 %.2f -> %.2f",
+                ae * 180.0 / M_PI, need, extra, before, after);
+      }
+    }
+  }
 
   // 壁衝突の予測監視。すべての意図と制約が出そろった後、確定の直前に
   // 評価する(latWant() が最終値と一致するのはこの位置だけ)。

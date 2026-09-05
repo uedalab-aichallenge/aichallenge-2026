@@ -1146,6 +1146,8 @@ private:
   //   (順位推定に依存しない。順位推定はずれることが分かっている)。
   const bool ot_lane_enable_;      // オーバーテイクレーンを使うか
   const bool ot_lane_guard_;       // 低速でレーンへ入らないガード(常時有効)
+  const bool yaw_margin_enable_;      // 姿勢ぶん横の許容範囲を狭めるか
+  const double yaw_margin_half_len_;  // 回転で横へ張り出す長さ[m]
   const double ot_lane_guard_look_;  // ガードを効かせ始める先読み距離[m]
   const double ot_lane_guard_time_;  // 同、速度に比例して足す時間[s]
   const double ot_lane_min_kmh_;   // レーンを使うのに要る自車速度[km/h]
@@ -1488,6 +1490,7 @@ private:
   int my_speed_cnt_{0};
   rclcpp::Time last_stats_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_ot_lane_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_yaw_margin_log_{0, 0, RCL_ROS_TIME};
   std::vector<std::pair<std::size_t, std::size_t>> boost_zones_;
   std::string no_pass_zone_spec_;
   std::string ot_lane_zone_spec_;
