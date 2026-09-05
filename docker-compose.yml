@@ -49,6 +49,8 @@ x-autoware-base: &autoware-base
     - OT_LANE_PREP_LOOK=${OT_LANE_PREP_LOOK:-18.0}
     - OT_LANE_PREP_TIME=${OT_LANE_PREP_TIME:-0.8}
     - OT_LANE_INSET=${OT_LANE_INSET:-0.35}
+    - BODY_ASYM=${BODY_ASYM:-true}
+    - HOLD_ALONGSIDE=${HOLD_ALONGSIDE:-true}
     - OT_LANE_USE=${OT_LANE_USE:-239:17}
     - OPP_MODEL=${OPP_MODEL:-true}
     - SPOT_ALL=${SPOT_ALL:-true}

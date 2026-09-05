@@ -783,6 +783,12 @@ V2XOvertaker::V2XOvertaker()
   ot_lane_prepare_look_(declare_parameter<double>("ot_lane_prepare_look", 18.0)),
   ot_lane_prepare_time_(declare_parameter<double>("ot_lane_prepare_time", 0.8)),
   ot_lane_inset_(declare_parameter<double>("ot_lane_inset", 0.35)),
+  body_margin_asym_(declare_parameter<bool>("body_margin_asym", true)),
+  geom_front_(declare_parameter<double>("geom_front", 1.554)),
+  geom_rear_(declare_parameter<double>("geom_rear", 0.510)),
+  geom_half_width_(declare_parameter<double>("geom_half_width", 0.725)),
+  hold_side_alongside_(declare_parameter<bool>("hold_side_alongside", true)),
+  alongside_extra_(declare_parameter<double>("alongside_extra", 0.10)),
   ot_lane_use_zone_spec_(
     declare_parameter<std::string>("ot_lane_use_zones", "239:17")),
   opp_model_enable_(declare_parameter<bool>("opp_model_enable", true)),
@@ -1485,6 +1491,10 @@ void V2XOvertaker::onTimer()
   //
   // 必要な半幅は 半幅*cos|θ| + 半長*sin|θ|。45度なら 0.65 → 約1.24m(約2倍)。
   // その差分だけ横の許容範囲を狭める。姿勢が揃っているときは何も変わらない。
+  // 車体が縦に重なっている相手へ横に近づく動きを禁じる。
+  // 姿勢ぶんの余裕より前に置く(こちらは相手、あちらは壁が相手)。
+  holdSideAlongside(f, c);
+
   if (yaw_margin_enable_) {
     const auto & q = odom_->pose.pose.orientation;
     const double myyaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -1497,19 +1507,32 @@ void V2XOvertaker::onTimer()
     while (e > M_PI) { e -= 2.0 * M_PI; }
     while (e < -M_PI) { e += 2.0 * M_PI; }
     const double ae = std::abs(e);
-    const double need = kCarWidth * 0.5 * std::cos(ae) + yaw_margin_half_len_ * std::sin(ae);
-    const double extra = std::max(need - kCarWidth * 0.5, 0.0);
-    if (extra > 0.02) {
+    double add_lo = 0.0, add_hi = 0.0, ext_l = 0.0, ext_r = 0.0;
+    if (body_margin_asym_) {
+      // 実際の車体の四隅から左右別に求める(bodyExtent のコメント参照)。
+      bodyExtent(e, ext_l, ext_r);
+      // コリドアは「車体が経路に沿った姿勢」を前提にした幅なので、
+      // 差分は「姿勢が揃っているときの半幅」から測る。
+      add_hi = std::max(ext_l - geom_half_width_, 0.0);   // 左(lat_hi)側
+      add_lo = std::max(ext_r - geom_half_width_, 0.0);   // 右(lat_lo)側
+    } else {
+      const double need = kCarWidth * 0.5 * std::cos(ae) +
+                          yaw_margin_half_len_ * std::sin(ae);
+      add_lo = add_hi = std::max(need - kCarWidth * 0.5, 0.0);
+      ext_l = ext_r = need;
+    }
+    if (add_lo > 0.02 || add_hi > 0.02) {
       const double before = c.latWant();
-      c.boundLat(c.lat_lo + extra, c.lat_hi - extra, "姿勢ぶんの余裕");
+      c.boundLat(c.lat_lo + add_lo, c.lat_hi - add_hi, "姿勢ぶんの余裕");
       const double after = c.latWant();
       if (std::abs(before - after) > 0.05 &&
           (now - last_yaw_margin_log_).seconds() > 2.0)
       {
         last_yaw_margin_log_ = now;
         diagLog("姿勢余裕",
-                "姿勢余裕 方位差=%.1fdeg 要る半幅=%.2fm(+%.2f) 横目標 %.2f -> %.2f",
-                ae * 180.0 / M_PI, need, extra, before, after);
+                "姿勢余裕 方位差=%+.1fdeg 張り出し 左%.2f 右%.2f "
+                "(狭める 左%.2f 右%.2f) 横目標 %.2f -> %.2f",
+                e * 180.0 / M_PI, ext_l, ext_r, add_hi, add_lo, before, after);
       }
     }
   }
@@ -8945,6 +8968,117 @@ V2XOvertaker::OccSteerResult V2XOvertaker::occSteerGuard(const Frame & f) const
     r.best_clear = best_depth;
   }
   return r;
+}
+
+
+// 方位差 e[rad](正=経路に対して左を向く)のときの、後軸中心から見た
+// 車体の左右の張り出し[m]。
+//
+// 【ユーザー指示 2026-09-06】「内輪差を考慮して壁や他車にぶつからないように」。
+//
+// 【従来が誤っていた点】姿勢ぶんの余裕は
+//   必要半幅 = 半幅*cos|e| + 1.60*sin|e|
+// という**左右対称・半長を 1.60m と置いた近似**だった。実際の車体は
+// 後軸中心を基準に 前端 F = 2.14+0.47 = 2.61m / 後端 R = 0.51m で**前後非対称**。
+// 20度のとき、この式は 1.16m を返すが、実際の前左隅の張り出しは
+//   2.61*sin20 + 0.65*cos20 = 0.89 + 0.61 = 1.50m
+// で **0.34m 過小**。一方、逆側(後ろ隅)は
+//   0.51*sin20 + 0.65*cos20 = 0.17 + 0.61 = 0.78m
+// なので **0.38m 過大**に見ていた。
+//
+// 過小な側は壁や相手に当たり、過大な側は「空いているのに寄れない」を作る。
+// 実測(gate2): 停止車回避が右へ -1.97m 寄りたいのに、この余裕で -0.64m まで
+// 制限され、左の相手ぎりぎりを 14.8km/h で走っていた。
+//
+// 左右を別に、実際の車体の四隅から計算する。
+void V2XOvertaker::bodyExtent(double e, double & ext_left, double & ext_right) const
+{
+  // 幾何は公式値を使う(実効ホイールベース 2.14m は当てはめ値なので使わない)。
+  const double F = geom_front_;
+  const double R = geom_rear_;
+  const double hw = geom_half_width_;
+  const double si = std::sin(e);
+  const double co = std::abs(std::cos(e));
+  // 四隅の横座標は d*sin(e) + w*cos(e) (d は前後、w は左右)。
+  ext_left  = std::max(F * si, -R * si) + hw * co;
+  ext_right = std::max(-F * si, R * si) + hw * co;
+}
+
+// 車体が縦に重なっている相手へ、横に近づく動きを禁じる。
+//
+// 【ユーザー報告(gate2)】「左側の相手3台の並びが終わった後、左に寄っていって、
+// 自分の左後方と相手の車がぶつかった。内輪差や自分の大きさを制御できていない
+// のではないか」。
+//
+// 【確認した事実】そのとおりだった。
+//   ・相手との間隔に使っている値は band_car_w=1.30 と min_pass_sep=1.15 の
+//     **幅だけ**で、車体の長さも旋回時の張り出しも入っていない。
+//   ・計画上の最小隙間は **0.50〜0.55m** しかなかった(ログ「最小隙間0.50m」)。
+//   ・横目標は `スタートレーン保持` により -1.63 → +0.96 へ跳び、車は3秒で
+//     -1.04 → +0.17 へ動いた。約12.6m の走行で 1.6m 横移動 = 経路角 約7.3度。
+//     ホイールベース 2.14m ぶんの内輪差だけで約 0.27m。0.50m の隙間の半分を食う。
+//
+// 【対策の考え方】必要な間隔そのものを広げると「抜けるかどうか」の判定が
+// 厳しくなり、追い越しが減る(過去に許可を絞って追い越しが 0.50 -> 0.00 に
+// なった実測がある)。そこで**判定は変えず、動きだけを縛る**。
+//
+//   車体が縦に重なっている相手が、必要な間隔より近い横位置にいる間は、
+//   **その相手へ近づく向きへ横目標を動かさない。**
+//
+// 追い越しは縦に前へ出ることで成立するので、「横に詰める」を禁じても
+// 追い越しは減らない。逆に、抜き切る前に寄り戻す動き(gate2 の接触)は消える。
+void V2XOvertaker::holdSideAlongside(const Frame & f, PlanCtx & c)
+{
+  if (!hold_side_alongside_ || !odom_ || line_x_.empty() || !my_prog_init_) { return; }
+  const auto & q = odom_->pose.pose.orientation;
+  const double myyaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                  1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  const std::size_t a = (f.ei + f.n - 1) % f.n, b = (f.ei + 1) % f.n;
+  const double tth = std::atan2(
+    f.in.points[b].pose.position.y - f.in.points[a].pose.position.y,
+    f.in.points[b].pose.position.x - f.in.points[a].pose.position.x);
+  double e = myyaw - tth;
+  while (e > M_PI) { e -= 2.0 * M_PI; }
+  while (e < -M_PI) { e += 2.0 * M_PI; }
+  double ext_l = 0.0, ext_r = 0.0;
+  bodyExtent(e, ext_l, ext_r);
+  // 縦に重なっているとみなす距離。自車と相手の全長ぶん。
+  const double body_len = veh_wheel_base_ + veh_front_overhang_ + veh_rear_overhang_;
+  const double my_lat = my_lat_for_target_;
+  for (const auto & kv : others_) {
+    const OtherState & o = kv.second;
+    if (!o.valid || !o.prog_init) { continue; }
+    if ((f.now - o.stamp).seconds() > v2x_timeout_) { continue; }
+    if (std::abs(o.prog - my_prog_) > body_len) { continue; }   // 縦に重なっていない
+    const std::size_t oi = nearest(f.in, o.x, o.y);
+    double nx, ny;
+    normalAt(f.in, oi, nx, ny);
+    const auto & lp = f.in.points[oi].pose.position;
+    const double olat = (o.x - lp.x) * nx + (o.y - lp.y) * ny;
+    const double sep = std::abs(my_lat - olat);
+    // 相手がいる側の張り出し + 相手の半幅 + 余裕。これより離れていれば縛らない。
+    const bool on_left = olat > my_lat;
+    const double need = (on_left ? ext_l : ext_r) + geom_half_width_ + alongside_extra_;
+    if (sep >= need) { continue; }
+    const double before = c.latWant();
+    if (on_left) {
+      c.boundLat(c.lat_lo, std::min(c.lat_hi, my_lat), "並走中は寄せない");
+    } else {
+      c.boundLat(std::max(c.lat_lo, my_lat), c.lat_hi, "並走中は寄せない");
+    }
+    const double after = c.latWant();
+    if (std::abs(before - after) > 0.05 &&
+        (this->now() - last_alongside_log_).seconds() > 1.0)
+    {
+      last_alongside_log_ = this->now();
+      diagLog("並走中は寄せない",
+              "並走中は寄せない target=%s %s 縦のずれ%.1fm 横間隔%.2fm(要%.2f) "
+              "方位差%.1fdeg 張り出し左%.2f 右%.2f 横目標 %.2f -> %.2f",
+              kv.first.c_str(), on_left ? "相手は左" : "相手は右",
+              o.prog - my_prog_, sep, need, e * 180.0 / M_PI,
+              ext_l, ext_r, before, after);
+    }
+  }
 }
 
 void V2XOvertaker::wallGuard(const Frame & f, PlanCtx & c)

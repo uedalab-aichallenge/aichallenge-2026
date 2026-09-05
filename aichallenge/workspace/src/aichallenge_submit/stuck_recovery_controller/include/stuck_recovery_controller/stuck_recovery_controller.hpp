@@ -302,6 +302,22 @@ private:
   bool wall_stall_valid_{false};
   double wall_stall_x_{0.0}, wall_stall_y_{0.0};
   rclcpp::Time wall_stall_since_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_wall_stall_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_wedge_hold_log_{0, 0, RCL_ROS_TIME};
+
+  // --- 不変条件の計測(2026-09-05) ---
+  //
+  // 「壁の外に車体が出ている(食い込み<0)状態で、前進の速度指令が実際に
+  //  ノードから出た」回数を、抜け道ごとに数える。**主張の代わりに数字を出す**
+  // ためのもので、挙動は一切変えない。0 でなければ塞げていない。
+  double wall_clear_now_{1e9};       // 毎周期の食い込み量[m]。正=余裕あり
+  static constexpr int kFwdWallReasons = 6;
+  long fwd_in_wall_cnt_[kFwdWallReasons]{};
+  double fwd_in_wall_sec_[kFwdWallReasons]{};
+  double fwd_in_wall_worst_{0.0};    // 最も深かった食い込み[m]
+  double fwd_in_wall_last_t_{-1.0};
+  rclcpp::Time last_invariant_log_{0, 0, RCL_ROS_TIME};
+  void noteForwardInWall(int reason, float speed);
   double wall_ban_acted_at_{-1.0};
   rclcpp::Time stall_since_{0, 0, RCL_ROS_TIME};
   // ギアを入れ替えた時刻。AWSIM のギアは切り替わるまで間があるので、

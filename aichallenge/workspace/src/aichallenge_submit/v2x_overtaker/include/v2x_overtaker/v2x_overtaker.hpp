@@ -816,6 +816,10 @@ private:
   OccSteerResult occSteerGuard(const Frame & f) const;
 
   void wallGuard(const Frame & f, PlanCtx & c);
+  // 方位差 e[rad](正=左を向く)のときの車体の左右の張り出し[m]。
+  void bodyExtent(double e, double & ext_left, double & ext_right) const;
+  // 車体が縦に重なっている相手へ、横に近づく動きを禁じる。
+  void holdSideAlongside(const Frame & f, PlanCtx & c);
   // 【舵角の許容範囲を制御側へ渡す】
   // wallGuard は横位置の制約(boundLat)と速度上限(requestCap)しか出さないので、
   // 「経路がどうであれ制御が壁へ向かう」場合を止められない。そこで、現在地点で
@@ -1272,7 +1276,38 @@ private:
   // 帯は右 2.15〜5.0m。車体を丸ごと帯へ入れるには -2.80 より右へ寄せる必要がある。
   // レーンへ入るとき、コリドアの右端からどれだけ内側を狙うか[m]。
   // 端に張り付けると壁に触れる。
+  // --- 車体の張り出し(内輪差)を左右別に見る(ユーザー指示 2026-09-06) ---
+  // 後軸中心を基準に、前端 F = wheel_base + front_overhang、後端 R = rear_overhang。
+  // 方位差 e があると、左右の張り出しは
+  //   左 = max(F*sin e, -R*sin e) + 半幅*|cos e|
+  //   右 = max(-F*sin e, R*sin e) + 半幅*|cos e|
+  // になる。**左右で違う**のが要点(従来は同じ値を左右に足していた)。
+  // レーンへ入るとき、コリドアの右端からどれだけ内側を狙うか[m]。
   const double ot_lane_inset_;
+  const bool body_margin_asym_;
+  // --- 車体の幾何(公式値)。実効ホイールベースとは別物 ---
+  //
+  // 【私の誤り 2026-09-06 ユーザー指摘】ここに実効ホイールベース 2.14m を
+  // 入れていた。2.14m は「自転車モデルが実際の旋回挙動に合うように当てはめた値」で
+  // `steering_tire_angle_gain 2.8` が吸収している分を含む。
+  // **車体の角がどこにあるかという幾何の計算に実効値を入れてはいけない。**
+  //
+  // 公式 `racing_kart_description/config/vehicle_info.param.yaml`:
+  //   wheel_base 1.087 / front_overhang 0.467 / rear_overhang 0.510
+  //   wheel_tread 1.12 / left,right_overhang 0.09
+  // 公式 `docs/specifications/simulator.ja.md`:
+  //   全長 200cm / 全幅 **145cm** / ホイールベース 108.7cm
+  //
+  // 後軸中心から 前端 1.087+0.467 = 1.554m / 後端 0.510m(全長 2.06m)。
+  // 幅は当たり判定には車体の 145cm を採る(param の 1.30m はタイヤ基準の箱)。
+  // 誤って 2.61m を使っていたので張り出しを 68% 過大に見ていた。
+  const double geom_front_;      // 後軸中心から前端[m]
+  const double geom_rear_;       // 後軸中心から後端[m]
+  const double geom_half_width_; // 車体の半幅[m]
+  // 車体が縦に重なっている相手へ、横に近づく動きを禁じるか。
+  const bool hold_side_alongside_;
+  // 上を効かせる横間隔の上限に足す余裕[m]。
+  const double alongside_extra_;
   const std::string ot_lane_use_zone_spec_;
   // 相手の走り方をモデルで予測するか。false にすると録画だけの旧挙動に戻る。
   const bool opp_model_enable_;
@@ -1623,6 +1658,7 @@ private:
   int my_speed_cnt_{0};
   rclcpp::Time last_stats_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_ot_lane_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_alongside_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_yaw_margin_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_sep_floor_log_{0, 0, RCL_ROS_TIME};
   std::vector<std::pair<std::size_t, std::size_t>> boost_zones_;

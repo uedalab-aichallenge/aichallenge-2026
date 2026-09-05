@@ -1146,10 +1146,13 @@ void StuckRecoveryController::updateStuckDetection(
     wall_stall_valid_ = false;
   }
   if (wall_stall) {
-    RCLCPP_WARN(get_logger(),
-                "壁に触れたまま %.1f秒 前進しても動かない(指令%.2f 実速度%.2f)。"
-                "膠着として復帰へ入る",
-                wall_contact_stall_sec_, command.longitudinal.speed, velocity);
+    if ((now - last_wall_stall_log_).seconds() > 2.0) {
+      last_wall_stall_log_ = now;
+      RCLCPP_WARN(get_logger(),
+                  "壁に触れたまま %.1f秒 前進しても動かない(指令%.2f 実速度%.2f)。"
+                  "膠着として復帰へ入る",
+                  wall_contact_stall_sec_, command.longitudinal.speed, velocity);
+    }
     hard_stall = true;
   }
 
@@ -2216,10 +2219,41 @@ bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
   if (!recovery_start_time_.has_value()) { return false; }
   const double total = (now - recovery_start_time_.value()).seconds();
   if (total > kRecoveryMaxSec) {
-    RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
-                kRecoveryMaxSec, situation_.c_str());
-    finishRecovery(now);
-    return false;
+    // --- 食い込んでいる間は通常制御へ返さない(2026-09-05) ---
+    //
+    // 【ユーザー報告「P2 まだ後退し続けています」の実体】
+    // 実測 20260905-225522/d2: 位置(89617.4,43174.8) が **200秒以上まったく
+    // 変わらない**。壁への食い込みは開始時 -0.22m → **-1.27m** まで深くなった。
+    //
+    // 深くなった理由は、**上限30秒で通常制御へ返すたびに全開(11.67m/s)が
+    // 0.8秒だけ通る**こと。禁止は「食い込んだまま0.8秒改善しない」で効くので、
+    // 返す → 0.8秒踏む → 止める → 復帰30秒 → 返す、を繰り返すと
+    // 1回あたり数cmずつ壁へ押し込む。7回で 1m 進んだ。
+    //
+    // 実機では「壁に当たったままアクセルを踏み続ける」は再起不能(運営アナウンス)。
+    // 食い込んでいる間は返さず、復帰の側で持ち続ける。
+    recovery::Pose wp;
+    const bool wedged_now = currentPose(wp) && obstacles_.valid() &&
+                            recovery::wallClearanceAt(obstacles_, veh_, wp) < 0.0;
+    if (wedged_now) {
+      if ((now - last_wedge_hold_log_).seconds() > 5.0) {
+        last_wedge_hold_log_ = now;
+        RCLCPP_WARN(get_logger(),
+          "復帰 上限%.0fs に到達したが壁へ食い込んでいる。通常制御へ返さず"
+          "後退での脱出を続ける 状況= %s", kRecoveryMaxSec, situation_.c_str());
+      }
+      // 時計を戻して、最終手段(食い込み中は後退か待機しか出さない)に任せる。
+      recovery_start_time_ = now;
+      replan_count_ = 0;
+      desperate_ = true;
+      desperate_since_ = now;
+      desperate_swing_ = -1;
+    } else {
+      RCLCPP_WARN(get_logger(), "復帰 上限%.0fs に到達。通常制御へ返す 状況= %s",
+                  kRecoveryMaxSec, situation_.c_str());
+      finishRecovery(now);
+      return false;
+    }
   }
 
   recovery::Pose p;
@@ -2630,10 +2664,12 @@ void StuckRecoveryController::finishRecovery(const rclcpp::Time & now)
 // 0.8秒の前進許可を何度も取り直せてしまう。解除側にヒステリシスを入れる。
 void StuckRecoveryController::updateWallBanState()
 {
-  if (!wall_forward_ban_) { return; }
   recovery::Pose p;
   if (!currentPose(p) || !obstacles_.valid()) { return; }
   const double clear = recovery::wallClearanceAt(obstacles_, veh_, p);
+  // 計測用に毎周期控える(禁止が無効でも記録する)。
+  wall_clear_now_ = clear;
+  if (!wall_forward_ban_) { return; }
   const double t = this->now().seconds();
   // 解除は「余裕が正側へ十分出た」ときだけ。ゼロ跨ぎのノイズで戻さない。
   if (clear >= wall_forward_ban_gain_ * 2.0) {
@@ -2659,6 +2695,41 @@ void StuckRecoveryController::updateWallBanState()
 //
 // 一律禁止ではなく **「食い込んでいて、かつ改善していないなら禁止」**。
 // 斜めに刺さっている場合は前進で抜けられるので、改善している間は通す。
+
+// 「壁の外に出たまま前進の指令が出た」を抜け道ごとに数えるだけの関数。
+// 挙動は変えない。0 でなければ不変条件を守れていない。
+void StuckRecoveryController::noteForwardInWall(int reason, float speed)
+{
+  if (reason < 0 || reason >= kFwdWallReasons) { return; }
+  if (speed <= 0.5f) { return; }
+  if (!(wall_clear_now_ < 0.0)) { return; }
+  const double t = this->now().seconds();
+  fwd_in_wall_cnt_[reason]++;
+  if (fwd_in_wall_last_t_ > 0.0) {
+    const double dt = t - fwd_in_wall_last_t_;
+    if (dt > 0.0 && dt < 0.5) { fwd_in_wall_sec_[reason] += dt; }
+  }
+  fwd_in_wall_last_t_ = t;
+  fwd_in_wall_worst_ = std::min(fwd_in_wall_worst_, wall_clear_now_);
+  if ((this->now() - last_invariant_log_).seconds() > 5.0) {
+    last_invariant_log_ = this->now();
+    long total = 0;
+    for (int i = 0; i < kFwdWallReasons; ++i) { total += fwd_in_wall_cnt_[i]; }
+    RCLCPP_WARN(get_logger(),
+      "不変条件 壁の外で前進 計%ld回 "
+      "[発進前 %ld(%.1fs) 禁止off %ld(%.1fs) 復帰の前進 %ld(%.1fs) "
+      "高速 %ld(%.1fs) 浅い %ld(%.1fs) 猶予 %ld(%.1fs)] 最深 %.2fm",
+      total,
+      fwd_in_wall_cnt_[0], fwd_in_wall_sec_[0],
+      fwd_in_wall_cnt_[1], fwd_in_wall_sec_[1],
+      fwd_in_wall_cnt_[2], fwd_in_wall_sec_[2],
+      fwd_in_wall_cnt_[3], fwd_in_wall_sec_[3],
+      fwd_in_wall_cnt_[4], fwd_in_wall_sec_[4],
+      fwd_in_wall_cnt_[5], fwd_in_wall_sec_[5],
+      fwd_in_wall_worst_);
+  }
+}
+
 void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceleration)
 {
   // --- 一度も走り出していない間は効かせない(2026-09-05) ---
@@ -2675,7 +2746,8 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
   //
   // この禁止の意味は「ぶつかった後に押し付け続けない」ことなので、
   // **まだ一度も走っていない車には適用しない。** 一度動けば有効になる。
-  if (!moving_observed_) { return; }
+  if (!moving_observed_) { noteForwardInWall(0, speed); return; }
+  if (!wall_forward_ban_) { noteForwardInWall(1, speed); }
   if (!wall_forward_ban_ || speed <= 0.05f) {
     if (wall_ban_gear_rev_ && speed > 0.05f) {
       publishGear(GearCommand::DRIVE);
@@ -2697,19 +2769,41 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
   // **計画自身が「当たらない」と評価している前進は止めない。**
   // 「当たる」と評価している前進は下の (B) で計画ごと却下するので、
   // ここへは来ない。止めるべきなのは計画の裏付けが無い前進だけ。
+  // --- 計画の予測ではなく、いまの実測で判断する(2026-09-05) ---
+  //
+  // 【計測でこの抜け道が最大だと分かった】不変条件の計測(1レース):
+  //   d1: 壁の外で前進 758回 のうち **復帰の前進 264回(2.6秒)**
+  //   d3: 935回 のうち **復帰の前進 533回(5.3秒)** 最深 -0.50m
+  // ここは「計画自身が当たらないと評価した前進は止めない」という免除だが、
+  // **その予測は実測とずれる**ことが既に分かっている
+  // (予測 +0.22m の前進区間が 4.5m 走って -0.28m になった実測がある)。
+  //
+  // 車体が**いま**壁の外に出ているなら、計画の予測は当てにならない。
+  // 計画は「壁の中にいる姿勢」から立てたものなので前提が崩れている。
+  // 実測が食い込みを示している間は免除しない。
   if (recovery_start_time_.has_value() && plan_.valid &&
       phase_idx_ < plan_.phases.size() && plan_.phases[phase_idx_].forward &&
-      plan_min_wall_clear_ >= 0.0)
+      plan_min_wall_clear_ >= 0.0 && wall_clear_now_ >= 0.0)
   {
+    noteForwardInWall(2, speed);
     return;
   }
   // **走っている車には効かせない。** 押し付けられて動けない状態が前提であり、
   // 走行中に壁を掠めた程度でスロットルを切ると、コース上に停止して
   // 全車の玉突きを招く(2026-09-05 に実測。1レースで4台全滅)。
-  if (std::abs(latest_velocity_) >= wall_forward_ban_speed_) { return; }
-  if (wall_ban_since_ < 0.0) { return; }
+  if (std::abs(latest_velocity_) >= wall_forward_ban_speed_) {
+    noteForwardInWall(3, speed);
+    return;
+  }
+  // wall_ban_since_ が立っていない = 深さ(wall_forward_ban_depth_)に届いていない。
+  if (wall_ban_since_ < 0.0) { noteForwardInWall(4, speed); return; }
   const double held = this->now().seconds() - wall_ban_since_;
-  if (held <= wall_forward_ban_hold_) { return; }
+  // 深く食い込んでいるなら「改善するか様子を見る」意味がない。猶予を縮める。
+  // 実測: 猶予 0.8秒のあいだ全開が通り、返すたびに壁へ数cm押し込んでいた。
+  const double hold = (wall_ban_ref_clear_ < -0.4)
+                        ? std::min(wall_forward_ban_hold_, 0.2)
+                        : wall_forward_ban_hold_;
+  if (held <= hold) { noteForwardInWall(5, speed); return; }
   // 拒否したという事実だけを残す。ここでは向きもギアも作らない。
   wall_ban_hit_ = true;
   if ((this->now() - last_wall_ban_log_).seconds() > 1.0) {
