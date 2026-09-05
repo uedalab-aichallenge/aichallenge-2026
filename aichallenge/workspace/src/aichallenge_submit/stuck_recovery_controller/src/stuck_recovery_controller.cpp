@@ -267,7 +267,18 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   wall_forward_ban_gain_ = declare_parameter<double>("wall_forward_ban_gain", 0.03);
   wall_forward_ban_speed_ = declare_parameter<double>("wall_forward_ban_speed", 1.0);
   wall_forward_ban_depth_ = declare_parameter<double>("wall_forward_ban_depth", 0.15);
-  wall_ban_reverse_ = declare_parameter<bool>("wall_ban_reverse", true);
+  // 【計測で戻した 2026-09-05】ギアを後退へ入れる実装にしたところ、
+  // リタイアが 20% -> 35%、壁ペナルティが 339秒/325秒という値になった。
+  //
+  // **復帰制御は自前でギアを管理している**(`復帰追跡 ... ギア2 / ギア20`)。
+  // このガードが毎周期ギアを上書きすると、復帰の計画実行とギアを取り合って壊す。
+  // ギアを入れないと後退しない(実測: 指令だけでは実速度 0.00m/s のまま)ので、
+  // **「ガードから後退させる」という形自体が誤り。**
+  //
+  // 正しくは復帰制御の計画として後退させること。段2(総当りに方位差を入れた)は
+  // その方向の変更で、そちらは残してある。
+  // ガードは「壁へ食い込んだままの前進を止める」だけに戻す(計測で最良)。
+  wall_ban_reverse_ = declare_parameter<bool>("wall_ban_reverse", false);
   wall_ban_reverse_after_ = declare_parameter<double>("wall_ban_reverse_after", 1.5);
   wall_ban_reverse_speed_ = declare_parameter<double>("wall_ban_reverse_speed", 1.0);
   wall_ban_reverse_rear_ = declare_parameter<double>("wall_ban_reverse_rear", 2.0);
@@ -1230,6 +1241,36 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
     plan_.valid = false;
   }
 
+  // --- 前進区間が「当たる」見込みの計画は、後退だけに切り詰める(2026-09-05) ---
+  //
+  // 【ユーザー報告の挙動の実体】
+  //   復帰 計画0: 後退舵-35deg 1.5m 前進舵-18deg 4.5m 余裕壁**-0.14**
+  //   後退で 壁まで -0.40 -> +0.10 (壁から離れる。正しい)
+  //   前進で 走行2.16m、壁まで +0.10 -> -0.10 (**同じ壁へ戻る**)
+  // 計画自身が -0.14 と予測しているのに実行していた。
+  //
+  // 【なぜ却下条件をすり抜けたか】バグB の却下は
+  // `plan_.phases.front().forward` (最初の区間が前進)に限定していた。
+  // **`min_wall_clear` は前進区間の値なので順序に関係なく見るべき**だった。
+  //
+  // 却下してしまうと計画が無くなり desperate へ落ちる(それは以前の計測で退行した)。
+  // 後退区間そのものは壁から離れる正しい動作なので、**後退だけ実行して
+  // 良い姿勢から立て直す。** 前進は次の計画で改めて評価する。
+  if (plan_.valid && plan_.min_wall_clear < 0.0 && plan_.phases.size() >= 2 &&
+      !plan_.phases.front().forward)
+  {
+    RCLCPP_WARN(get_logger(),
+      "復帰 前進区間が当たる見込み(余裕壁%.2f)。後退だけ実行して立て直す",
+      plan_.min_wall_clear);
+    plan_.phases.resize(1);
+    if (plan_.rev_points > 0 && plan_.rev_points <= plan_.path.size()) {
+      plan_.path.resize(plan_.rev_points);
+    }
+    // 前進区間が無くなったので、前進の見込み余裕は「無し」として扱う。
+    plan_.min_wall_clear = 1e9;
+    plan_.min_car_clear = 1e9;
+  }
+
   // 採用した計画が前進区間で見込んだ余裕を、追従中の中断閾値に使えるよう保存する。
   // 計画が取れなかったときは 1e9 のままにして、中断閾値は既定値を使わせる。
   plan_min_wall_clear_ = plan_.valid ? plan_.min_wall_clear : 1e9;
@@ -2148,7 +2189,33 @@ void StuckRecoveryController::updateWallBanState()
 // 斜めに刺さっている場合は前進で抜けられるので、改善している間は通す。
 void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceleration)
 {
-  if (!wall_forward_ban_ || speed <= 0.05f) { return; }
+  if (!wall_forward_ban_ || speed <= 0.05f) {
+    if (wall_ban_gear_rev_ && speed > 0.05f) {
+      publishGear(GearCommand::DRIVE);
+      wall_ban_gear_rev_ = false;
+    }
+    return;
+  }
+  // --- 復帰計画の前進区間は止めない(ユーザー報告 2026-09-05) ---
+  //
+  // 【報告された挙動】「壁に衝突して全く前進せず、リバースに入れて後退、
+  // ギアを入れ替えて前進せず、また後退をしだす」。
+  //
+  // 【原因】この禁止が**復帰計画の前進区間を毎回0にしていた。**
+  // 実測(20260905-150402 d1): 前進を止めた 200回 に対し復帰の計画は 3回。
+  // 計画は「後退 → 前進」で立つので、後退で壁から離れた直後に前進区間が
+  // 潰され、動かないので計画をやり直し、また後退から始まる循環になる。
+  //
+  // 【切り分け】計画は前進区間の最小余裕を `min_wall_clear` として持っている。
+  // **計画自身が「当たらない」と評価している前進は止めない。**
+  // 「当たる」と評価している前進は下の (B) で計画ごと却下するので、
+  // ここへは来ない。止めるべきなのは計画の裏付けが無い前進だけ。
+  if (recovery_start_time_.has_value() && plan_.valid &&
+      phase_idx_ < plan_.phases.size() && plan_.phases[phase_idx_].forward &&
+      plan_min_wall_clear_ >= 0.0)
+  {
+    return;
+  }
   // **走っている車には効かせない。** 押し付けられて動けない状態が前提であり、
   // 走行中に壁を掠めた程度でスロットルを切ると、コース上に停止して
   // 全車の玉突きを招く(2026-09-05 に実測。1レースで4台全滅)。
@@ -2183,27 +2250,47 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
       // 後軸基準の自転車モデルで 1m ぶん後退させ、車体の余裕が増える側を採る。
       recovery::Pose p;
       if (currentPose(p)) {
-        double best = -1e9; float best_steer = 0.0f;
-        for (double sg : {-1.0, 0.0, 1.0}) {
+        // 【修正 2026-09-05】1m の後退では足りず、3案すべてが現状より悪化する
+        // 場面があった(食い込み -0.20m に対し見込み -0.50m)。
+        // 距離を伸ばし、**余裕が改善しないなら回転量そのもの**で選ぶ。
+        // 壁接触の原因は姿勢なので、回転が進むこと自体が価値を持つ。
+        const double now_clear = recovery::wallClearanceAt(obstacles_, veh_, p);
+        double best_clear = -1e9, best_turn = -1e9;
+        float best_steer = 0.0f; bool by_turn = false;
+        for (double sg : {-1.0, -0.5, 0.5, 1.0}) {
           const double st = sg * kMaxSteerRad;
           recovery::Pose q = p;
-          const double ds = -0.1;               // 後退 0.1m 刻み
-          for (int i = 0; i < 10; ++i) {
+          const double ds = -0.1;
+          double bestq = 1e9;
+          for (int i = 0; i < 25; ++i) {          // 2.5m ぶん後退させて見る
             q.x += ds * std::cos(q.yaw);
             q.y += ds * std::sin(q.yaw);
             q.yaw += ds * std::tan(st) / std::max(veh_.wheel_base, 0.1);
+            bestq = std::min(bestq, recovery::wallClearanceAt(obstacles_, veh_, q));
           }
-          const double cl = recovery::wallClearanceAt(obstacles_, veh_, q);
-          if (cl > best) { best = cl; best_steer = static_cast<float>(st); }
+          const double turn = std::abs(q.yaw - p.yaw);
+          // 余裕が現状より改善する案があればそれを採る。
+          if (bestq > now_clear + 0.02 && bestq > best_clear) {
+            best_clear = bestq; best_steer = static_cast<float>(st); by_turn = false;
+          } else if (best_clear < -1e8 && turn > best_turn) {
+            // どれも改善しない。**最も回る案**を採る(姿勢を直すのが目的)。
+            best_turn = turn; best_steer = static_cast<float>(st); by_turn = true;
+          }
         }
+        const double best = by_turn ? now_clear : best_clear;
+        // **ギアを後退へ入れる。** 負の目標速度だけでは後退しない
+        // (実測: 指令を出しても実速度 0.00m/s のまま食い込み時間が伸び続けた)。
+        publishGear(GearCommand::REVERSE);
+        wall_ban_gear_rev_ = true;
         speed = static_cast<float>(-wall_ban_reverse_speed_);
         acceleration = 0.0f;
         if ((this->now() - last_wall_ban_rev_log_).seconds() > 1.0) {
           last_wall_ban_rev_log_ = this->now();
           RCLCPP_WARN(get_logger(),
             "壁へ食い込んだまま %.1fs。後退して回転で抜ける(舵 %+.0fdeg / "
-            "見込みの余裕 %.2fm / 後方 %.1fm)",
-            held, best_steer * 180.0 / M_PI, best, rearRoom());
+            "選択=%s / 現在の余裕 %.2f -> 見込み %.2fm / 後方 %.1fm)",
+            held, best_steer * 180.0 / M_PI, by_turn ? "回転量" : "余裕",
+            now_clear, best, rearRoom());
         }
         // 舵は呼び出し側の値を上書きする。回転が目的なので舵が本体。
         wall_ban_steer_ = best_steer;
@@ -2216,6 +2303,11 @@ void StuckRecoveryController::applyWallForwardBan(float & speed, float & acceler
         "壁へ食い込んだまま %.1fs だが後方に余地が無い(%.1fm)。"
         "後退での接触は双方に CRASH が付くので待つ", held, rearRoom());
     }
+  }
+  if (wall_ban_gear_rev_) {
+    // 後退をやめたらギアを戻す。戻さないと通常制御の前進指令が後退になる。
+    publishGear(GearCommand::DRIVE);
+    wall_ban_gear_rev_ = false;
   }
   speed = 0.0f;
   acceleration = kBrakeAccel;

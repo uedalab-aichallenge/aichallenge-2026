@@ -148,6 +148,7 @@ private:
   double wall_ban_reverse_rear_{2.0};    // 後方にこれだけ[m]空いていないと出さない
   float wall_ban_steer_{0.0f};           // 回転で抜けるときの舵
   bool wall_ban_steer_valid_{false};
+  bool wall_ban_gear_rev_{false};   // 後退で抜けるためにギアを後退へ入れたか
   rclcpp::Time last_wall_ban_rev_log_{0, 0, RCL_ROS_TIME};
   // 他車と重なる評価の前進計画も却下するか(既定 false。計測で退行したため)
   bool reject_car_overlap_plan_{false};
