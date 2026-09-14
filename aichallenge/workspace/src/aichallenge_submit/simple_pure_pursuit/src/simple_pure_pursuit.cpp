@@ -66,6 +66,29 @@ SimplePurePursuit::SimplePurePursuit()
       RCLCPP_INFO(get_logger(), "lookahead 縮小区間 idx%zu-%zu x%.2f", z.from, z.to, z.scale);
     }
   }
+  speed_scale_ = declare_parameter<double>("speed_scale", 1.0);
+  // 走行中のパラメータ調整(ten_tune_tui から ros2 param set で変える)。
+  ten_param_cb_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & ps) {
+      rcl_interfaces::msg::SetParametersResult r;
+      r.successful = true;
+      for (const auto & p : ps) {
+        const auto & n = p.get_name();
+        const auto t = p.get_type();
+        const bool numeric = t == rclcpp::ParameterType::PARAMETER_DOUBLE ||
+                             t == rclcpp::ParameterType::PARAMETER_INTEGER;
+        if (!numeric) { continue; }
+        const double v = (t == rclcpp::ParameterType::PARAMETER_INTEGER)
+                           ? static_cast<double>(p.as_int()) : p.as_double();
+        if (n == "speed_scale") { speed_scale_ = v; }
+        if (n == "steering_tire_angle_gain") { steering_tire_angle_gain_ = v; }
+        if (n == "lookahead_gain") { lookahead_gain_ = v; }
+        if (n == "lookahead_min_distance") { lookahead_min_distance_ = v; }
+        if (n == "max_acceleration") { max_acceleration_ = v; }
+        if (n == "speed_proportional_gain") { speed_proportional_gain_ = v; }
+      }
+      return r;
+    });
   pub_cmd_ = create_publisher<AckermannControlCommand>("output/control_cmd", 1);
   pub_raw_cmd_ = create_publisher<AckermannControlCommand>("output/raw_control_cmd", 1);
   pub_lookahead_point_ = create_publisher<PointStamped>("/control/debug/lookahead_point", 1);
@@ -181,7 +204,8 @@ void SimplePurePursuit::onTimer()
 
   // calc longitudinal speed and acceleration
   double target_longitudinal_vel =
-    use_external_target_vel_ ? external_target_vel_ : closet_traj_point.longitudinal_velocity_mps;
+    (use_external_target_vel_ ? external_target_vel_ : closet_traj_point.longitudinal_velocity_mps) *
+    speed_scale_;
   double current_longitudinal_vel = odometry_->twist.twist.linear.x;
 
   cmd.longitudinal.speed = target_longitudinal_vel;

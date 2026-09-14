@@ -672,8 +672,9 @@ private:
   const double front_lane_half_;   // 自分の進路とみなす横幅の半分[m]
   const double contact_vehicle_dist_;
   const double contact_log_hold_;  // これ以内に他車がいれば車両接触とみなす[m]
-  const double avoid_range_;       // 衝突回避で見る範囲[m]
+  double avoid_range_;       // 衝突回避で見る範囲[m]
   const double collision_radius_;  // 衝突とみなす半径[m](車体2台分)
+  const double avoid_min_lon_;   // これより前に出ていない相手は衝突回避の対象外[m]
   const double ttc_threshold_;     // この時間[s]以内に衝突しそうなら回避する
   const double big_gap_closing_;   // 速度差[km/h]がこれ以上なら距離制限を外す
   const double inside_time_gain_;  // イン側から抜くときの所要時間の許容倍率
@@ -688,9 +689,9 @@ private:
   // 追突防止を完全に外してよい横間隔[m]。既定は車体の全幅 1.45m。
   double pass_beside_sep_;
   const double offset_rate_;
-  const double corridor_safety_;
-  const double corridor_safety_pass_;  // 追い越し試行中に使う縁からの余裕[m]
-  const double corridor_safety_zone_;  // 追い越し可能ゾーンで使う縁からの余裕[m]
+  double corridor_safety_;
+  double corridor_safety_pass_;  // 追い越し試行中に使う縁からの余裕[m]
+  double corridor_safety_zone_;  // 追い越し可能ゾーンで使う縁からの余裕[m]
   const double side_room_ahead_;   // 左右の余地を見る先読み距離[m]
   const double side_flip_hold_;    // 余地なしがこの秒数続いたら反対側へ回る[s]
   const int side_flip_max_;        // 対象車1台につき側を変更してよい回数(バースト)
@@ -854,7 +855,7 @@ private:
   const double repulse_band_margin_;
   // ブーストを撃ってよい最大の車間[m]。これより後ろで撃つと追突する。
   const double boost_side_gap_;
-  const double min_pass_width_;
+  double min_pass_width_;
   const bool rear_end_lat_release_;   // 横にずれた分だけ追突防止を緩めるか
   const double rear_end_free_min_;
   const bool lat_lag_by_speed_;
@@ -977,7 +978,7 @@ private:
   mutable rclcpp::Time last_otlane_log_{0, 0, RCL_ROS_TIME};
   const double side_run_need_;
   // 相手と自車を少し大きく見る余裕[m]。経路が無ければ外す。
-  const double size_pad_;
+  double size_pad_;
   // 横間隔のパラメータに「物理の下限 + size_pad」の床を張る。
   const bool sep_floor_enable_;
   mutable rclcpp::Time last_occ_relax_log_{0, 0, RCL_ROS_TIME};
@@ -1053,8 +1054,8 @@ private:
   // 「通れない」を保持する。
   const double stop_nopass_exit_speed_;
   const double stop_nopass_release_sec_;
-  const double stopped_look_ahead_;  // 停止車両を探す前方距離[m]
-  const double stop_margin_;         // 停止車両の手前に空ける距離[m]
+  double stopped_look_ahead_;  // 停止車両を探す前方距離[m]
+  double stop_margin_;         // 停止車両の手前に空ける距離[m]
   const double stop_brake_k_;
   const double stop_hold_margin_;    // 追突判定で制動距離へ足す余裕[m]
 
@@ -1142,6 +1143,8 @@ private:
   const double launch_stopped_grace_; // 実移動開始後、停止車分類を待つ時間[s]
   const double look_width_ahead_;
   const double v2x_timeout_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr ten_param_cb_;
+  bool stopped_pad_relax_{false};   // true で「余裕込みで帯が無ければ余裕を外して測り直す」(旧挙動)
   bool race_started_{false};       // /awsim/state が Start になったか
   const double safe_gap_;
   const double safe_gap_min_;      // 車間の下限[m]
@@ -1149,7 +1152,7 @@ private:
   const double gap_brake_ratio_;   // 制動距離を車間にどれだけ反映するか
   const double a_min_;             // 想定減速度[m/s^2]
   const double follow_kp_;
-  const double follow_keep_gap_;  // これ以上の車間なら相手より遅くしない[m]
+  double follow_keep_gap_;  // これ以上の車間なら相手より遅くしない[m]
   const double min_follow_speed_;
   const bool capped_self_enable_;   // 1位ハンデ中の closing 足切り緩和を使うか
   const double capped_self_closing_;// そのときに要る最低速度差[km/h]
@@ -1191,7 +1194,7 @@ private:
   const bool boost_runup_enable_;   // 並ぶ前(助走段階)にブーストを撃つか
   const double boost_runup_gap_;    // 助走ブーストを撃つ車間の上限[m]
   const double boost_runup_gap_min_;// 同 下限[m]。近すぎると助走にならず追突する
-  const double wall_margin_;        // 横目標を壁から必ず離す量[m]
+  double wall_margin_;        // 横目標を壁から必ず離す量[m]
   const double wall_margin_stopped_;  // 停止車を避けるときの壁の余裕[m]
   const bool straight_pass_enable_;   // 直線の追い越しを通しきるか
   const double straight_pass_wall_;   // そのとき壁に残す余裕[m]

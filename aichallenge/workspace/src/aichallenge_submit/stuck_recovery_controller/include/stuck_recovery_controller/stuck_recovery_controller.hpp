@@ -24,6 +24,7 @@
 #include <autoware_auto_planning_msgs/msg/trajectory.hpp>
 #include <autoware_auto_vehicle_msgs/msg/gear_command.hpp>
 #include <autoware_auto_vehicle_msgs/msg/gear_report.hpp>
+#include <autoware_auto_vehicle_msgs/msg/control_mode_report.hpp>
 #include <autoware_auto_vehicle_msgs/msg/steering_report.hpp>
 #include <autoware_auto_vehicle_msgs/msg/velocity_report.hpp>
 
@@ -316,6 +317,13 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr crash_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr race_state_sub_;
   bool force_recovery_{false};
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr ten_param_cb_;
+  rclcpp::Subscription<autoware_auto_vehicle_msgs::msg::ControlModeReport>::SharedPtr control_mode_sub_;
+  bool control_mode_seen_{false};   // control_mode を一度でも受信したか(未受信なら従来どおり)
+  bool autonomous_{true};           // 最後に受信した control_mode が AUTONOMOUS か
+  double launch_no_recovery_sec_{8.0};                 // 発進(最初の実移動)からこの秒数は復帰を始めない
+  std::optional<rclcpp::Time> launch_moving_since_;    // 最初の実移動を観測した時刻
+  rclcpp::Time last_launch_hold_log_{0, 0, RCL_ROS_TIME};
   bool race_started_{false};
 
   // 復帰経路の計算に使う情報

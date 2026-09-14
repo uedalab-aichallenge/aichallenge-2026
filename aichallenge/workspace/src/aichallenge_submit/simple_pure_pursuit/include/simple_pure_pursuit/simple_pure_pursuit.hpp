@@ -50,12 +50,12 @@ class SimplePurePursuit : public rclcpp::Node {
 
   // pure pursuit parameters
   const double wheel_base_;
-  const double lookahead_gain_;
-  const double lookahead_min_distance_;
-  const double speed_proportional_gain_;
+  double lookahead_gain_;
+  double lookahead_min_distance_;
+  double speed_proportional_gain_;
   const bool use_external_target_vel_;
   const double external_target_vel_;
-  const double steering_tire_angle_gain_;
+  double steering_tire_angle_gain_;
   // ラインから離れているときに lookahead を伸ばす係数(横ずれ e に対し e*gain)
   const double lookahead_cte_gain_;
   // 低速時だけ曲率と速度で lookahead に上限を掛ける。
@@ -100,7 +100,7 @@ class SimplePurePursuit : public rclcpp::Node {
   const double sat_accel_max_;    // そのときに許す最大加速度
   const double sat_guard_min_speed_; // この速度[m/s]以下ではガードを効かせない
   rclcpp::Time last_sat_log_{0, 0, RCL_ROS_TIME};
-  const double max_acceleration_;
+  double max_acceleration_;
   // --- 壁ガードによる舵角クランプ(最終手段の安全網)
   // v2x_overtaker が /control/wall_guard/steer_limit へ流す
   // 「壁に当たらない舵角の範囲」で、計算した舵角を最後にクランプする。
@@ -113,6 +113,8 @@ class SimplePurePursuit : public rclcpp::Node {
  private:
   void onTimer();
   bool subscribeMessageAvailable();
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr ten_param_cb_;
+  double speed_scale_{1.0};   // 走行ラインの目標速度に掛ける倍率(実機で調整)
 };
 
 }  // namespace simple_pure_pursuit

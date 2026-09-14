@@ -1,0 +1,107 @@
+# ten_tune_tui.py が読む調整対象パラメータの定義
+#
+# 構造:
+#   nodes:
+#     <ノードのフルネーム>:
+#       <パラメータ名>: {step: <増減幅>, min: <下限>, max: <上限>}
+#
+# - 型は起動時にノードへ GetParameters して実測する(ここには書かない)。
+# - bool / string はステップ操作不要のため今回は含めない(spaceキーでbool、Enterで直接入力は可能)。
+# - このファイルはビルド時に share/aichallenge_submit_launch/config/ にインストールされる。
+
+nodes:
+  /planning/scenario_planning/v2x_overtaker:
+    size_pad:
+      step: 0.05
+      min: 0.0
+      max: 1.0
+    stopped_size_pad:
+      step: 0.05
+      min: 0.0
+      max: 1.0
+    corridor_safety:
+      step: 0.05
+      min: 0.0
+      max: 2.0
+    corridor_safety_pass:
+      step: 0.05
+      min: 0.0
+      max: 2.0
+    corridor_safety_zone:
+      step: 0.05
+      min: 0.0
+      max: 2.0
+    wall_margin:
+      step: 0.02
+      min: 0.0
+      max: 1.0
+    pass_wall_keep:
+      step: 0.02
+      min: 0.0
+      max: 1.0
+    pass_gap_margin:
+      step: 0.02
+      min: 0.0
+      max: 1.0
+    follow_keep_gap:
+      step: 0.05
+      min: 0.0
+      max: 3.0
+    stop_margin:
+      step: 0.05
+      min: 0.0
+      max: 3.0
+    avoid_range:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    stopped_look_ahead:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    min_pass_width:
+      step: 0.02
+      min: 0.0
+      max: 2.0
+  /simple_pure_pursuit_node:
+    steering_tire_angle_gain:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    lookahead_gain:
+      step: 0.05
+      min: 0.0
+      max: 3.0
+    lookahead_min_distance:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    max_acceleration:
+      step: 0.05
+      min: 0.0
+      max: 3.0
+    speed_proportional_gain:
+      step: 0.1
+      min: 0.0
+      max: 5.0
+    speed_scale:
+      step: 0.05
+      min: 0.3
+      max: 1.2
+  /stuck_recovery_controller:
+    recovery_speed:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    simple_speed:
+      step: 0.1
+      min: 0.0
+      max: 10.0
+    recovery_accel:
+      step: 0.05
+      min: 0.0
+      max: 3.0
+    simple_accel:
+      step: 0.05
+      min: 0.0
+      max: 3.0

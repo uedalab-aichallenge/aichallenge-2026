@@ -7,6 +7,12 @@
 
   <let name="steering_tire_angle_gain_var" value="1.50" if="$(var simulation)"/>
   <let name="steering_tire_angle_gain_var" value="1.639" unless="$(var simulation)"/>
+  <!-- 自前の舵ゲイン。SIM は実測で 2.8。実機は公式サンプルの実機/SIM 比(1.639/1.50)を掛ける。
+       復帰側の指令変換 steer_cmd_scale(既定 1.6667)にも同じ比を掛ける。 -->
+  <let name="ten_steer_gain" value="2.8" if="$(var simulation)"/>
+  <let name="ten_steer_gain" value="3.06" unless="$(var simulation)"/>
+  <let name="ten_steer_cmd_scale" value="1.6666667" if="$(var simulation)"/>
+  <let name="ten_steer_cmd_scale" value="1.821" unless="$(var simulation)"/>
 
   <node pkg="simple_pure_pursuit" exec="simple_pure_pursuit" name="simple_pure_pursuit_node" output="screen">
     <param name="sat_accel_guard" value="$(env SAT_ACCEL_GUARD true)"/>
@@ -29,7 +35,9 @@
     <!-- OVER ペナルティ(|a|>3 m/s^2 で 2 秒間 5 km/h 制限)を踏まないための上限。
          AWSIM は入力を ±1.37 に clamp するので 2.0 でも性能は落ちない。 -->
     <param name="max_acceleration" value="2.0"/>
-    <param name="steering_tire_angle_gain" value="2.8"/>
+    <param name="steering_tire_angle_gain" value="$(var ten_steer_gain)"/>
+    <!-- 走行ラインの目標速度に掛ける倍率。ten_tune_tui で走行中に変えられる。 -->
+    <param name="speed_scale" value="1.0"/>
 
     <remap from="input/kinematics" to="/localization/kinematic_state"/>
     <remap from="input/trajectory" to="/planning/scenario_planning/trajectory"/>
@@ -43,6 +51,11 @@
   <node pkg="stuck_recovery_controller" exec="stuck_recovery_controller_node"
         name="stuck_recovery_controller" output="screen">
     <param name="vehicle_id" value="d$(env ROS_DOMAIN_ID 0)"/>
+    <!-- 実機は /awsim/state が来ない。起動時点でレース中とみなす(実移動を観測するまで判定しない)。 -->
+    <param name="assume_race_started" value="$(eval &quot;'$(var simulation)' == 'false'&quot;)"/>
+    <param name="steer_cmd_scale" value="$(var ten_steer_cmd_scale)"/>
+    <!-- 発進(最初の実移動)から8秒は復帰を始めない。 -->
+    <param name="launch_no_recovery_sec" value="8.0"/>
     <param name="wedge_backward_first" value="$(env RECOVERY_FIX false)"/>
     <param name="wall_forward_ban" value="$(env WALL_FWD_BAN true)"/>
     <!-- 復帰の最終手段(壁へ食い込んで動けないとき、舵を振って下がる)。 -->
@@ -64,7 +77,7 @@
          既定 off。`desperate`(最終手段)とは別物で、あちらは触らない。 -->
     <param name="deadlock_release_enable" value="$(env DEADLOCK_RELEASE false)"/>
     <param name="deadlock_release_sec" value="$(env DEADLOCK_RELEASE_SEC 5.0)"/>
-    <param name="recovery_speed" value="$(env RECOVERY_SPEED 4.0)"/>
+    <param name="recovery_speed" value="$(env RECOVERY_SPEED 2.0)"/>
     <param name="recovery_accel" value="$(env RECOVERY_ACCEL 1.37)"/>
     <param name="no_plan_retry_sec" value="$(env NO_PLAN_RETRY_SEC 0.10)"/>
     <param name="embed_forward_escape" value="$(env EMBED_FORWARD_ESCAPE true)"/>
@@ -109,8 +122,8 @@
          1.5m なら 0.08m。経路の延長(尾)と併せて確実に追従できる長さにする。 -->
     <param name="lookahead_min_distance" value="1.5"/>
     <param name="wheel_base" value="2.14"/>
-    <param name="steering_tire_angle_gain" value="2.8"/>
-    <param name="reverse_max_speed" value="1.5"/>
+    <param name="steering_tire_angle_gain" value="$(var ten_steer_gain)"/>
+    <param name="reverse_max_speed" value="1.0"/>
     <remap from="input/kinematics" to="/localization/kinematic_state"/>
     <remap from="input/trajectory" to="/planning/scenario_planning/trajectory_reverse"/>
     <remap from="output/control_cmd" to="/control/command/reverse_control_cmd"/>

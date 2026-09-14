@@ -206,11 +206,54 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
       }
     });
 
+  // 実機では /awsim/state が配信されない。起動時点でレース中とみなす。
+  // 発進前の誤判定は moving_observed_(実移動を一度観測するまで判定しない)が防ぐ。
+  if (declare_parameter<bool>("assume_race_started", false)) {
+    race_started_ = true;
+    RCLCPP_INFO(get_logger(), "assume_race_started: /awsim/state を待たずにレース中とみなす");
+  }
+  // 走行中のパラメータ調整(ten_tune_tui から ros2 param set で変える)。
+  ten_param_cb_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & ps) {
+      rcl_interfaces::msg::SetParametersResult r;
+      r.successful = true;
+      for (const auto & p : ps) {
+        const auto & n = p.get_name();
+        const auto t = p.get_type();
+        const bool numeric = t == rclcpp::ParameterType::PARAMETER_DOUBLE ||
+                             t == rclcpp::ParameterType::PARAMETER_INTEGER;
+        if (!numeric) { continue; }
+        const double v = (t == rclcpp::ParameterType::PARAMETER_INTEGER)
+                           ? static_cast<double>(p.as_int()) : p.as_double();
+        if (n == "recovery_speed") { recovery_speed_ = v; }
+        if (n == "simple_speed") { simple_speed_ = v; }
+        if (n == "recovery_accel") { recovery_accel_ = v; }
+        if (n == "simple_accel") { simple_accel_ = v; }
+      }
+      return r;
+    });
+  // 実機: AUTONOMOUS のときだけスタック判定・復帰をする。MANUAL 中は判定を捨て、
+  // AUTONOMOUS に戻ったら「実移動を観測するまで判定しない」からやり直す。
+  control_mode_sub_ = create_subscription<autoware_auto_vehicle_msgs::msg::ControlModeReport>(
+    "/vehicle/status/control_mode", rclcpp::QoS(1),
+    [this](const autoware_auto_vehicle_msgs::msg::ControlModeReport::ConstSharedPtr msg) {
+      const bool auto_now =
+        msg->mode == autoware_auto_vehicle_msgs::msg::ControlModeReport::AUTONOMOUS;
+      if (!control_mode_seen_ || auto_now != autonomous_) {
+        RCLCPP_INFO(get_logger(), "control_mode %s (mode=%u)",
+          auto_now ? "AUTONOMOUS: スタック判定を有効化(実移動の観測から)" : "MANUAL等: スタック判定と復帰を止める",
+          static_cast<unsigned>(msg->mode));
+      }
+      control_mode_seen_ = true;
+      autonomous_ = auto_now;
+    });
+  launch_no_recovery_sec_ = declare_parameter<double>("launch_no_recovery_sec", 8.0);
   // Start前のグリッド待機はスタックではない。状態はlatched配信なので、ノードが。
   race_state_sub_ = create_subscription<std_msgs::msg::String>(
-    "/awsim/state", rclcpp::QoS(1).transient_local().reliable(),
+    "/awsim/state", rclcpp::QoS(10),
     [this](const std_msgs::msg::String::ConstSharedPtr msg) {
-      if (!race_started_ && msg->data == "Start") {
+      // 安全ゲートは Start を出さず Grounded で走り出す。実移動を観測するまで判定しないので待機中は安全。
+      if (!race_started_ && (msg->data == "Start" || msg->data == "Grounded")) {
         race_started_ = true;
         moving_observed_ = false;
         stuck_start_time_.reset();
@@ -1158,7 +1201,7 @@ void StuckRecoveryController::onNominalCommand(
       wall_ban_acted_ = true;
       wall_ban_acted_seq_ = plan_seq_;
       wall_ban_acted_at_ = tnow;
-      if (!recovery_start_time_.has_value() && !in_cooldown) {
+      if (!recovery_start_time_.has_value() && !in_cooldown && !(launch_moving_since_.has_value() && (now - launch_moving_since_.value()).seconds() < launch_no_recovery_sec_)) {
         RCLCPP_WARN(get_logger(),
           "壁前進禁止が前進を止めた。前進が塞がれているとみて復帰を始める");
         stuck_start_time_.reset();
@@ -1329,6 +1372,17 @@ void StuckRecoveryController::updateStuckDetection(
 {
   const float velocity = latest_velocity_;
   logV2XSelfOffset();   // V2X の基準点を実測する(2秒に1回)
+  // MANUAL 中(実機)は判定しない。復帰中なら打ち切る。
+  if (control_mode_seen_ && !autonomous_) {
+    if (recovery_start_time_.has_value()) { finishRecovery(now, "MANUAL"); }
+    moving_observed_ = false;
+    stuck_start_time_.reset();
+    blocked_vehicle_start_time_.reset();
+    healthy_wait_since_.reset();
+    entry_ref_valid_ = false;
+    pre_steer_valid_ = false;
+    return;
+  }
   // Ready中は指令値・近接車・経過時間にかかわらず復帰状態を作らない。
   if (!race_started_) {
     moving_observed_ = false;
@@ -1341,6 +1395,10 @@ void StuckRecoveryController::updateStuckDetection(
   }
   // Require movement once to avoid detecting the initial stationary state as stuck.
   if (velocity >= kMovingSpeedThreshold) {
+    if (!moving_observed_) {
+      launch_moving_since_ = now;
+      RCLCPP_INFO(get_logger(), "発進を観測。%.1f 秒間は復帰を始めない", launch_no_recovery_sec_);
+    }
     moving_observed_ = true;
   }
   // 動けているなら手詰まりではない。計時を落とす。
@@ -1498,6 +1556,15 @@ void StuckRecoveryController::updateStuckDetection(
       // 復帰直後は通常制御に発進の機会を与える。
       if (recovery_end_time_ &&
           (now - recovery_end_time_.value()).seconds() < kCooldownSec) {
+        return;
+      }
+      // 発進から launch_no_recovery_sec 秒は復帰を始めない(スタート直後の誤起動対策)。
+      if ((launch_moving_since_.has_value() && (now - launch_moving_since_.value()).seconds() < launch_no_recovery_sec_)) {
+        if ((now - last_launch_hold_log_).seconds() > 1.0) {
+          last_launch_hold_log_ = now;
+          RCLCPP_INFO(get_logger(), "発進から%.1fs: 復帰の開始を見送る(%.1fs まで)",
+            (now - launch_moving_since_.value()).seconds(), launch_no_recovery_sec_);
+        }
         return;
       }
       // **代入の前に**「既に復帰中だったか」を控える(順序が逆だと必ず真になる)
@@ -2767,8 +2834,18 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
       return true;
     }
   }
+  // AWSIM は速度指令を使わず加速度だけを見る。一定の加速度を出し続けると速度が
+  // 上がり続ける(4台レースで復帰の前進が 5m/s に達し、舵を振ったまま壁へ衝突)。
+  // simple_speed に達したら踏むのをやめ、超えたら制動する。
+  double simple_a = simple_accel_;
+  const double v_abs_now = std::abs(latest_velocity_);
+  if (v_abs_now > simple_speed_ + 0.3) {
+    simple_a = kBrakeAccel;
+  } else if (v_abs_now >= simple_speed_) {
+    simple_a = 0.0;
+  }
   publishCommand(static_cast<float>(forward ? simple_speed_ : -simple_speed_),
-                 static_cast<float>(simple_accel_), st_cmd);
+                 static_cast<float>(simple_a), st_cmd);
   if ((now - last_simple_log_).seconds() > 0.5) {
     last_simple_log_ = now;
     RCLCPP_INFO(get_logger(),
@@ -3295,6 +3372,9 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
       pt.longitudinal_velocity_mps =
           static_cast<float>(recovery_speed_ * w + vt * (1.0 - w));
     }
+    // 復帰中の経路は全区間を recovery_speed 以下にする(先頭の合流区間だけでなく)。
+    pt.longitudinal_velocity_mps =
+        std::min(pt.longitudinal_velocity_mps, static_cast<float>(recovery_speed_));
     out.points.push_back(pt);
   }
   publishRecoveryPathMarker(from);

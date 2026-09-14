@@ -27,6 +27,7 @@ V2XOvertaker::V2XOvertaker()
   contact_log_hold_(declare_parameter<double>("contact_log_hold", 6.0)),
   avoid_range_(declare_parameter<double>("avoid_range", 8.0)),
   collision_radius_(declare_parameter<double>("collision_radius", 1.7)),
+  avoid_min_lon_(declare_parameter<double>("avoid_min_lon", 2.1)),
   ttc_threshold_(declare_parameter<double>("ttc_threshold", 1.0)),
   big_gap_closing_(declare_parameter<double>("big_gap_closing", 5.0)),
   inside_time_gain_(declare_parameter<double>("inside_time_gain", 1.4)),
@@ -1047,12 +1048,51 @@ V2XOvertaker::V2XOvertaker()
         is_boosting_ = m->data[6] > 0.5f;
       }
     });
+  // 実機では /awsim/state が配信されない。起動時点でレース中とみなす。
+  // 発進制御の時間窓は launch_motion_since_(実移動の観測)から数えるので影響しない。
+  if (declare_parameter<bool>("assume_race_started", false)) {
+    race_started_ = true;
+    race_start_time_ = this->now().seconds();
+    launch_since_ = race_start_time_;
+    RCLCPP_INFO(get_logger(), "assume_race_started: /awsim/state を待たずにレース中とみなす");
+  }
+  stopped_pad_relax_ = declare_parameter<bool>("stopped_pad_relax", false);
+  // 走行中のパラメータ調整(ten_tune_tui から ros2 param set で変える)。
+  ten_param_cb_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & ps) {
+      rcl_interfaces::msg::SetParametersResult r;
+      r.successful = true;
+      for (const auto & p : ps) {
+        const auto & n = p.get_name();
+        const auto t = p.get_type();
+        const bool numeric = t == rclcpp::ParameterType::PARAMETER_DOUBLE ||
+                             t == rclcpp::ParameterType::PARAMETER_INTEGER;
+        if (!numeric) { continue; }
+        const double v = (t == rclcpp::ParameterType::PARAMETER_INTEGER)
+                           ? static_cast<double>(p.as_int()) : p.as_double();
+        if (n == "size_pad") { size_pad_ = v; }
+        if (n == "stopped_size_pad") { stopped_size_pad_ = v; }
+        if (n == "corridor_safety") { corridor_safety_ = v; }
+        if (n == "corridor_safety_pass") { corridor_safety_pass_ = v; }
+        if (n == "corridor_safety_zone") { corridor_safety_zone_ = v; }
+        if (n == "wall_margin") { wall_margin_ = v; }
+        if (n == "pass_wall_keep") { pass_wall_keep_ = v; }
+        if (n == "pass_gap_margin") { pass_gap_margin_ = v; }
+        if (n == "follow_keep_gap") { follow_keep_gap_ = v; }
+        if (n == "stop_margin") { stop_margin_ = v; }
+        if (n == "avoid_range") { avoid_range_ = v; }
+        if (n == "stopped_look_ahead") { stopped_look_ahead_ = v; }
+        if (n == "min_pass_width") { min_pass_width_ = v; }
+      }
+      return r;
+    });
   // レース開始の検知。AWSIM は latch(transient_local) で流すので合わせる。
   sub_state_ = create_subscription<std_msgs::msg::String>(
     "/awsim/state",
-    rclcpp::QoS(1).transient_local().reliable(),
+    rclcpp::QoS(10),
     [this](const std_msgs::msg::String::SharedPtr m) {
-      if (!race_started_ && m->data == "Start") {
+      // 安全ゲートは Start を出さず Grounded で走り出す(公式 autostart_orchestrator も Grounded で開始)。
+      if (!race_started_ && (m->data == "Start" || m->data == "Grounded")) {
         race_started_ = true;
         race_start_time_ = this->now().seconds();
         launch_since_ = race_start_time_;
@@ -7123,7 +7163,8 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       double best_w = -1.0, best_a = 0.0, best_b = 0.0;
       int group = 0;          // 2段探索の外で持つ(下のログが使う)
       bool occ_pad = true;
-      for (int occ_pass = 0; occ_pass < 2; ++occ_pass) {
+      // 停止車の余裕は外さない(stopped_pad_relax=false)。帯が無ければ手前で止まる。
+      for (int occ_pass = 0; occ_pass < (stopped_pad_relax_ ? 2 : 1); ++occ_pass) {
       occ_pad = (occ_pass == 0);
       best_w = -1.0; best_a = 0.0; best_b = 0.0;
       std::vector<std::pair<double, double>> blocked;
@@ -7408,6 +7449,11 @@ void V2XOvertaker::avoidCollision(const Frame & f, PlanCtx & c)
         const double fl = std::hypot(fx, fy);
         if (fl > 1e-9) { fx /= fl; fy /= fl; }
         if (dx * fx + dy * fy < -kRearIgnore) { continue; }
+        // 縦に重なっている(真横に並んでいる)車は正面衝突の相手ではない。
+        // 距離が collision_radius より近いと TTC が負になり、同じ向きに並走している
+        // だけの車を「止まれない正面衝突」とみなして壁側へ押していた(4台レースの
+        // スタートで P3 が壁に接触)。真横の相手は並走の層(追突防止・車体ガード)が扱う。
+        if (dx * fx + dy * fy < avoid_min_lon_) { continue; }
       }
       const size_t oi2 = nearest(in, o.x, o.y);
       double nx2, ny2;
