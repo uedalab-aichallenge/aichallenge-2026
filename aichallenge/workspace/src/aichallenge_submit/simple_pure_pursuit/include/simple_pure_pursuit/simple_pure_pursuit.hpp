@@ -14,7 +14,9 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <optional>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 namespace simple_pure_pursuit {
 
@@ -49,28 +51,28 @@ class SimplePurePursuit : public rclcpp::Node {
 
 
   // pure pursuit parameters
-  const double wheel_base_;
+  double wheel_base_;
   double lookahead_gain_;
   double lookahead_min_distance_;
   double speed_proportional_gain_;
-  const bool use_external_target_vel_;
-  const double external_target_vel_;
+  bool use_external_target_vel_;
+  double external_target_vel_;
   double steering_tire_angle_gain_;
   // ラインから離れているときに lookahead を伸ばす係数(横ずれ e に対し e*gain)
-  const double lookahead_cte_gain_;
+  double lookahead_cte_gain_;
   // 低速時だけ曲率と速度で lookahead に上限を掛ける。
   // 基準速度以上では変更しない。
-  const double lookahead_slow_speed_;   // これ[m/s]以上なら従来どおり
-  const double lookahead_curve_k_;      // 上限 = 曲率半径 x この係数
-  const double lookahead_slow_min_;     // 縮めすぎ防止の下限[m]
-  const double lookahead_slow_exp_;     // 低速での縮め方の鋭さ(指数)
+  double lookahead_slow_speed_;   // これ[m/s]以上なら従来どおり
+  double lookahead_curve_k_;      // 上限 = 曲率半径 x この係数
+  double lookahead_slow_min_;     // 縮めすぎ防止の下限[m]
+  double lookahead_slow_exp_;     // 低速での縮め方の鋭さ(指数)
   // 追い越し試行中は目標点を近づける。横にずらした軌道へ素早く追従させるため。
-  const double lookahead_overtake_scale_;
+  double lookahead_overtake_scale_;
   bool overtaking_{false};
   double overtake_scale_now_{1.0};   // なましてから掛ける
   // 場所を指定して lookahead を縮める区間。"開始:終了:倍率" をカンマ区切り。
   // 区間指定は、曲率だけでは不要な区間まで縮めて発振し得るために使う。
-  const std::string lookahead_zone_spec_;
+  std::string lookahead_zone_spec_;
   struct LookaheadZone { std::size_t from; std::size_t to; double scale; };
   std::vector<LookaheadZone> lookahead_zones_;
   double lookahead_scale_now_{1.0};
@@ -88,17 +90,17 @@ class SimplePurePursuit : public rclcpp::Node {
   rclcpp::Time last_steer_diag_log_{0, 0, RCL_ROS_TIME};
   double prev_requested_steer_{0.0};
   static constexpr double kScaleSmooth = 0.08;   // なまし係数(1周期あたり)
-  const double lookahead_curve_ahead_;
+  double lookahead_curve_ahead_;
   // 自車の少し先の軌道の曲率半径[m]を返す。取れなければ大きな値
   double localTurnRadius(size_t closest_idx) const;
   // 低速時の操舵角制限(スタート時の振られ対策)
-  const double start_steer_speed_;   // この速度[m/s]未満で制限を掛ける
-  const double start_steer_limit_;   // 停止時の操舵角上限[rad]
-  const double stuck_steer_free_speed_;  // これ未満の速度では制限を外す(壁からの脱出用)
-  const bool sat_accel_guard_;    // 舵が飽和している間は前へ加速しない
-  const double sat_steer_rad_;    // 実舵の上限[rad](実測 0.31 = 18deg)
-  const double sat_accel_max_;    // そのときに許す最大加速度
-  const double sat_guard_min_speed_; // この速度[m/s]以下ではガードを効かせない
+  double start_steer_speed_;   // この速度[m/s]未満で制限を掛ける
+  double start_steer_limit_;   // 停止時の操舵角上限[rad]
+  double stuck_steer_free_speed_;  // これ未満の速度では制限を外す(壁からの脱出用)
+  bool sat_accel_guard_;    // 舵が飽和している間は前へ加速しない
+  double sat_steer_rad_;    // 実舵の上限[rad](実測 0.31 = 18deg)
+  double sat_accel_max_;    // そのときに許す最大加速度
+  double sat_guard_min_speed_; // この速度[m/s]以下ではガードを効かせない
   rclcpp::Time last_sat_log_{0, 0, RCL_ROS_TIME};
   double max_acceleration_;
   // --- 壁ガードによる舵角クランプ(最終手段の安全網)
@@ -106,8 +108,12 @@ class SimplePurePursuit : public rclcpp::Node {
   // 「壁に当たらない舵角の範囲」で、計算した舵角を最後にクランプする。
   // フェイルオープン: メッセージが来ない / 古い / 無効化されている場合は
   // 一切クランプしない(安全網の不具合で操縦不能になるほうが危険)。
-  const bool wall_guard_clamp_enable_;   // 丸ごと無効化する
-  const double wall_guard_stale_sec_;    // これ[s]以上古い制限は使わない
+  bool wall_guard_clamp_enable_;   // 丸ごと無効化する
+  double wall_guard_stale_sec_;    // これ[s]以上古い制限は使わない
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+    parameter_callback_handle_;
+  mutable std::mutex parameters_mutex_;
 
 
  private:
@@ -115,6 +121,8 @@ class SimplePurePursuit : public rclcpp::Node {
   bool subscribeMessageAvailable();
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr ten_param_cb_;
   double speed_scale_{1.0};   // 走行ラインの目標速度に掛ける倍率(実機で調整)
+  rcl_interfaces::msg::SetParametersResult onParameterSet(
+    const std::vector<rclcpp::Parameter> & parameters);
 };
 
 }  // namespace simple_pure_pursuit

@@ -6,8 +6,11 @@
 #include <tf2/utils.h>
 
 #include <algorithm>
+#include <cctype>
 #include <sstream>
+#include <functional>
 #include <string>
+#include <utility>
 
 namespace reverse_pure_pursuit
 {
@@ -15,6 +18,114 @@ namespace reverse_pure_pursuit
 using motion_utils::findNearestIndex;
 using tier4_autoware_utils::calcLateralDeviation;
 using tier4_autoware_utils::calcYawDeviation;
+
+namespace
+{
+
+std::string trim(const std::string & value)
+{
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return "";
+  }
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+bool parseLookaheadZones(
+  const std::string & spec,
+  std::vector<ReversePurePursuit::LookaheadZone> & zones,
+  std::string & reason)
+{
+  zones.clear();
+  if (spec.empty()) {
+    return true;
+  }
+
+  std::stringstream ss(spec);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item = trim(item);
+    const auto first_colon = item.find(':');
+    const auto second_colon = item.find(':', first_colon == std::string::npos ? 0 : first_colon + 1);
+    if (item.empty() || first_colon == std::string::npos || second_colon == std::string::npos ||
+        item.find(':', second_colon + 1) != std::string::npos) {
+      reason = "expected comma-separated from:to:scale entries";
+      return false;
+    }
+
+    const auto from_text = trim(item.substr(0, first_colon));
+    const auto to_text = trim(item.substr(first_colon + 1, second_colon - first_colon - 1));
+    const auto scale_text = trim(item.substr(second_colon + 1));
+    if (from_text.empty() || to_text.empty() || scale_text.empty() ||
+        !std::all_of(from_text.begin(), from_text.end(), [](const char c) {
+          return std::isdigit(static_cast<unsigned char>(c)) != 0;
+        }) ||
+        !std::all_of(to_text.begin(), to_text.end(), [](const char c) {
+          return std::isdigit(static_cast<unsigned char>(c)) != 0;
+        })) {
+      reason = "zone indices must be unsigned integers";
+      return false;
+    }
+
+    try {
+      std::size_t from_consumed = 0;
+      std::size_t to_consumed = 0;
+      std::size_t from = static_cast<std::size_t>(std::stoull(from_text, &from_consumed));
+      std::size_t to = static_cast<std::size_t>(std::stoull(to_text, &to_consumed));
+      const double scale = std::stod(scale_text);
+      if (from_consumed != from_text.size() || to_consumed != to_text.size() ||
+          !std::isfinite(scale) || from > to || scale <= 0.0 || scale > 1000.0) {
+        reason = "zone range or scale is invalid";
+        return false;
+      }
+      zones.push_back({from, to, scale});
+    } catch (const std::exception &) {
+      reason = "zone index or scale is out of range";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool readNumericParameter(const rclcpp::Parameter & parameter, double & value)
+{
+  try {
+    if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      value = parameter.as_double();
+    } else if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+      value = static_cast<double>(parameter.as_int());
+    } else {
+      return false;
+    }
+  } catch (const std::exception &) {
+    return false;
+  }
+  return std::isfinite(value);
+}
+
+bool readBoolParameter(const rclcpp::Parameter & parameter, bool & value)
+{
+  try {
+    if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
+      return false;
+    }
+    value = parameter.as_bool();
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
+}
+
+rcl_interfaces::msg::SetParametersResult rejectParameter(const std::string & reason)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = false;
+  result.reason = reason;
+  return result;
+}
+
+}  // namespace
 
 ReversePurePursuit::ReversePurePursuit()
 : Node("reverse_pure_pursuit"),
@@ -52,18 +163,14 @@ ReversePurePursuit::ReversePurePursuit()
 {
   // "165:185:0.35,10:20:0.5" の形を解析する
   {
-    std::stringstream ss(lookahead_zone_spec_);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-      std::size_t a = item.find(':');
-      std::size_t b = item.rfind(':');
-      if (a == std::string::npos || b == a) { continue; }
-      LookaheadZone z;
-      z.from = static_cast<std::size_t>(std::stoul(item.substr(0, a)));
-      z.to = static_cast<std::size_t>(std::stoul(item.substr(a + 1, b - a - 1)));
-      z.scale = std::stod(item.substr(b + 1));
-      lookahead_zones_.push_back(z);
-      RCLCPP_INFO(get_logger(), "lookahead 縮小区間 idx%zu-%zu x%.2f", z.from, z.to, z.scale);
+    std::string zone_reason;
+    if (!parseLookaheadZones(lookahead_zone_spec_, lookahead_zones_, zone_reason)) {
+      RCLCPP_ERROR(get_logger(), "invalid lookahead_scale_zones: %s", zone_reason.c_str());
+      lookahead_zone_spec_.clear();
+    }
+    for (const auto & zone : lookahead_zones_) {
+      RCLCPP_INFO(
+        get_logger(), "lookahead 縮小区間 idx%zu-%zu x%.2f", zone.from, zone.to, zone.scale);
     }
   }
   pub_cmd_ = create_publisher<AckermannControlCommand>("output/control_cmd", 1);
@@ -82,6 +189,8 @@ ReversePurePursuit::ReversePurePursuit()
 
   using namespace std::literals::chrono_literals;
   timer_ = create_wall_timer(10ms, std::bind(&ReversePurePursuit::onTimer, this));
+  parameter_callback_handle_ = add_on_set_parameters_callback(
+    std::bind(&ReversePurePursuit::onParameterSet, this, std::placeholders::_1));
 }
 
 AckermannControlCommand zeroAckermannControlCommand(rclcpp::Time stamp)
@@ -155,6 +264,7 @@ double ReversePurePursuit::localTurnRadius(size_t closest_idx) const
 
 void ReversePurePursuit::onTimer()
 {
+  std::lock_guard<std::mutex> parameter_lock(parameters_mutex_);
   // check data
   if (!subscribeMessageAvailable()) {
     return;
@@ -311,6 +421,233 @@ void ReversePurePursuit::onTimer()
   pub_cmd_->publish(cmd);
   cmd.lateral.steering_tire_angle /=  steering_tire_angle_gain_;
   pub_raw_cmd_->publish(cmd);
+}
+
+rcl_interfaces::msg::SetParametersResult ReversePurePursuit::onParameterSet(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  try {
+    std::lock_guard<std::mutex> parameter_lock(parameters_mutex_);
+
+    // Stage every value first.  Nothing is written to the live controller until all
+    // requested values and the zone specification have passed validation.
+    double wheel_base = wheel_base_;
+    double lookahead_gain = lookahead_gain_;
+    double lookahead_min_distance = lookahead_min_distance_;
+    double speed_proportional_gain = speed_proportional_gain_;
+    bool use_external_target_vel = use_external_target_vel_;
+    double external_target_vel = external_target_vel_;
+    double steering_tire_angle_gain = steering_tire_angle_gain_;
+    double lookahead_cte_gain = lookahead_cte_gain_;
+    double lookahead_curve_ref = lookahead_curve_ref_;
+    double lookahead_curve_min = lookahead_curve_min_;
+    double lookahead_slow_speed = lookahead_slow_speed_;
+    double lookahead_slow_full = lookahead_slow_full_;
+    double lookahead_curve_k = lookahead_curve_k_;
+    double lookahead_slow_min = lookahead_slow_min_;
+    double lookahead_slow_exp = lookahead_slow_exp_;
+    double lookahead_slow_far = lookahead_slow_far_;
+    double lookahead_overtake_scale = lookahead_overtake_scale_;
+    double lookahead_curve_ahead = lookahead_curve_ahead_;
+    double start_steer_speed = start_steer_speed_;
+    double start_steer_limit = start_steer_limit_;
+    double stuck_steer_free_speed = stuck_steer_free_speed_;
+    double max_acceleration = max_acceleration_;
+    double reverse_max_speed = reverse_max_speed_;
+    std::string lookahead_zone_spec = lookahead_zone_spec_;
+
+    for (const auto & parameter : parameters) {
+      const auto & name = parameter.get_name();
+      double number = 0.0;
+      if (name == "wheel_base") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("wheel_base must be numeric");
+        }
+        wheel_base = number;
+      } else if (name == "lookahead_gain") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_gain must be numeric");
+        }
+        lookahead_gain = number;
+      } else if (name == "lookahead_min_distance") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_min_distance must be numeric");
+        }
+        lookahead_min_distance = number;
+      } else if (name == "speed_proportional_gain") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("speed_proportional_gain must be numeric");
+        }
+        speed_proportional_gain = number;
+      } else if (name == "use_external_target_vel") {
+        if (!readBoolParameter(parameter, use_external_target_vel)) {
+          return rejectParameter("use_external_target_vel must be bool");
+        }
+      } else if (name == "external_target_vel") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("external_target_vel must be numeric");
+        }
+        external_target_vel = number;
+      } else if (name == "steering_tire_angle_gain") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("steering_tire_angle_gain must be numeric");
+        }
+        steering_tire_angle_gain = number;
+      } else if (name == "lookahead_cte_gain") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_cte_gain must be numeric");
+        }
+        lookahead_cte_gain = number;
+      } else if (name == "lookahead_curve_ref") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_curve_ref must be numeric");
+        }
+        lookahead_curve_ref = number;
+      } else if (name == "lookahead_curve_min") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_curve_min must be numeric");
+        }
+        lookahead_curve_min = number;
+      } else if (name == "lookahead_slow_speed") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_slow_speed must be numeric");
+        }
+        lookahead_slow_speed = number;
+      } else if (name == "lookahead_slow_full") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_slow_full must be numeric");
+        }
+        lookahead_slow_full = number;
+      } else if (name == "lookahead_curve_k") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_curve_k must be numeric");
+        }
+        lookahead_curve_k = number;
+      } else if (name == "lookahead_slow_min") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_slow_min must be numeric");
+        }
+        lookahead_slow_min = number;
+      } else if (name == "lookahead_slow_exp") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_slow_exp must be numeric");
+        }
+        lookahead_slow_exp = number;
+      } else if (name == "lookahead_slow_far") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_slow_far must be numeric");
+        }
+        lookahead_slow_far = number;
+      } else if (name == "lookahead_overtake_scale") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_overtake_scale must be numeric");
+        }
+        lookahead_overtake_scale = number;
+      } else if (name == "lookahead_scale_zones") {
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
+          return rejectParameter("lookahead_scale_zones must be a string");
+        }
+        lookahead_zone_spec = parameter.as_string();
+      } else if (name == "lookahead_curve_ahead") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("lookahead_curve_ahead must be numeric");
+        }
+        lookahead_curve_ahead = number;
+      } else if (name == "start_steer_speed") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("start_steer_speed must be numeric");
+        }
+        start_steer_speed = number;
+      } else if (name == "start_steer_limit") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("start_steer_limit must be numeric");
+        }
+        start_steer_limit = number;
+      } else if (name == "stuck_steer_free_speed") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("stuck_steer_free_speed must be numeric");
+        }
+        stuck_steer_free_speed = number;
+      } else if (name == "max_acceleration") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("max_acceleration must be numeric");
+        }
+        max_acceleration = number;
+      } else if (name == "reverse_max_speed") {
+        if (!readNumericParameter(parameter, number)) {
+          return rejectParameter("reverse_max_speed must be numeric");
+        }
+        reverse_max_speed = number;
+      }
+      // Parameters owned by another callback are intentionally ignored.
+    }
+
+    if (!(wheel_base > 0.0)) { return rejectParameter("wheel_base must be > 0"); }
+    if (lookahead_gain < 0.0) { return rejectParameter("lookahead_gain must be >= 0"); }
+    if (!(lookahead_min_distance > 0.0)) { return rejectParameter("lookahead_min_distance must be > 0"); }
+    if (speed_proportional_gain < 0.0) { return rejectParameter("speed_proportional_gain must be >= 0"); }
+    if (external_target_vel < 0.0) { return rejectParameter("external_target_vel must be >= 0"); }
+    if (!(steering_tire_angle_gain > 0.0)) { return rejectParameter("steering_tire_angle_gain must be > 0"); }
+    if (lookahead_cte_gain < 0.0) { return rejectParameter("lookahead_cte_gain must be >= 0"); }
+    if (!(lookahead_curve_ref > 0.0)) { return rejectParameter("lookahead_curve_ref must be > 0"); }
+    if (!(lookahead_curve_min > 0.0)) { return rejectParameter("lookahead_curve_min must be > 0"); }
+    if (!(lookahead_slow_speed > 0.0)) { return rejectParameter("lookahead_slow_speed must be > 0"); }
+    if (!(lookahead_slow_full > 0.0)) { return rejectParameter("lookahead_slow_full must be > 0"); }
+    if (!(lookahead_curve_k > 0.0)) { return rejectParameter("lookahead_curve_k must be > 0"); }
+    if (!(lookahead_slow_min > 0.0)) { return rejectParameter("lookahead_slow_min must be > 0"); }
+    if (!(lookahead_slow_exp > 0.0)) { return rejectParameter("lookahead_slow_exp must be > 0"); }
+    if (!(lookahead_slow_far > 0.0)) { return rejectParameter("lookahead_slow_far must be > 0"); }
+    if (!(lookahead_overtake_scale > 0.0)) { return rejectParameter("lookahead_overtake_scale must be > 0"); }
+    if (!(lookahead_curve_ahead > 0.0)) { return rejectParameter("lookahead_curve_ahead must be > 0"); }
+    if (!(start_steer_speed > 0.0)) { return rejectParameter("start_steer_speed must be > 0"); }
+    if (!(start_steer_limit > 0.0) || start_steer_limit > M_PI_2) {
+      return rejectParameter("start_steer_limit must be in (0, pi/2]");
+    }
+    if (stuck_steer_free_speed < 0.0) { return rejectParameter("stuck_steer_free_speed must be >= 0"); }
+    if (!(max_acceleration > 0.0)) { return rejectParameter("max_acceleration must be > 0"); }
+    if (!(reverse_max_speed > 0.0)) { return rejectParameter("reverse_max_speed must be > 0"); }
+
+    std::vector<LookaheadZone> lookahead_zones;
+    std::string zone_reason;
+    if (!parseLookaheadZones(lookahead_zone_spec, lookahead_zones, zone_reason)) {
+      return rejectParameter("lookahead_scale_zones: " + zone_reason);
+    }
+
+    wheel_base_ = wheel_base;
+    lookahead_gain_ = lookahead_gain;
+    lookahead_min_distance_ = lookahead_min_distance;
+    speed_proportional_gain_ = speed_proportional_gain;
+    use_external_target_vel_ = use_external_target_vel;
+    external_target_vel_ = external_target_vel;
+    steering_tire_angle_gain_ = steering_tire_angle_gain;
+    lookahead_cte_gain_ = lookahead_cte_gain;
+    lookahead_curve_ref_ = lookahead_curve_ref;
+    lookahead_curve_min_ = lookahead_curve_min;
+    lookahead_slow_speed_ = lookahead_slow_speed;
+    lookahead_slow_full_ = lookahead_slow_full;
+    lookahead_curve_k_ = lookahead_curve_k;
+    lookahead_slow_min_ = lookahead_slow_min;
+    lookahead_slow_exp_ = lookahead_slow_exp;
+    lookahead_slow_far_ = lookahead_slow_far;
+    lookahead_overtake_scale_ = lookahead_overtake_scale;
+    lookahead_zone_spec_ = lookahead_zone_spec;
+    lookahead_zones_ = std::move(lookahead_zones);
+    lookahead_curve_ahead_ = lookahead_curve_ahead;
+    start_steer_speed_ = start_steer_speed;
+    start_steer_limit_ = start_steer_limit;
+    stuck_steer_free_speed_ = stuck_steer_free_speed;
+    max_acceleration_ = max_acceleration;
+    reverse_max_speed_ = reverse_max_speed;
+  } catch (const std::exception & exception) {
+    return rejectParameter(std::string("parameter update failed: ") + exception.what());
+  } catch (...) {
+    return rejectParameter("parameter update failed with an unknown exception");
+  }
+
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+  result.reason = "accepted";
+  return result;
 }
 
 bool ReversePurePursuit::subscribeMessageAvailable()
