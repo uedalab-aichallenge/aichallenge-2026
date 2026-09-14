@@ -10,6 +10,7 @@
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>rcl_interfaces</depend>
   <depend>autoware_auto_control_msgs</depend>
   <depend>autoware_auto_planning_msgs</depend>
   <depend>motion_utils</depend>
