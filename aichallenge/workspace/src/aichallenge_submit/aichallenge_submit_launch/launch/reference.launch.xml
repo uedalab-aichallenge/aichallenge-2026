@@ -20,21 +20,19 @@
        data/ten_map/; pass raceline_file:=raceline_awsim_30km_from_garage.csv to fall back to the upstream line. -->
   <arg name="corridor_file" default="ten_map/corridor_ten.csv" description="追い越し時に使える横可動域(make_corridor.py で生成)"/>
   <arg name="rank1_corner_gain" default="1.00" description="1位のときコーナー速度に掛ける係数"/>
-  <!-- 先頭を抜いてよい残り周回数。0 でいつでも抜く。
-       同一レース内で新旧を比べるため、環境変数で車ごとに上書きできる。 -->
-  <!-- 追突防止を緩め始める横間隔[m]。車幅1.46mより下げると車体が重なる。
-       実測(2026-09-04): 追突防止が効いているときの横間隔は中央値0.83m、
-       既定1.66mに届くのは4%だけで、事実上一度も解除されていなかった。 -->
-  <!-- 試行中の横位置を「試行」が保持するか。false で 2026-09-04 以前の挙動
-       (並走した瞬間に追越の意図が消え、基準ラインへ引き戻される)。 -->
-  <!-- 側の決定の2つの修正をまとめて切り替える(A/B用)。
-       true: 録画で決めた側を曲率より優先し、側は「相手と壁の空き」で決める -->
+  <!-- 録画で決めた側を曲率より優先し、相手と壁の空きで側を決める。 -->
   <arg name="side_fix" default="$(env SIDE_FIX false)"
        description="側の決定の修正を有効にするか"/>
+  <!-- 試行中の横位置を試行状態が保持するか。 -->
   <arg name="attempt_lat_hold_enable" default="$(env ATTEMPT_LAT_HOLD false)"
        description="試行中の横位置を試行が保持するか"/>
-  <arg name="rear_end_free_min" default="$(env REAR_END_FREE_MIN 1.66)"
+  <arg name="rear_end_free_min" default="$(env REAR_END_FREE_MIN 1.45)"
        description="追突防止を緩め始める横間隔[m]"/>
+  <!-- 追突防止の解除を「縦に並ぶ時刻の予測横間隔」でも判定する。 -->
+  <arg name="rear_end_predict_release" default="$(env REAR_PREDICT true)"
+       description="追突防止の解除を予測横間隔でも判定する"/>
+  <arg name="rear_end_predict_floor" default="$(env REAR_PREDICT_FLOOR 0.35)"
+       description="真後ろ扱いにする横間隔[m](これ未満では予測解除しない)"/>
   <arg name="spot_entry_gap" default="$(env SPOT_ENTRY_GAP -1.0)"
        description="横へ出る前に取り返す縦の安全車間[m]。負で従来値"/>
   <arg name="spot_pass_len_gain" default="$(env SPOT_PASS_LEN_GAIN 1.0)"
@@ -43,44 +41,243 @@
        description="必要距離に掛ける安全率"/>
   <arg name="zone_fallback_enable" default="$(env ZONE_FALLBACK false)"
        description="予測計画が無いとき汎用ゾーンで仕掛けてよいか"/>
-  <!-- 公式オーバーテイクレーン(SIM決勝の s2r-final のみ有効)。
-       位置は AWSIM のシーンから実測: レースライン idx234-21 の右 2.15〜5.0m。
-       local_script/overtaking_zone.py で再取得できる。 -->
-  <!-- latch で「禁止区間」「側の余地なし」を越えない。玉突きの最初の1台が
-       latch で最狭部と禁止区間へ入って壁に刺さったため(2026-09-05 実測)。 -->
-  <!-- 停止車回避の判定の作り直し(壁帯を抜け切るまでの最狭で見る / 横の到達可能性 /
-       通れないのラッチ / 最大制動)。2026-09-05 実測の玉突き対策。 -->
+  <!-- 停止車回避を、壁帯の最狭幅・横到達可能性・ラッチ・最大制動で判定する。 -->
   <arg name="stop_avoid_fix" default="$(env STOP_AVOID_FIX true)"
-       description="停止車回避の判定を作り直したものを使うか"/>
-  <arg name="latch_never_no_pass" default="$(env LATCH_HARD false)"
        description="禁止区間と側の余地なしは latch で越えない"/>
-  <!-- 追突防止が前提にする制動係数。|a_min|(2.5) に掛ける。
-       実測: 強い制動を指令した窓での達成減速度は中央 1.66 m/s^2
-       (= 係数 0.66 相当)。既定 0.22 は 0.55 m/s^2 相当で3倍保守的。 -->
   <arg name="rear_end_brake_k" default="$(env REAR_END_BRAKE_K 0.22)"
        description="追突防止が前提にする制動係数(a_min に掛ける)"/>
-  <arg name="ot_lane_guard" default="$(env OT_LANE_GUARD_ON true)"
-       description="低速でオーバーテイクレーンへ入らないガード(常時有効)"/>
-  <arg name="ot_lane_enable" default="$(env OT_LANE false)"
+  <arg name="ot_lane_enable" default="$(env OT_LANE true)"
        description="公式オーバーテイクレーンを追い越しに使うか"/>
   <arg name="ot_lane_zones" default="$(env OT_LANE_ZONES 234:21)"
        description="オーバーテイクレーンの idx 範囲"/>
   <arg name="ot_lane_min_kmh" default="$(env OT_LANE_MIN 28.0)"
        description="レーンを使うのに要る自車速度[km/h]。27がルール上の閾値"/>
-
   <!-- レーンの手前から追い越しを許可する。横位置は指令から約20m先で実現するので、
        「レーンの中にいる」を条件にすると許可でレーンへ入れない循環になる。 -->
   <arg name="ot_lane_prepare" default="$(env OT_LANE_PREP true)"
        description="オーバーテイクレーンの入口手前から許可を出す"/>
   <arg name="ot_lane_prepare_look" default="$(env OT_LANE_PREP_LOOK 18.0)"
        description="入口の何m手前から許可するかの基本値"/>
-  <!-- 相手の軌道予測をモデル(走行中に相手ごとに当てはめる)で行うか。
-       false にすると録画した表だけを使う旧挙動に戻る。 -->
   <arg name="opp_model_enable" default="$(env OPP_MODEL true)"
        description="相手の走り方をモデルで予測する"/>
   <arg name="spot_all_slots" default="$(env SPOT_ALL true)"
        description="抜きどころ計画を全グリッド位置で作る(予選は slot1 だけだった)"/>
-  <!-- 車体の張り出し(内輪差)を左右別に見る。false で従来の左右対称な近似。 -->
+  <!-- PASS中の追突防止を補間して完全に解除する横間隔[m]。 -->
+  <!-- 側を決め直す区間。**開いている側が反転する点で割る**こと。 -->
+  <arg name="side_pick_zones" default="$(env SIDE_PICK_ZONES 232:241,0:20)"
+       description="側を決め直す idx 区間(反転点で割る)"/>
+  <!-- 抜き切りに使える直線の idx 区間。**side_pick_zones とは目的が違う**。
+       side_pick_zones は「開いている側が反転する点」で割ってあるので、
+       それを直線の長さとして読むと実際の直線(230-25, 約52m)を
+       40m と誤認する。ここは物理的な直線の範囲を書く。 -->
+  <arg name="pass_finish_zones" default="$(env PASS_FINISH_ZONES 230:25)"
+       description="抜き切りに使える直線の idx 区間"/>
+  <arg name="lat_lag_by_speed" default="$(env LAT_LAG_BY_SPEED true)"
+       description="横の遅れを速度に応じた距離で扱う"/>
+  <arg name="lat_lag_sec" default="$(env LAT_LAG_SEC 2.7)"
+       description="横の遅れ[s]"/>
+  <!-- 準備(横へ出始める)を開始する車間を、必要距離から決める。 -->
+  <arg name="prepare_early" default="$(env PREPARE_EARLY true)"
+  <!-- 相手の横位置の予測方式。**車ごとに振って同一レース内で比べる**。 -->
+  <arg name="lat_pred_mode" default="$(env LAT_PRED_MODE 1)"
+       description="相手の横位置の予測方式(0=学習 1=実測 2=実測+減衰)"/>
+  <!-- 直線で「左から抜こうとする」を潰す3点。 -->
+  <arg name="side_zone_end_clamp" default="$(env SIDE_ZONE_END_CLAMP true)"
+       description="側の探索窓の後端を、いまいる直線の中に収める"/>
+  <arg name="side_plan_full_scale" default="$(env SIDE_PLAN_FULL_SCALE true)"
+       description="plan_mode で窓を短縮しない(縮尺 0.85 を使わない)"/>
+  <arg name="pass_need_room_m" default="$(env PASS_NEED_ROOM_M 0.30)"
+       description="抜き切り地点で要る残余幅[m]。負なら従来の need_here"/>
+  <!-- 計画が側を決められないときの既定を「相手の反対」から**直線の幾何**へ替える。 -->
+  <!-- 助走の基準を、録画の抜きどころではなく計画の「抜き始める地点」にする。 -->
+  <arg name="runup_use_plan" default="$(env RUNUP_USE_PLAN true)"
+       description="助走の基準を計画の抜き始める地点にする"/>
+  <!-- 停止車の横を通るとき、要る横移動を「帯に入るまで」で測る。 -->
+  <arg name="stopped_band_edge" default="$(env STOPPED_BAND_EDGE true)"
+       description="停止車横の速度上限を帯の縁までで測る"/>
+  <!-- 先の閉まり方から逆算して、戻れない縁へ横目標を出さない(idx170 対策) -->
+  <arg name="reachable_lat_clamp" default="$(env REACHABLE_LAT_CLAMP true)"
+       description="戻れない縁へ横目標を出さない"/>
+  <!-- 既定の側を「相手の反対」ではなく「いま出られる余地の大きい側」で決める -->
+  <arg name="side_default_by_room" default="$(env SIDE_DEFAULT_BY_ROOM false)"
+       description="既定の側を出られる余地で決める(A/Bで負けたので既定 false)"/>
+  <!-- 加速を正しく見る。 -->
+  <arg name="runup_boost_accel" default="$(env RUNUP_BOOST_ACCEL true)"
+       description="助走の加速度にブーストぶんを足す"/>
+  <arg name="pass_dist_accel" default="$(env PASS_DIST_ACCEL true)"
+       description="抜き切り距離に加速フェーズを入れる"/>
+  <arg name="pass_boost_gate" default="$(env PASS_BOOST_GATE true)"
+       description="抜き切り計算がブーストを要ると答えたら撃つ"/>
+  <!-- 幾何の取り違えを直す。 -->
+  <arg name="occupied_real_width" default="$(env OCCUPIED_REAL_WIDTH true)"
+       description="停止車の占有帯に実寸(1.45m)を使う"/>
+  <arg name="occupied_yaw_pad" default="$(env OCCUPIED_YAW_PAD true)"
+       description="占有帯にコーナーの張り出しを足す"/>
+  <arg name="body_curve_pad" default="$(env BODY_CURVE_PAD true)"
+       description="車体の横の張り出しにコーナーの振り出しを足す"/>
+  <!-- 側の判定『相手の区間平均横』の直し。 -->
+  <arg name="side_meanlat_live" default="$(env SIDE_MEANLAT_LIVE true)"
+       description="相手の横位置にモデルではなく実測を使う"/>
+  <arg name="side_fallback_room" default="$(env SIDE_FALLBACK_ROOM true)"
+       description="相手の横だけで決める枝でも片側しか通せないなら従う"/>
+  <!-- 横間隔の床。8つの間隔のうち5つが物理の下限(0.725*2=1.45m)を。 -->
+  <arg name="sep_floor_enable" default="$(env SEP_FLOOR_ENABLE true)"
+       description="横間隔に物理の下限+余裕の床を張る"/>
+  <arg name="ot_lane_runup" default="$(env OT_LANE_RUNUP true)"
+       description="レーン入口で門(27km/h)を超えるよう助走する"/>
+  <arg name="gate_runup_charge" default="$(env GATE_RUNUP_CHARGE true)"
+       description="レーン入口までの残距離から逆算して全開にする"/>
+  <arg name="gate_runup_sidestep" default="$(env GATE_RUNUP_SIDESTEP true)"
+       description="門への助走中は横へ逃がして追突防止を外す"/>
+  <arg name="stopped_aim_edge" default="$(env STOPPED_AIM_EDGE true)"
+       description="停止車回避は帯の中央でなく手前の端を狙う"/>
+  <arg name="stopped_keep_pass_exclude" default="$(env STOPPED_KEEP_PASS_EXCLUDE false)"
+       description="true=従来どおり追い越し対象を停止車から除外"/>
+  <arg name="stop_creep_by_band" default="$(env STOP_CREEP_BY_BAND true)"
+       description="にじり出しの可否を車間でなく空き帯で決める"/>
+  <arg name="ot_lane_aim" default="$(env OT_LANE_AIM true)"
+       description="追越レーンの窓へ実際に横位置を寄せる"/>
+  <arg name="free_boost_enable" default="$(env FREE_BOOST false)"
+       description="終盤に相手が居なくてもブーストを撃つ(既定off)"/>
+  <arg name="runup_gap_hold" default="$(env RUNUP_GAP_HOLD true)"
+       description="助走の要車間をその速度を保てる車間で決める"/>
+  <arg name="runup_gap_cap" default="$(env RUNUP_GAP_CAP true)"
+       description="助走の要車間に追従の上限(8m)を掛けない"/>
+  <arg name="runup_gap_open" default="$(env RUNUP_GAP_OPEN true)"
+       description="助走中は後方に詰められても相手より少し遅くなることを許す"/>
+  <arg name="runup_accel_mps2" default="$(env RUNUP_ACCEL_MPS2 3.2)"
+       description="助走が使う加速度[m/s^2]。公式ドキュメント
+         (docs/specifications/simulator.ja.md)の駆動時最大加速度。
+         0以下で従来式(vehicle_accel*0.60)。
+         round97 は全開指令中の実測(90%点0.73)を根拠に
+         いったん 0.73 へ落としたが、ユーザー指示で公式値 3.2 に戻した。
+         実測との乖離(中央 0.28 / 90%点 0.73)は未解決のまま残るので、
+         点火が早すぎる/間に合わないと出たらまずここを疑うこと。
+         ブースト中は別途 +boost_accel(0.5、公式仕様と一致)が乗る。"/>
+  <arg name="start_gap_by_rearend" default="$(env START_GAP_REAREND true)"
+       description="追い越しの開始車間を追突防止と同じ式で出す"/>
+  <arg name="rear_end_target_release" default="$(env REAR_TARGET_RELEASE false)"
+       description="追突防止の解除を横目標でも先読み判定する"/>
+  <arg name="rear_end_lat_plan" default="$(env REAR_LAT_PLAN true)"
+       description="横の計画で回避できるなら追突防止で減速しない"/>
+  <arg name="pass_gap_clear_ratio" default="$(env PASS_GAP_CLEAR 1.0)"
+       description="相手との車体の隙間を車幅の何倍取るか(2/3)"/>
+  <arg name="predict_all_targets" default="$(env PREDICT_ALL true)"
+       description="相手の予測軌道の検査を全相手に適用する"/>
+  <arg name="gate_sidestep_after_merge" default="$(env GATE_SIDESTEP_AFTER_MERGE true)"
+       description="門への横逃がしはスタートの合流が済んでから"/>
+  <arg name="ot_lane_runup_margin_kmh" default="$(env LANE_RUNUP_MARGIN 3.5)"
+       description="助走の目標を門より何km/h上に置くか"/>
+  <arg name="runup_gate_slack_kmh" default="$(env RUNUP_GATE_SLACK 1.0)"
+       description="試算が門にこれ[km/h]まで届かなくても点火する"/>
+  <arg name="runup_fuel" default="$(env RUNUP_FUEL true)"
+       description="加速の点火距離を「車間という滑走路」から逆算する"/>
+  <arg name="runup_sim" default="$(env RUNUP_SIM true)"
+       description="点火判定を前向きシミュレーションで行う"/>
+  <arg name="ot_lane_entry_pre_m" default="$(env LANE_ENTRY_PRE 3.0)"
+       description="レーン入口の何m手前を助走の目標にするか"/>
+  <arg name="gate_runup_in_lane" default="$(env GATE_IN_LANE true)"
+       description="レーン内でも門の目標速度を保つ"/>
+  <arg name="runup_sim_opp_model" default="$(env SIM_OPP_MODEL true)"
+       description="相手の将来速度を推定モデルで出す"/>
+  <arg name="opp_accel_mps2" default="$(env OPP_ACCEL 0.8)"
+       description="相手の加速能力[m/s^2] 予測の変化率の上限"/>
+  <arg name="runup_fuel_body" default="$(env RUNUP_FUEL_BODY true)"
+       description="滑走路の計算から車体長を引く"/>
+  <arg name="gate_runup_ref_gate" default="$(env GATE_REF_GATE true)"
+       description="点火の基準をレーン入口までの距離にする"/>
+  <arg name="rear_end_sep_true" default="$(env REAR_SEP_TRUE true)"
+       description="追突防止の横間隔を自車法線への射影で正しく測る"/>
+  <arg name="normal_gap_by_rearend" default="$(env NORMAL_GAP_REAREND true)"
+       description="通常走行の目標車間も追突防止の式から逆算する"/>
+  <arg name="pre_position_sep" default="$(env PRE_POS_SEP true)"
+       description="事前寄せの下限を追突防止の解除間隔にする"/>
+  <arg name="pre_position_in_prepare" default="$(env PRE_IN_PREPARE false)"
+       description="準備中(PREPARE)でも事前寄せを続ける"/>
+  <arg name="pre_position_pass_ok" default="$(env PRE_POS_PASSOK false)"
+       description="抜けると判断している間も事前寄せを続ける"/>
+  <arg name="runup_gap_open_cmd" default="$(env RUNUP_GAP_OPEN_CMD true)"
+       description="車間を開ける処理を指令として出す"/>
+  <arg name="runup_charge_relax" default="$(env RUNUP_CHARGE_RELAX true)"
+       description="点火中は追従の安全車間を助走用に下げる"/>
+  <arg name="ot_lane_runup_look" default="$(env LANE_RUNUP_LOOK 28.0)"
+       description="助走で入口を探す距離[m]。小さいほど点火が入口に近くなる"/>
+  <arg name="ot_lane_win_safety" default="$(env LANE_WIN_SAFETY 0.15)"
+       description="レーンの窓を出すときコリドアから引く余裕[m]"/>
+  <arg name="ot_lane_aim_seek" default="$(env LANE_AIM_SEEK true)"
+       description="狙い点にレーンの窓が無ければ前方へ探す"/>
+  <arg name="pass_gap_margin" default="$(env PASS_GAP_MARGIN 0.10)"
+       description="相手の輪郭に足す安全マージン[m]"/>
+  <arg name="pass_wall_keep" default="$(env PASS_WALL_KEEP 0.25)"
+       description="壁側の帯の縁に残す量[m]"/>
+  <arg name="body_guard_enable" default="$(env BODY_GUARD true)"
+       description="実測の車体位置でコリドア/他車への食い込みを見て引き戻す"/>
+  <arg name="body_guard_react_m" default="$(env BODY_GUARD_REACT 0.0)"
+       description="この余裕[m]を切ったら引き戻す"/>
+  <arg name="body_guard_hard_m" default="$(env BODY_GUARD_HARD 0.35)"
+       description="これ以上はみ出したときだけ減速"/>
+  <arg name="body_guard_cap_kmh" default="$(env BODY_GUARD_CAP 20.0)"
+       description="はみ出している間の速度上限[km/h]"/>
+  <arg name="gate_runup_target_gate" default="$(env GATE_TARGET_GATE false)"
+       description="入口への助走の目標を門+余裕に抑える"/>
+  <arg name="gate_runup_late" default="$(env GATE_LATE false)"
+       description="加速開始点だけを門基準にする(目標は据え置き)"/>
+  <arg name="boost_only_if_decisive" default="$(env BOOST_ONLY_IF_DECISIVE true)"
+       description="ブーストが結果を変えるときだけ撃つ"/>
+  <arg name="size_pad" default="$(env SIZE_PAD 0.12)"
+       description="相手と自車を少し大きく見る余裕[m]"/>
+  <arg name="side_zone_geom_default" default="$(env SIDE_ZONE_GEOM_DEFAULT false)"
+       description="計画が決められないとき、抜き切り地点のコリドアの広い側を既定にする"/>
+  <arg name="lane_record_enable" default="$(env LANE_RECORD false)"
+       description="相手の地点ごとの録画を使う(既定off、モデルのみ使用)"/>
+  <arg name="stop_avoid_band_local" default="$(env STOP_BAND_LOCAL true)"
+       description="停止車の帯をその場所で見る"/>
+  <!-- 壁接触が集中する区間。**禁止ではなく**「相手が明確に遅いときだけ許す」。 -->
+  <arg name="caution_zones" default="$(env CAUTION_ZONES 165:175)"
+       description="遅い相手だけ追い越す区間"/>
+  <arg name="side_recheck" default="$(env SIDE_RECHECK true)"
+  <!-- 手前で抜き切れるなら、遠くの抜きどころまで経路を検査しない。 -->
+  <arg name="spot_look_local" default="$(env SPOT_LOOK_LOCAL true)"
+       description="抜き切り距離までしか経路を検査しない"/>
+  <arg name="side_by_completion" default="$(env SIDE_BY_COMPLETION true)"
+       description="抜く側を抜き切り地点の空きで決める"/>
+       description="抜き切り窓の比(0.5=後半半分を見る)"/>
+  <!-- 決め直しゾーンが変わったことを側の決め直しの契機にするか。 -->
+  <arg name="side_zone_repick" default="$(env SIDE_ZONE_REPICK false)"
+       description="区間が変わったら側を決め直す"/>
+  <arg name="side_zone_mean_split" default="$(env SIDE_ZONE_MEAN_SPLIT false)"
+       description="相手の区間平均横をいる区間の bin だけで取る"/>
+  <arg name="slow_rival_by_top" default="$(env SLOW_RIVAL_BY_TOP false)"
+       description="遅い相手の判定を区間平均の最大で行う(平均は詰まると帰還する)"/>
+  <arg name="zone_free" default="$(env ZONE_FREE false)"
+       description="ゾーンをやめ、能力計算だけで追い越しを許可する(ユーザー指示)"/>
+  <arg name="spot_w_ref" default="$(env SPOT_W_REF false)"
+       description="帯の幅判定を帯の基準に合わせる(1.5/1.8は生コリドア用の値で三重計上)"/>
+  <arg name="spot_w_ref_min" default="$(env SPOT_W_REF_MIN 0.25)"
+       description="そのときの要求幅[m]"/>
+  <arg name="slow_rival_recent" default="$(env SLOW_RIVAL_RECENT false)"
+       description="遅い相手の判定を直近1周の区間最大で行う"/>
+  <!-- 曲率のイン優先。既存の side_pick_over_curve は by_room 経由でしか効かず、。 -->
+  <arg name="curve_side_enable" default="$(env CURVE_SIDE true)"
+       description="曲率のイン優先を使う"/>
+  <arg name="curve_side_in_zone" default="$(env CURVE_SIDE_IN_ZONE true)"
+       description="側決定ゾーン(直線)でもイン優先を効かせる"/>
+  <!-- 側を「区間平均の空き」ではなく「その側が途切れず続く距離」で決める。
+       平均は、開いている側が反転する区間(この道の直線がそれ)を跨ぐと差が消える。 -->
+  <arg name="side_pick_by_run" default="$(env SIDE_PICK_RUN false)"
+       description="側を連続長で決める"/>
+  <!-- 側の選択で、相手の横位置の地図が無い地点をモデルの予測で埋めるか。
+       地図は周回1-2 でほぼ空(0〜1.1点/24)なので、埋めないと側の決め直しが走らない。 -->
+  <arg name="side_model_fill" default="$(env SIDE_MODEL_FILL true)"
+       description="側の選択で地図の穴を相手モデルで埋める"/>
+  <!-- 抜く側を相手の予測経路に沿って 40m 先まで見て決めるか。 -->
+  <arg name="band_side_lead" default="$(env BAND_SIDE_LEAD false)"
+       description="側の選択に相手の予測経路の先読みを使う"/>
+  <!-- 録画に依存しない PREPARE。決勝は相手の録画点が無いので、。 -->
+  <arg name="prepare_free_enable" default="$(env PREP_FREE true)"
+       description="録画なしで接近準備(PREPARE)に入る"/>
+  <arg name="prepare_free_gap" default="$(env PREP_GAP 20.0)"
+       description="準備を始める相手までの距離[m]"/>
   <arg name="body_margin_asym" default="$(env BODY_ASYM true)"
        description="車体の四隅から左右別に張り出しを求める"/>
   <!-- 車体が縦に重なっている相手へ横に近づく動きを禁じる。 -->
@@ -88,17 +285,29 @@
        description="壁の境界を車体が占める区間の最も狭いところで取る"/>
   <arg name="hold_side_alongside" default="$(env HOLD_ALONGSIDE true)"
        description="並走中は相手へ寄せない"/>
-  <arg name="ot_lane_inset" default="$(env OT_LANE_INSET 0.35)"
        description="レーンで狙う横位置。コリドアの右端からこれだけ内側"/>
   <arg name="ot_lane_use_zones" default="$(env OT_LANE_USE 239:17)"
        description="車体を丸ごとレーンへ入れられる区間(公式のルール区間より狭い)"/>
   <arg name="ot_lane_prepare_time" default="$(env OT_LANE_PREP_TIME 0.8)"
        description="上に足す「速度×この秒数」"/>  <arg name="ot_lane_guard_lat" default="$(env OT_LANE_GUARD 2.0)"
        description="上記未満のときレーン側(右)へ許す最大量[m]"/>
+  <!-- レーンが決めた「右」を下流の層(録画で選び直し / 抜きどころ / side_flip /。 -->
+  <arg name="side_hold_when_none" default="$(env SIDE_HOLD false)"
+       description="どちらの側も必要間隔に届かないとき横へ出ないか"/>
+  <arg name="attempt_giveup_time" default="$(env ATTEMPT_GIVEUP 0.0)"
+       description="抜けない状態がこの秒数続いたら試行を降りる。0 で無効"/>
+  <arg name="ot_lane_side_sticky" default="$(env OT_LANE_STICKY true)"
+       description="レーンで決めた側を下流に上書きさせないか"/>
+  <arg name="ot_lane_side_over_spot" default="$(env OT_LANE_OVER_SPOT true)"
+  <arg name="ot_lane_guard_geom" default="$(env OT_LANE_GUARD_GEOM true)"
+       description="低速ガードの右限に実測の幾何を使うか(false で固定値)"/>
+  <arg name="ot_lane_touch_margin" default="$(env OT_LANE_TOUCH_MARGIN 0.15)"
+       description="レーンに触れない判定へ足す余裕[m]。ヨーで横幅が増えるぶん"/>
   <arg name="ot_lane_side_right" default="$(env OT_LANE_SIDE true)"
        description="レーン内では側を右に固定するか"/>
-  <arg name="no_pass_zones" default="$(env NO_PASS_ZONES 18:30,89:95)"
+  <arg name="no_pass_zones" default="$(env NO_PASS_ZONES 89:95)"
        description="追い越し禁止区間。既定の 18:30 はレーン出口(18-21)と重なる"/>
+  <!-- 先頭を抜いてよい残り周回数。0 でいつでも抜く。 -->
   <arg name="leader_pass_last_laps" default="$(env LEADER_PASS_LAST_LAPS 0)"
        description="先頭を抜いてよい残り周回数(0で無効)"/>
   <arg name="rank2_corner_gain" default="1.00" description="2位以下のときコーナー速度に掛ける係数"/>
@@ -239,112 +448,34 @@
                    ttc_threshold=1.0s * 11.67m/s = 11.7m より短いと TTC 判定が死ぬ。
                  stopped_look_ahead: 制動距離 v^2/(2*a_min)=27.2m + stop_margin 3.0m
                    = 30.2m。既定 30.0m では余裕がゼロだった。 -->
-            <!-- スタートグリッドの座標。P1(最後尾) / P2(中間) / P3(最前列=NPC) の順。
-                 実測して記録した値(2026-08-28、ten-qual 3台):
-                   P1 = (89631.0, 43128.0) 横 +1.4  進行度 329.2
-                   P2 = (89633.0, 43131.3) 横 -2.4  進行度 330.4
-                   P3 = (89628.9, 43131.5) 横 +0.6  進行度 333.5
-                 レース開始時に自車の座標を照合して P1/P2/P3 を確定する。
-                 他車の進行度から毎回並べ替える方法は V2X の到着に依存して
-                 崩れるので、固定のグリッド座標との照合を優先する。 -->
-            <!-- 【2026-09-03】ここは3台分の座標しかない。自コード4台の検証では
-                 台数が登録数を超えるため、assignStartSlots が進行度順の
-                 フォールバックへ切り替わる(グリッド確定(進行度順) のログ)。
-                 4台のグリッド座標を固定したい場合は、そのログの実測座標を
-                 ここへ追記する。 -->
+            <!-- スタートグリッドの座標。P1からP4の順。 -->
             <param name="grid_slots"
                    value="89631.0:43128.0,89633.0:43131.3,89628.9:43131.5,89630.8:43134.9"/>
-            <!-- 【2026-09-03 実測】自コード4台(MPCなし)でシミュレータを起動し、
-                 スタート前に静止している各車の /localization/kinematic_state を読んだ値:
-                   d2 = (89633.307, 43131.176)   既存 P2 と 0.3m 以内で一致
-                   d3 = (89629.065, 43131.418)   既存 P3 と 0.3m 以内で一致
-                   d4 = (89630.776, 43134.926)   ← 4台目。最前列(y が最大)
-                 d1 は取得に失敗したが、同構成の走行ログで「自車=P1(照合 0.46m)」と
-                 出ており既存 P1 と一致することを確認済み。
-                 P1〜P3 は本番3台構成で検証済みの値をそのまま残し、P4 だけ追加した
-                 (照合しきい値は 3.0m なので 0.3m の差は影響しない)。 -->
-            <!-- 発進レーンの保持。第1段は左へ向く原因の除去(既定 true)。
-                 第2段は P1 を右へ出して MPC を即座に抜きにいく(ユーザー要望)。 -->
-            <!-- 【2026-09-03 ユーザー指示】発進時にP1が右へ寄る処理を無効化。
-                 恒久設定ではない。戻すときは true。 -->
-            <!-- 【2026-09-03 検証用・要復帰】自コード4台・MPC0台で走らせる間は
-                 NPC が居ない。既定の npc_slot=3 のままだと P3 の僚車を NPC と
-                 みなし、予測速度の上限を「遅いNPC」側で見積もる等の誤りが出る。
-                 0 はどのスロットにも一致しない。**本番提出前に 3 へ戻すこと。** -->
-            <param name="npc_slot" value="0"/>
-            <!-- 【A/B比較用 2026-09-03】壁の安全網。導入前後の成績を測るため
-                 launch から明示的に切り替えられるようにしてある。
                  occ_enable: 占有格子で舵角範囲を決める最終手段
                  wall_guard_enable: コリドアベースの横範囲/速度の制約 -->
-            <!-- 【A/B比較用 2026-09-03 夜】
-                 pass_width_dist_gain: 幅の判定を「抜き切るのに要る距離」まで
-                 伸ばす。0 で従来(look_width_ahead=20m のみ)。
-                 attempt_require_intent: 追越試行の検出に、横位置の調停で
-                 追越の意図が採用されていることを要求する。false で従来。 -->
             <!-- latch_allow_enable: latch に追い越しの許可を持たせるか。
-                 false で「latch は横位置の保持だけ」。実測で全走行時間の24.9%が
-                 latch による allow_base の迂回だった。 -->
             <param name="latch_allow_enable" value="true"/>
-            <param name="pass_width_dist_gain" value="0.0"/>
-            <param name="attempt_infeasible_time" value="0.0"/>
             <param name="attempt_require_intent" value="false"/>
             <param name="occ_enable" value="true"/>
             <param name="wall_guard_enable" value="false"/>
-            <param name="launch_p1_right" value="false"/>
-            <!-- 第3段: 発進の一発追い越し。P1・1周目・25秒以内・横間隔1.6m以上・
-                 相手はNPCのみ、という閉じた条件でだけ追従上限を外す。 -->
-            <!-- 【2026-09-03】発進の一発追い越しは「相手はNPCのみ」という条件付き。
                  自コード4台・MPC0台の検証構成ではNPCが居ないため発火せず、
                  P1限定の特別扱いだけが残る。あわせて無効化する。戻すときは true。 -->
             <param name="launch_p1_pass" value="false"/>
-            <!-- 抜き切れないまま idx18 の狭窄へ並走進入しない。禁止区間の
-                 12m手前で発進専用の横保持を解除し、通常の衝突回避へ戻す。 -->
-            <param name="launch_no_pass_guard_dist" value="12.0"/>
-            <!-- 中盤のブーストの無駄撃ち対策。実測で「停止中のMPC(相手0.0km/h)」に
-                 加速余地1.1〜1.9で撃っていた。止まっている車を抜くのに
                  ブーストは要らない。余地の下限を上げる。 -->
             <param name="boost_min_headroom" value="2.5"/>
-            <!-- 【実測 2026-08-30 / output/20260830-141528】
-                 1位でブーストを撃たせたところ、発射後10秒の窓で観測された
-                 最高速度は 24.8km/h で 25.0 を超えなかった。
-                 1位でいた期間の最速ラップも 47.2s(=25.5km/h)で上限に貼り付き。
-                 => ブーストは1位の上限を突破しない。1位で撃つのは死に資源。
                  さらに1位で撃たせると狙いが周回遅れのMPC(車間24.1m)になり、
                  順位を脅かさない相手にブーストを捨てていた。
                  よって既定(false / true)のまま抑止するのが正しい。 -->
-            <!-- 発進の検証中は計測ログを40秒まで伸ばす(既定20秒では足りない) -->
             <param name="telem_sec" value="40.0"/>
             <param name="detect_range" value="25.0"/>
             <param name="avoid_range" value="14.0"/>
             <param name="stopped_look_ahead" value="40.0"/>
-            <!-- 【2026-08-31】1.9 -> 1.75。pass_gap は「狙う間隔」だが side_fits_ の
-                 判定では余地に収まることを要求するため、実質の必要幅になっていた。
-                 実測(sepfix01)では 余地に 1.7〜1.8m あるのに 1.9 が入らず却下。
-                 接触しない下限は band_car_w=1.60 がクランプ側で保証する。 -->
-            <param name="pass_gap" value="1.75"/>
-            <!-- 【2026-08-31】2 -> 4。却下46件中13件が「相手が余地の外側に居て、
                  反対側なら 3.7m 空いているのに側を変えられない」形だった。
                  側の振れは path_rate(2.0m/s)と band_side_hold で別途抑えてある。 -->
             <param name="side_flip_max" value="4"/>
-            <!-- 【2026-08-31 実測】カートの実幅は 1.46m(半幅0.73 x2)。
-                 並走するには自車と相手の中心間隔が 1.46m 以上必要。
-                 ところが band_car_w の既定は 1.30 で、バンド(経路の最終クランプ)は
-                 相手の中心から 1.30m の位置まで自車の経路を許していた。
-                 = 16cm 重なった経路を「通れる」として出力していたことになる。
-                 min_pass_sep(既定1.15)も同じ性質で、こちらは 31cm 重なる。
                  目標間隔 pass_gap は 1.9m と安全側なのに、狭くなった瞬間に
                  この2つがクランプ側で効いて相手へ寄せてしまう。
                  実幅 1.46m + 余裕 0.14m = 1.60m に揃える。 -->
-            <param name="band_car_w" value="1.60"/>
-            <param name="min_pass_sep" value="1.60"/>
-            <!-- 計画側も追突防止の解除境界(1.66m)より広くする。
-                 ソース既定と勝利確認済みの実験条件を一致させる。 -->
-            <param name="spot_margin" value="1.80"/>
-            <param name="follow_gap" value="7.0"/>
-            <param name="offset_rate" value="1.2"/>
-            <!-- 順位別のコーナー速度係数。sweep.sh の順位別計測で最適値を決める。
-                 1.00 = 速度マップそのまま。1位は 25km/h 制限があるのでコーナーで稼ぐ余地がある。 -->
-            <!-- 【デバッグ用 2026-09-04 ユーザー指示・一時的】
                  ブーストの「最終区間用の温存」を無効化する。
                  実測: boost_reserve_final=1 で持ち球2個のため、1個目を撃った瞬間に
                  残り1となり、以後の追い越し要求が全部
@@ -352,41 +483,113 @@
                  追い越し成功18件すべてがブースト未使用。
                  **必要なときに本当に使えるかを確認するための一時設定。**
                  本番前に 1 へ戻すか、使えることを確認した上で値を決めること。 -->
-            <param name="boost_reserve_final" value="0"/>
             <param name="side_pick_over_curve" value="$(var side_fix)"/>
             <param name="side_pick_by_room" value="$(var side_fix)"/>
             <param name="side_room_use_min" value="$(var side_fix)"/>
             <param name="attempt_lat_hold_enable" value="$(var attempt_lat_hold_enable)"/>
-            <param name="rear_end_free_min" value="$(var rear_end_free_min)"/>
-            <param name="spot_entry_gap" value="$(var spot_entry_gap)"/>
             <param name="spot_pass_len_gain" value="$(var spot_pass_len_gain)"/>
             <param name="spot_need_margin" value="$(var spot_need_margin)"/>
             <param name="zone_fallback_enable" value="$(var zone_fallback_enable)"/>
             <param name="stop_avoid_fix" value="$(var stop_avoid_fix)"/>
-            <param name="latch_never_no_pass" value="$(var latch_never_no_pass)"/>
-            <param name="rear_end_brake_k" value="$(var rear_end_brake_k)"/>
-            <param name="ot_lane_guard" value="$(var ot_lane_guard)"/>
             <param name="ot_lane_enable" value="$(var ot_lane_enable)"/>
             <param name="ot_lane_zones" type="str" value="$(var ot_lane_zones)"/>
             <param name="ot_lane_min_kmh" value="$(var ot_lane_min_kmh)"/>
-            <param name="ot_lane_prepare" value="$(var ot_lane_prepare)"/>
-            <param name="ot_lane_prepare_look" value="$(var ot_lane_prepare_look)"/>
-            <param name="ot_lane_prepare_time" value="$(var ot_lane_prepare_time)"/>
-            <param name="ot_lane_inset" value="$(var ot_lane_inset)"/>
-            <param name="body_margin_asym" value="$(var body_margin_asym)"/>
-            <param name="hold_side_alongside" value="$(var hold_side_alongside)"/>
-            <param name="wall_body_span" value="$(var wall_body_span)"/>
-            <param name="ot_lane_use_zones" type="str" value="$(var ot_lane_use_zones)"/>
-            <param name="opp_model_enable" value="$(var opp_model_enable)"/>
             <param name="spot_all_slots" value="$(var spot_all_slots)"/>
+            <param name="pass_beside_sep" value="$(var pass_beside_sep)"/>
+            <param name="side_pick_zones" value="$(var side_pick_zones)"/>
+            <param name="pass_finish_zones" type="str" value="$(var pass_finish_zones)"/>
+            <param name="lat_lag_by_speed" value="$(var lat_lag_by_speed)"/>
+            <param name="lat_lag_sec" value="$(var lat_lag_sec)"/>
+            <param name="prepare_early" value="$(var prepare_early)"/>
+            <param name="lat_pred_mode" value="$(var lat_pred_mode)"/>
+            <param name="side_zone_end_clamp" value="$(var side_zone_end_clamp)"/>
+            <param name="side_plan_full_scale" value="$(var side_plan_full_scale)"/>
+            <param name="pass_need_room_m" value="$(var pass_need_room_m)"/>
+            <param name="side_zone_geom_default" value="$(var side_zone_geom_default)"/>
+            <param name="runup_use_plan" value="$(var runup_use_plan)"/>
+            <param name="side_default_by_room" value="$(var side_default_by_room)"/>
+            <param name="sep_floor_enable" value="$(var sep_floor_enable)"/>
+            <param name="ot_lane_runup" value="$(var ot_lane_runup)"/>
+            <param name="gate_runup_charge" value="$(var gate_runup_charge)"/>
+            <param name="gate_runup_sidestep" value="$(var gate_runup_sidestep)"/>
+            <param name="stopped_aim_edge" value="$(var stopped_aim_edge)"/>
+            <param name="stopped_keep_pass_exclude" value="$(var stopped_keep_pass_exclude)"/>
+            <param name="stop_creep_by_band" value="$(var stop_creep_by_band)"/>
+            <param name="ot_lane_aim" value="$(var ot_lane_aim)"/>
+            <param name="free_boost_enable" value="$(var free_boost_enable)"/>
+            <param name="runup_gap_hold" value="$(var runup_gap_hold)"/>
+            <param name="runup_gap_cap" value="$(var runup_gap_cap)"/>
+            <param name="runup_gap_open" value="$(var runup_gap_open)"/>
+            <param name="runup_accel_mps2" value="$(var runup_accel_mps2)"/>
+            <param name="start_gap_by_rearend" value="$(var start_gap_by_rearend)"/>
+            <param name="rear_end_target_release" value="$(var rear_end_target_release)"/>
+            <param name="rear_end_lat_plan" value="$(var rear_end_lat_plan)"/>
+            <param name="pass_gap_clear_ratio" value="$(var pass_gap_clear_ratio)"/>
+            <param name="predict_all_targets" value="$(var predict_all_targets)"/>
+            <param name="gate_sidestep_after_merge" value="$(var gate_sidestep_after_merge)"/>
+            <param name="ot_lane_runup_margin_kmh" value="$(var ot_lane_runup_margin_kmh)"/>
+            <param name="runup_gate_slack_kmh" value="$(var runup_gate_slack_kmh)"/>
+            <param name="runup_fuel" value="$(var runup_fuel)"/>
+            <param name="runup_sim" value="$(var runup_sim)"/>
+            <param name="ot_lane_entry_pre_m" value="$(var ot_lane_entry_pre_m)"/>
+            <param name="gate_runup_in_lane" value="$(var gate_runup_in_lane)"/>
+            <param name="runup_sim_opp_model" value="$(var runup_sim_opp_model)"/>
+            <param name="opp_accel_mps2" value="$(var opp_accel_mps2)"/>
+            <param name="runup_fuel_body" value="$(var runup_fuel_body)"/>
+            <param name="gate_runup_ref_gate" value="$(var gate_runup_ref_gate)"/>
+            <param name="rear_end_sep_true" value="$(var rear_end_sep_true)"/>
+            <param name="normal_gap_by_rearend" value="$(var normal_gap_by_rearend)"/>
+            <param name="pre_position_sep" value="$(var pre_position_sep)"/>
+            <param name="pre_position_in_prepare" value="$(var pre_position_in_prepare)"/>
+            <param name="pre_position_pass_ok" value="$(var pre_position_pass_ok)"/>
+            <param name="runup_gap_open_cmd" value="$(var runup_gap_open_cmd)"/>
+            <param name="runup_charge_relax" value="$(var runup_charge_relax)"/>
+            <param name="ot_lane_runup_look" value="$(var ot_lane_runup_look)"/>
+            <param name="ot_lane_win_safety" value="$(var ot_lane_win_safety)"/>
+            <param name="ot_lane_aim_seek" value="$(var ot_lane_aim_seek)"/>
+            <param name="pass_gap_margin" value="$(var pass_gap_margin)"/>
+            <param name="pass_wall_keep" value="$(var pass_wall_keep)"/>
+            <param name="body_guard_enable" value="$(var body_guard_enable)"/>
+            <param name="body_guard_react_m" value="$(var body_guard_react_m)"/>
+            <param name="body_guard_hard_m" value="$(var body_guard_hard_m)"/>
+            <param name="body_guard_cap_kmh" value="$(var body_guard_cap_kmh)"/>
+            <param name="gate_runup_target_gate" value="$(var gate_runup_target_gate)"/>
+            <param name="gate_runup_late" value="$(var gate_runup_late)"/>
+            <param name="boost_only_if_decisive" value="$(var boost_only_if_decisive)"/>
+            <param name="size_pad" value="$(var size_pad)"/>
+            <param name="lane_record_enable" value="$(var lane_record_enable)"/>
+            <param name="stop_avoid_band_local" value="$(var stop_avoid_band_local)"/>
+            <param name="caution_zones" type="str" value="$(var caution_zones)"/>
+            <param name="side_recheck" value="$(var side_recheck)"/>
+            <param name="spot_look_local" value="$(var spot_look_local)"/>
+            <param name="side_by_completion" value="$(var side_by_completion)"/>
+            <param name="side_completion_window" value="$(var side_completion_window)"/>
+            <param name="side_zone_repick" value="$(var side_zone_repick)"/>
+            <param name="side_zone_mean_split" value="$(var side_zone_mean_split)"/>
+            <param name="slow_rival_by_top" value="$(var slow_rival_by_top)"/>
+            <param name="zone_free" value="$(var zone_free)"/>
+            <param name="spot_w_ref" value="$(var spot_w_ref)"/>
+            <param name="spot_w_ref_min" value="$(var spot_w_ref_min)"/>
+            <param name="slow_rival_recent" value="$(var slow_rival_recent)"/>
+            <param name="curve_side_enable" value="$(var curve_side_enable)"/>
+            <param name="curve_side_in_zone" value="$(var curve_side_in_zone)"/>
+            <param name="side_pick_by_run" value="$(var side_pick_by_run)"/>
+            <param name="side_model_fill" value="$(var side_model_fill)"/>
+            <param name="band_side_lead" value="$(var band_side_lead)"/>
+            <param name="prepare_free_enable" value="$(var prepare_free_enable)"/>
+            <param name="prepare_free_gap" value="$(var prepare_free_gap)"/>
             <param name="ot_lane_guard_lat" value="$(var ot_lane_guard_lat)"/>
             <param name="ot_lane_side_right" value="$(var ot_lane_side_right)"/>
+            <param name="ot_lane_side_sticky" value="$(var ot_lane_side_sticky)"/>
+            <param name="side_hold_when_none" value="$(var side_hold_when_none)"/>
+            <param name="attempt_giveup_time" value="$(var attempt_giveup_time)"/>
+            <param name="ot_lane_side_over_spot" value="$(var ot_lane_side_over_spot)"/>
+            <param name="ot_lane_touch_margin" value="$(var ot_lane_touch_margin)"/>
+            <param name="ot_lane_guard_geom" value="$(var ot_lane_guard_geom)"/>
             <param name="no_pass_zones" type="str" value="$(var no_pass_zones)"/>
             <param name="leader_pass_last_laps" value="$(var leader_pass_last_laps)"/>
             <param name="rank1_corner_gain" value="$(var rank1_corner_gain)"/>
             <param name="rank2_corner_gain" value="$(var rank2_corner_gain)"/>
-    <!-- 抜く側を相手の予測経路に沿って決める(2026-08-31)。
-         発進区間は自動的に除外される。問題が出たら false にするだけで戻せる。 -->
     <param name="band_side_pred" value="false"/>
             <remap from="input/trajectory" to="trajectory_raw"/>
             <!-- 復帰処理が最後に入るので、ここでは中間トピックへ出す -->
@@ -403,8 +606,6 @@
            debug_gui:=false で止められる。1台につき1つ窓が出る。 -->
       <node pkg="race_debug_gui" exec="race_debug_gui_node" name="race_debug_gui"
             output="log" if="$(var debug_gui)">
-            <!-- 窓のタイトルにだけ使う「本当の」グリッド位置(ユーザーの許可)。
-                 判断には一切使わない。ローカル検証環境では ドメイン番号 = グリッド番号。 -->
             <param name="vehicle_id" value="$(env ROS_DOMAIN_ID 0)"/>
             <remap from="input/status" to="/planning/scenario_planning/v2x_status"/>
       </node>
@@ -444,8 +645,6 @@
   <group if="$(eval &quot;'$(var control_method)' == 'joycon'&quot;)">
     <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/joycon.launch.xml"/>
   </group>
-
-  <group if="$(eval &quot;'$(var control_method)' == 'rl_train'&quot;)">
     <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/rl_train.launch.xml"/>
   </group>
 
@@ -463,8 +662,6 @@
         <param from="$(find-pkg-share aichallenge_submit_launch)/config/map/lanelet2_map_loader.param.yaml" />
         <extra_arg name="use_intra_process_comms" value="false" />
       </composable_node>
-
-      <!-- map_loader::Lanelet2MapVisualizationNode -->
       <composable_node pkg="map_loader" plugin="Lanelet2MapVisualizationNode" name="lanelet2_map_visualization" namespace="">
         <remap from="input/lanelet2_map" to="vector_map" />
         <remap from="output/lanelet2_map_marker" to="vector_map_marker" />

@@ -9,30 +9,19 @@
   <let name="steering_tire_angle_gain_var" value="1.639" unless="$(var simulation)"/>
 
   <node pkg="simple_pure_pursuit" exec="simple_pure_pursuit" name="simple_pure_pursuit_node" output="screen">
+    <param name="sat_accel_guard" value="$(env SAT_ACCEL_GUARD true)"/>
     <param name="use_external_target_vel" value="false"/>
     <param name="external_target_vel" value="10.0"/>
     <param name="lookahead_gain" value="0.20"/>
     <param name="lookahead_min_distance" value="3.5"/>
-    <!-- 曲率に応じて lookahead を縮める。pure pursuit は lookahead が長いほど
-         コーナーを内側へ切り込むので、直線で有利な長さをそのままコーナーで使うと
-         壁に届く。実測(単独走行)でコース最小半径の idx82(R=4.7m)は外側の余裕が
-         0.16m しかなく、追従誤差(±0.24m)のほうが大きかった。
-         curve_ref 以上の半径で等倍、それより曲がっているほど curve_min まで縮める。 -->
-    <param name="lookahead_curve_ref" value="20.0"/>
-    <param name="lookahead_curve_min" value="0.45"/>
     <!-- 場所を指定して lookahead を縮める。"開始:終了:倍率" をカンマ区切り。
          idx165-185 は内側の余地が 0.90m しかなく、pure_pursuit が
          ラインより 1.2m 内側を通ると領域外に出る。曲率で決めると
          もっときつい idx51-65(R4.0m) 等が強く縮まって発振する。 -->
     <param name="lookahead_scale_zones" value="162:168:0.35"/>
     <param name="lookahead_curve_ahead" value="6.0"/>
-    <!-- 【A/B比較用 2026-09-03】v2x_overtaker が出す舵角範囲へのクランプ。 -->
+    <!-- 現在無効。v2x_overtakerの舵角範囲を比較するときだけ有効化する。 -->
     <param name="wall_guard_clamp_enable" value="false"/>
-    <!-- 低速で目標点を近づける処理の下限[m]。
-         【重要】ホイールベースは実測 2.14m。lookahead がこれを下回ると
-         pure pursuit の要求半径が最大舵角で到達できる半径(3.05m)を
-         下回り、舵が飽和したまま収束しない。復帰動作は低速かつ
-         ライン外なので必ずここに入る。 -->
     <param name="lookahead_slow_min" value="2.8"/>
     <param name="lookahead_slow_speed" value="2.78"/>
     <param name="lookahead_slow_exp" value="2.0"/>
@@ -51,23 +40,48 @@
     <remap from="output/control_cmd" to="/control/command/nominal_control_cmd"/>
   </node>
 
-  <!-- 公式のスタック復帰制御。nominal を素通しし、スタック検知時のみ後退で復帰する。
-       検知条件: 実速度<=0.1 m/s が 1.0 秒継続(かつ指令速度>1.0, 指令加速度>0.3)
-       復帰動作: リバース4秒 -> DRIVE 0.5秒停止 -> 通常復帰
-       出典: https://github.com/AutomotiveAIChallenge/stuck_recovery_controller -->
   <node pkg="stuck_recovery_controller" exec="stuck_recovery_controller_node"
         name="stuck_recovery_controller" output="screen">
-    <!-- 復帰の開始時点で既に壁へ食い込んでいるとき、前進を試さず後退から始める。
-         false で従来(前進を2秒試してから切り返す)。A/B 用に env で切替可。 -->
+    <param name="vehicle_id" value="d$(env ROS_DOMAIN_ID 0)"/>
     <param name="wedge_backward_first" value="$(env RECOVERY_FIX false)"/>
-    <!-- 壁へ食い込んだままの前進を禁じる(既定 on)。A/B のため車ごとに切れる。
-         運営アナウンス 2026-09-03: 実機では壁にぶつかったままアクセルを
-         踏み続けると再起不能(≒最下位)。SIM でも壁ペナルティが最大の損失。 -->
     <param name="wall_forward_ban" value="$(env WALL_FWD_BAN true)"/>
+    <!-- 復帰の最終手段(壁へ食い込んで動けないとき、舵を振って下がる)。 -->
+    <param name="desperate_enable" value="$(env DESPERATE true)"/>
+    <param name="embed_min_reverse" value="$(env EMBED_MIN_REV 0.20)"/>
+    <!-- 候補(到達可否のキネマティック判定)は有効。 -->
+    <param name="simple_stall_sec" value="$(env SIMPLE_STALL_SEC 3.0)"/>
+    <param name="simple_stall_min_m" value="$(env SIMPLE_STALL_MIN_M 0.15)"/>
+    <!-- いまの向きの候補がこの秒数続けて見つからないときだけ向きを変える(切り返しの発振防止)。 -->
+    <param name="simple_lost_confirm_sec" value="$(env SIMPLE_LOST_CONFIRM_SEC 0.5)"/>
+    <param name="plan_steer_kick" value="$(env PLAN_STEER_KICK true)"/>
+    <param name="plan_steer_kick_m" value="$(env PLAN_STEER_KICK_M 1.0)"/>
+    <param name="contact_lease_enable" value="$(env CONTACT_LEASE false)"/>
+    <param name="queue_wait_moving" value="$(env QWAIT_MOVING false)"/>
+    <!-- 完全停止のときの待ちの上限[s]。 -->
+    <param name="queue_wait_max_stopped" value="$(env QWAIT_MAX_STOPPED 4.0)"/>
+    <param name="queue_wait_front_only" value="$(env QWAIT_FRONT_ONLY true)"/>
+    <!-- 手詰まり(計画を使い切って1歩も動けない)のときにフルブレーキをやめて後退する。
+         既定 off。`desperate`(最終手段)とは別物で、あちらは触らない。 -->
+    <param name="deadlock_release_enable" value="$(env DEADLOCK_RELEASE false)"/>
+    <param name="deadlock_release_sec" value="$(env DEADLOCK_RELEASE_SEC 5.0)"/>
+    <param name="recovery_speed" value="$(env RECOVERY_SPEED 4.0)"/>
+    <param name="recovery_accel" value="$(env RECOVERY_ACCEL 1.37)"/>
+    <param name="no_plan_retry_sec" value="$(env NO_PLAN_RETRY_SEC 0.10)"/>
+    <param name="embed_forward_escape" value="$(env EMBED_FORWARD_ESCAPE true)"/>
+    <param name="guard_trust_certificate" value="$(env GUARD_TRUST_CERT true)"/>
+    <param name="steer_clamp_all" value="$(env STEER_CLAMP_ALL true)"/>
+    <param name="phase_min_sec" value="$(env PHASE_MIN_SEC 0.6)"/>
+    <param name="stopped_box_enable" value="$(env STOPPED_BOX_ENABLE true)"/>
+    <!-- 止まって壁に食い込んでいる間、到達可能壁予測の「停止」を効かせない。
+         門が自分で自分を維持して 274秒 動けなくなる問題への対策。 -->
+    <param name="reachable_guard_allow_escape" value="$(env REACHABLE_GUARD_ESCAPE true)"/>
+    <!-- 反復探索(試す->測る->効いた向きを残す)。既定 off。 -->
+    <param name="escape_probe_enable" value="$(env ESCAPE_PROBE false)"/>
     <param name="wall_forward_ban_hold" value="$(env WALL_FWD_BAN_HOLD 0.8)"/>
+    <param name="rev_gear_fix" value="$(env REV_GEAR_FIX false)"/>
+    <param name="rev_cmd_hold_sec" value="$(env REV_CMD_HOLD_SEC 0.5)"/>
     <!-- 復帰経路の計算に使う。コース境界(可動域)と他車位置から
          「後退したときに最も空いている方向」を選んで舵を当てる。 -->
-    <param name="hard_stall_dist" value="0.8"/>
     <param name="raceline_csv"
            value="$(find-pkg-share simple_trajectory_generator)/data/$(var raceline_file)"/>
     <param name="corridor_csv"
@@ -76,18 +90,7 @@
          ヘアピンで鼻先が壁に当たっている状態を表現できないため。 -->
     <param name="occupancy_grid_yaml"
            value="$(env RECOVERY_GRID $(find-pkg-share multi_purpose_mpc_ros)/env/ten_final_ver3/ten_occupancy_grid_map.yaml)"/>
-    <!-- 【撤回 2026-09-05】一時 merged_occupancy_grid_map(手編集 ∪ final_ver3)へ
-         向けたが根拠が無いので戻した。final_ver3 は MPC 用の地図で、
-         CONTROL_METHOD の既定は pure_pursuit なので**誰も使っていない**。
-         占有格子を使うのは v2x_overtaker と復帰の2つだけで、どちらも同じ
-         手編集の地図を読んでいた(矛盾は無かった)。
-         後退の原因でもなかった(後退中の記録1110点のうち食い違いは1点)。
-         RECOVERY_GRID で差し替えられるようにはしてある。 -->
-    <!-- 【重要 2026-09-05】ここは手編集の ten_occupancy_grid_map を指していた。
-         その地図には通常制御の地図では壁なのに「自由」なセルが 3872個(38.7m^2)あり、
-         復帰が「後ろは空いている」と信じて壁へ後退し続ける原因になっていた
-         (ユーザー報告「ずっと壁に向かって後退し続ける」)。
-         merged は「どちらかが壁なら壁」を取った統合地図で、手編集の意図的な閉塞は残す。 -->
+    <!-- v2x_overtakerと復帰制御が共有する占有格子。RECOVERY_GRIDで差し替え可能。 -->
     <!-- 復帰の前進区間は、指令を直接作るのではなく経路を渡して pure_pursuit に
          追従させる。通常制御への戻りが連続になり、後退に頼る量も減る。
          そのため軌道の経路にも入る(v2x_overtaker の出力を受け、
@@ -98,11 +101,6 @@
     <remap from="output/reverse_trajectory" to="/planning/scenario_planning/trajectory_reverse"/>
   </node>
 
-  <!-- 後退用 pure_pursuit(2026-08-31・ユーザー指示)。
-       復帰の後退区間を、直接の舵角指令ではなく経路追従で走らせる。
-       前軸を基準に後方の目標点を追い、舵の符号を反転する。
-       ギアは stuck_recovery_controller が持つ(こちらは出さない)。
-       最終出力は復帰ノードが中継するので、reverse 側の専用トピックへ出す。 -->
   <node pkg="reverse_pure_pursuit" exec="reverse_pure_pursuit"
         name="reverse_pure_pursuit_node" output="screen">
     <param name="lookahead_gain" value="0.0"/>

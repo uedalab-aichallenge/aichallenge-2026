@@ -19,7 +19,6 @@ using tier4_autoware_utils::calcYawDeviation;
 
 SimplePurePursuit::SimplePurePursuit()
 : Node("simple_pure_pursuit"),
-  // initialize parameters
   wheel_base_(declare_parameter<float>("wheel_base", 2.14)),
   lookahead_gain_(declare_parameter<float>("lookahead_gain", 1.0)),
   lookahead_min_distance_(declare_parameter<float>("lookahead_min_distance", 1.0)),
@@ -28,38 +27,30 @@ SimplePurePursuit::SimplePurePursuit()
   external_target_vel_(declare_parameter<float>("external_target_vel", 0.0)),
   steering_tire_angle_gain_(declare_parameter<float>("steering_tire_angle_gain", 1.0)),
   lookahead_cte_gain_(declare_parameter<float>("lookahead_cte_gain", 3.0)),
-  lookahead_curve_ref_(declare_parameter<float>("lookahead_curve_ref", 12.0)),
-  lookahead_curve_min_(declare_parameter<float>("lookahead_curve_min", 0.5)),
-  // --- 低速でだけ曲率に応じて目標点を近づける ---
-  // 既定 2.78 m/s = 10 km/h。これ以上の速度では一切変更しない。
+  // この速度[m/s]未満のコーナーで目標点を近づける。
   lookahead_slow_speed_(declare_parameter<float>("lookahead_slow_speed", 2.78)),
-  lookahead_slow_full_(declare_parameter<float>("lookahead_slow_full", 1.0)),
-  // 縮める先 = 曲率半径 x この係数。
-  // 0.8 では半径4.8mのヘアピンで 3.84m となり、基準の 3.5m より**長く**なって
-  // まったく縮まっていなかった。実際に短くなる値にする。
+  // 低速時の目標距離の上限 = 曲率半径 x この係数。
   lookahead_curve_k_(declare_parameter<float>("lookahead_curve_k", 0.35)),
   lookahead_slow_min_(declare_parameter<float>("lookahead_slow_min", 1.5)),
-  // 低速での縮め方の鋭さ。大きいほど停止に近い側で急激に短くなる。
+  // 低速時に目標距離を縮める指数。
   lookahead_slow_exp_(declare_parameter<float>("lookahead_slow_exp", 2.0)),
-  // 低速でも直線ならここまでしか縮めない[m]
-  lookahead_slow_far_(declare_parameter<float>("lookahead_slow_far", 3.0)),
-  // 追い越し試行中に lookahead へ掛ける倍率。
-  // pure pursuit は lookahead が長いほど目標線を内側へ切り込むので、
-  // 横にずらした軌道に対しては「オフセットへ届くのが遅れる」形で出る。
-  // 実測(自コード同士): 打切・失敗時の最大横間隔は 91% が車幅以上に
-  // 達しているのに一度も抜けなかった。横へ出るのが遅いぶん、
-  // 抜き切るまでに要る距離が伸びていた。試行中だけ目標点を近づける。
+  // 追い越し中に lookahead の定数項へ掛ける倍率。
   lookahead_overtake_scale_(declare_parameter<float>("lookahead_overtake_scale", 0.9)),
   lookahead_zone_spec_(declare_parameter<std::string>("lookahead_scale_zones", "")),
   lookahead_curve_ahead_(declare_parameter<float>("lookahead_curve_ahead", 6.0)),
   start_steer_speed_(declare_parameter<float>("start_steer_speed", 3.0)),
   start_steer_limit_(declare_parameter<float>("start_steer_limit", 0.21)),
   stuck_steer_free_speed_(declare_parameter<float>("stuck_steer_free_speed", 0.4)),
+  // 要求舵が実舵上限を超える間は前へ加速しない。
+  sat_accel_guard_(declare_parameter<bool>("sat_accel_guard", true)),
+  sat_steer_rad_(declare_parameter<double>("sat_steer_rad", 0.31)),
+  sat_accel_max_(declare_parameter<double>("sat_accel_max", 0.0)),
+  sat_guard_min_speed_(declare_parameter<double>("sat_guard_min_speed", 2.0)),
   max_acceleration_(declare_parameter<float>("max_acceleration", 3.0)),
   wall_guard_clamp_enable_(declare_parameter<bool>("wall_guard_clamp_enable", true)),
   wall_guard_stale_sec_(declare_parameter<float>("wall_guard_stale_sec", 0.3))
 {
-  // "165:185:0.35,10:20:0.5" の形を解析する
+  // 区間指定「開始:終了:倍率」を解析する。
   {
     std::stringstream ss(lookahead_zone_spec_);
     std::string item;
@@ -78,7 +69,7 @@ SimplePurePursuit::SimplePurePursuit()
   pub_cmd_ = create_publisher<AckermannControlCommand>("output/control_cmd", 1);
   pub_raw_cmd_ = create_publisher<AckermannControlCommand>("output/raw_control_cmd", 1);
   pub_lookahead_point_ = create_publisher<PointStamped>("/control/debug/lookahead_point", 1);
-  // 壁ガードの舵角クランプ。トピックは絶対名なので remap は要らない。
+  // 壁ガードの舵角範囲を受け取り、上書きの有無を返す。
   pub_steer_override_ = create_publisher<std_msgs::msg::Bool>(
     "/control/wall_guard/override", rclcpp::QoS(1));
   sub_steer_limit_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
@@ -87,7 +78,7 @@ SimplePurePursuit::SimplePurePursuit()
       steer_limit_lo_ = msg->vector.x;
       steer_limit_hi_ = msg->vector.y;
       steer_limit_flag_ = msg->vector.z;
-      steer_limit_time_ = this->now();   // 古さは **受信時刻** で判定する
+      steer_limit_time_ = this->now();
       steer_limit_valid_ = true;
     });
 
@@ -116,9 +107,7 @@ AckermannControlCommand zeroAckermannControlCommand(rclcpp::Time stamp)
   return cmd;
 }
 
-// 自車の少し先(lookahead_curve_ahead_ 手前まで)の軌道の曲率半径[m]を返す。
-// 3点の外接円で見る。軌道点の間隔は約2.7mなので、3点で 5m 程度の区間を見ることになる。
-// 直線では半径が発散するので、上限を切って返す。
+// 自車の先 lookahead_curve_ahead_ [m] までで最もきつい曲率半径[m]を返す(直線は上限値)。
 double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
 {
   constexpr double kStraight = 1e4;
@@ -132,8 +121,7 @@ double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
   }
   const auto at = [&](size_t i) { return pts.at(i % n).pose.position; };
 
-  // 外接円を測る点の間隔[点]。点間隔が細かいほど、隣り合う3点で測ると
-  // わずかなジグザグを曲率として拾ってしまう。約2.7m 離れた3点で測る。
+  // 外接円を測る点の間隔[点](約2.7m)。
   size_t span = 1;
   {
     double total = 0.0;
@@ -148,8 +136,6 @@ double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
     }
   }
 
-  // 現在地から curve_ahead_ [m] 先までを走査し、いちばんきつい曲率を採る。
-  // 平均を採るとコーナー入口で緩く出てしまい、縮めたい場所で縮まらない。
   double tightest = kStraight;
   double travelled = 0.0;
   for (size_t k = 0; k + 2 < n; ++k) {
@@ -166,7 +152,7 @@ double SimplePurePursuit::localTurnRadius(size_t closest_idx) const
     const double ab = std::hypot(b.x - a.x, b.y - a.y);
     const double bc = std::hypot(c.x - b.x, c.y - b.y);
     const double ca = std::hypot(a.x - c.x, a.y - c.y);
-    // 三角形の面積(外積)。潰れていれば直線とみなす。
+    // 3点がほぼ一直線なら飛ばす。
     const double cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     if (std::abs(cross) < 1e-6 || ab < 1e-6 || bc < 1e-6 || ca < 1e-6) {
       continue;
@@ -201,40 +187,16 @@ void SimplePurePursuit::onTimer()
   cmd.longitudinal.speed = target_longitudinal_vel;
   cmd.longitudinal.acceleration =
     speed_proportional_gain_ * (target_longitudinal_vel - current_longitudinal_vel);
-  // 加減速とも ±max_acceleration_ に収める。
-  // 大会ルール(OVER ペナルティ): 加速度指令の絶対値が ±3 m/s^2 を超えるか
-  // 250 Hz 以上で publish すると 2 秒間 5 km/h に制限される。
-  // 元の実装は上限側しか clamp しておらず、減速側が無制限だった
-  // (目標速度が急に下がると -6 m/s^2 級の指令が出てペナルティを踏む)。
-  // AWSIM 側は入力を ±1.37 m/s^2 に clamp するので、2.0 に抑えても性能は落ちない。
+  // 加減速を同じ上限に収める。
   cmd.longitudinal.acceleration =
     std::clamp<double>(cmd.longitudinal.acceleration, -max_acceleration_, max_acceleration_);
 
   // calc lateral control
-  //// calc lookahead distance
-  //// ラインから離れているときは lookahead を伸ばして緩やかに合流させる。
-  //// 固定 lookahead だと、横ずれ e に対して必要な操舵が asin(e/L) 相当まで
-  //// 跳ね上がり、スタートのグリッド位置(ライン外)から復帰するときに大きく行き過ぎる。
-  //// 追従できているとき(e が小さいとき)は base 側が勝つので走行中の挙動は変わらない。
+  // 横ずれが大きいときは lookahead を伸ばす。
   const double cross_track_error = std::hypot(
     closet_traj_point.pose.position.x - odometry_->pose.pose.position.x,
     closet_traj_point.pose.position.y - odometry_->pose.pose.position.y);
-  //// 曲率に応じて lookahead を縮める。
-  //// pure pursuit は lookahead が長いほどコーナーを内側へ切り込む。
-  //// 直線で有利な長い lookahead を、余裕の無いコーナーでそのまま使うと
-  //// 壁に届いてしまう。実測(単独走行)でコース最小半径の idx82(R=4.7m)は
-  //// 外側の余裕が 0.16m しかなく、追従誤差(±0.24m)のほうが大きい。
-  //// 速度による分は残し、下限側(min_distance)だけを曲率で縮める。
-  // 曲率で lookahead を縮めるのはやめた。
-  //
-  // 実測で、狙って直したいコーナー(idx165-185)の半径は 7.0m だが、
-  // コース上にはもっときつい 4.0〜4.8m のコーナーが5箇所ある。
-  // 半径で縮めると、そちらのほうが強く縮まって左右に発振する。
-  // 問題のコーナーが特別なのは半径ではなく、内側の余地が 0.90m しか
-  // ないこと。だから場所で指定する。
-  //
-  // lookahead_scale_zones = "開始:終了:倍率" をカンマ区切りで並べる。
-  // 例 "165:185:0.35" は idx165-185 で lookahead_min_distance を 0.35 倍。
+  // 指定区間では lookahead の定数項を縮める。
   double curve_scale = 1.0;
   for (const auto & z : lookahead_zones_) {
     const bool inside = (z.from <= z.to)
@@ -242,19 +204,9 @@ void SimplePurePursuit::onTimer()
                           : (closet_traj_point_idx >= z.from || closet_traj_point_idx <= z.to);
     if (inside) { curve_scale = std::min(curve_scale, z.scale); }
   }
-  // 急に切り替えると舵が跳ねるので、なまして入れる
   lookahead_scale_now_ += (curve_scale - lookahead_scale_now_) * kScaleSmooth;
   curve_scale = lookahead_scale_now_;
-  // --- 追い越し試行中は目標点を近づける(ユーザー指示)
-  //
-  // 横にずらした軌道を渡しても、lookahead が長いと遠くの点を向くので
-  // オフセットへ寄るのが遅れる。試行中だけ縮めて素早く横へ出す。
-  //
-  // 【蛇行させた初版の誤り】合成後の lookahead **全体**に 0.6 を掛けていた。
-  // 速度の項(lookahead_gain * v)まで縮むので 36km/h で 5.5m -> 3.3m と
-  // 高速域が 40% 短くなり、舵が発振して蛇行した(ユーザー報告)。
-  // **速度の項は高速での直進安定性そのもの**なので触ってはいけない。
-  // 縮めてよいのは速度に依らない項(lookahead_min_distance)だけ。
+  // 追い越し中の倍率は定数項だけに掛ける。
   {
     const double want = overtaking_ ? lookahead_overtake_scale_ : 1.0;
     overtake_scale_now_ += (want - overtake_scale_now_) * kScaleSmooth;
@@ -264,64 +216,21 @@ void SimplePurePursuit::onTimer()
       lookahead_min_distance_ * curve_scale * overtake_scale_now_,
     lookahead_cte_gain_ * cross_track_error);
 
-  // --- 低速のときだけ、曲率と現在速度で目標点を近づける(ユーザー指示)
-  //
-  // 【なぜ低速で当たるか】
-  // lookahead = max(0.20*目標速度 + 3.5, 3.0*横ずれ)。
-  // 低速では速度の項がほぼ消えるので **ほぼ 3.5m 固定**になる。
-  // R=4.7m のコーナーに対して 3.5m 先の目標点は円弧を大きく横切る位置に来るため、
-  // 車は内側へ切り込んで壁に当たる(lookahead が長いほど切り込むのは既知)。
-  // さらに一度当たると横ずれが増え、`3.0*横ずれ` の項が勝って **もっと長くなり**、
-  // いっそう切り込む。低速で何度も同じコーナーに当たるのはこの正のフィードバック。
-  //
-  // 【過去に棄却した曲率縮小との違い】
-  // 以前の実装は**全速度域**で曲率に応じて縮めたため、コース上の R=4.0-4.8m の
-  // 5箇所が強く縮まって左右に発振し棄却された(上のコメント参照)。
-  // ここは **lookahead_slow_speed(既定 10km/h)未満でだけ**効かせるので、
-  // レース速度での挙動は一切変わらない。発振した速度域には掛からない。
-  //
-  // 【なぜ curve_scale ではなく合成後に上限を掛けるか】
-  // curve_scale は max() の左側にしか効かず、**横ずれの項を抑えられない**。
-  // 当たった後は横ずれ項が勝っているので、そこを抑えないと連鎖が切れない。
+  // 低速時は速度と曲率半径から lookahead に上限を掛け、なまして適用する。
   {
     const double v_now = std::abs(current_longitudinal_vel);
     double cap = 1e9;
     if (v_now < lookahead_slow_speed_) {
       const double radius = localTurnRadius(closet_traj_point_idx);
-      // 効き方を線形から**指数関数的**に変えた(ユーザー指示)。
-      //
-      // 「一定以上の速度なら変更しない」はそのまま
-      // (lookahead_slow_speed = 2.78m/s = 10km/h 以上では何もしない)。
-      // その下では、遅くなるほど**加速度的に**目標点を近づける。
-      //
-      //   x = 0 (基準速度)  ... 1 (停止)
-      //   w = (exp(k*x) - 1) / (exp(k) - 1)     k = lookahead_slow_exp
-      // k を大きくするほど、停止に近い側で急激に短くなる。
-      // 線形(k->0 相当)では、ぶつかる直前の極低速でも十分に短くならず、
-      // 目標点が遠いまま切り込んで壁や相手に当たっていた。
-      // **距離そのものを指数関数で減衰させる**(ユーザー指示)。
-      //   x = (基準速度 - 速度)/基準速度   … 0(基準速度)〜1(停止)
-      //   倍率 = exp(-k * x)
-      // 基準速度(lookahead_slow_speed)で倍率1 = 変更なし。
-      // そこから下は速度が落ちるほど**指数関数的**に短くなる。
-      //
-      // 【初版が弱すぎた点】重み w を線形補間の係数として使っていたため、
-      // **6km/h で効果が 12% しか出ていなかった**。
-      // 指示は「6km/h くらいの低速で指数関数的に短くする」なので、
-      // 距離そのものを exp で減衰させる形に改めた。
-      // k=2.0 で 8km/h 0.67倍 / 6km/h 0.45倍 / 4km/h 0.30倍。
       const double x =
         std::clamp((lookahead_slow_speed_ - v_now) / lookahead_slow_speed_, 0.0, 1.0);
       const double k = std::max(lookahead_slow_exp_, 1e-3);
       const double by_speed = lookahead_distance * std::exp(-k * x);
-      // コーナーでは「円弧から外れない長さ」でも抑える。
-      // 短すぎると舵が発振するので下限を切る。
       const double by_curve = radius * lookahead_curve_k_;
       cap = std::max(std::min(by_speed, by_curve), lookahead_slow_min_);
     }
-    // 急に切り替えると舵が跳ねるので、なましてから掛ける。
     if (lookahead_slow_now_ > 1e8 && cap > 1e8) {
-      lookahead_slow_now_ = cap;                    // どちらも無効。そのまま
+      lookahead_slow_now_ = cap;
     } else {
       const double target = (cap > 1e8) ? lookahead_distance * 4.0 : cap;
       if (lookahead_slow_now_ > 1e8) { lookahead_slow_now_ = target; }
@@ -332,23 +241,13 @@ void SimplePurePursuit::onTimer()
     }
     lookahead_distance = std::max(lookahead_distance, lookahead_slow_min_);
   }
-  //// calc center coordinate of rear wheel
-  //// orientation.z はクォータニオンの z 成分であって yaw ではない。
-  //// ここを取り違えると基準点が最大 wheel_base/2 だけ明後日の方向へずれる。
+  // 後輪中心を yaw から求める。
   const double yaw = tf2::getYaw(odometry_->pose.pose.orientation);
   double rear_x = odometry_->pose.pose.position.x - wheel_base_ / 2.0 * std::cos(yaw);
   double rear_y = odometry_->pose.pose.position.y - wheel_base_ / 2.0 * std::sin(yaw);
-  //// search lookahead point
-  //// 閉ループ軌道では末尾で探索が尽きるため、先頭へ回り込んで探す。
-  //// 回り込まずに end() をそのまま参照すると未定義動作になり、操舵指令が壊れる。
   const auto & traj_points = trajectory_->points;
   const size_t n_points = traj_points.size();
-  // 閉ループ判定。
-  // 固定閾値(1.0m)だと点間隔より小さくなり、実際は閉じている軌道を「開いている」と
-  // 誤判定する。raceline_ten_v2 は先頭-末尾が 1.978m(=通常の点間隔)あり、
-  // その結果 idx120(最終点)で lookahead 探索が打ち切られ、
-  // lookahead 点が自車位置とほぼ同じになって舵角が -42度/900deg/s に暴れていた。
-  // 点間隔を基準にすることで、リサンプル間隔が変わっても正しく判定できる。
+  // 先頭と末尾の隙間が平均点間隔の2倍未満なら閉ループとみなし、末尾から先頭へ回り込んで探す。
   bool is_closed_loop = false;
   if (n_points > 3) {
     double span = 0.0;
@@ -361,7 +260,6 @@ void SimplePurePursuit::onTimer()
     const double end_gap = std::hypot(
       traj_points.front().pose.position.x - traj_points.back().pose.position.x,
       traj_points.front().pose.position.y - traj_points.back().pose.position.y);
-    // 先頭と末尾の隙間が「通常の点間隔の2倍」以内なら閉じているとみなす
     is_closed_loop = end_gap < mean_spacing * 2.0;
   }
 
@@ -378,7 +276,7 @@ void SimplePurePursuit::onTimer()
       break;
     }
   }
-  //// 全点が lookahead 以内（開いた軌道の終端など）のときは終端を使う
+  // 全点が lookahead 以内なら終端を使う。
   if (!lookahead_found) {
     lookahead_idx = n_points - 1;
   }
@@ -398,21 +296,13 @@ void SimplePurePursuit::onTimer()
                  yaw;
   cmd.lateral.steering_tire_angle =
     steering_tire_angle_gain_ * std::atan2(2.0 * wheel_base_ * std::sin(alpha), lookahead_distance);
+  const double requested_steer = cmd.lateral.steering_tire_angle;
 
-  // 低速時は操舵角に上限を掛ける。
-  // スタート時、車両はグリッド位置(レースラインから最大 1.3 m ずれる)に置かれる。
-  // 低速だと lookahead が最小値まで縮むため、この横ずれに対して asin(e/L) 相当の
-  // 巨大な操舵角が出て、左右に大きく振られてから復帰する挙動になっていた。
-  // 速度が乗れば lookahead も伸びて自然に収まるので、低速域だけ抑える。
-  // ヘアピンでも 24 km/h(6.7 m/s)は出ているので、通常走行には掛からない。
+  // 低速時は操舵角に上限を掛け、速度に比例して開放する。
   {
     const double v_abs = std::abs(current_longitudinal_vel);
-    // ほぼ停止しているときは制限を外す。
-    // 壁に当たって止まった状態では、脱出のために大きく切る必要がある。
-    // ここを制限したままにすると舵角が上限に張り付き、いつまでも抜け出せない
-    // (実際に d1 が 46 回リカバリーを繰り返してスタート地点から動けなくなった)。
+    // ほぼ停止しているときは制限しない。
     if (v_abs > stuck_steer_free_speed_ && v_abs < start_steer_speed_) {
-      // 停止時 start_steer_limit_ から、しきい速度で通常制限まで線形に開放する
       const double ratio = (start_steer_speed_ > 1e-6) ? (v_abs / start_steer_speed_) : 1.0;
       const double limit = start_steer_limit_ + ratio * (M_PI_2 - start_steer_limit_);
       cmd.lateral.steering_tire_angle =
@@ -420,13 +310,7 @@ void SimplePurePursuit::onTimer()
     }
   }
 
-  // --- 壁ガードによる舵角クランプ(最終手段の安全網)
-  // v2x_overtaker が「壁に当たらない舵角の範囲」を流してくる。ここは
-  // steering_tire_angle_gain_ を掛けたあとの物理的な舵角なので、
-  // gain で割る前(= この位置)でクランプする必要がある。
-  // 【フェイルオープン】無効化されている / 一度も受け取っていない /
-  // wall_guard_stale_sec_ 以上古い / 範囲が無効(lo > hi, 非有限)の場合は
-  // **一切クランプしない**。安全網が死んだときに操舵が固まるほうが危険。
+  // 壁ガードの舵角範囲でクランプする。無効・未受信・古い・範囲不正のときはクランプしない。
   {
     bool override_active = false;
     if (wall_guard_clamp_enable_ && steer_limit_valid_) {
@@ -451,10 +335,53 @@ void SimplePurePursuit::onTimer()
         }
       }
     }
-    // 上書きしたかどうかを v2x_overtaker へ返す(処理の中への通知)。
     std_msgs::msg::Bool ov;
     ov.data = override_active;
     pub_steer_override_->publish(ov);
+  }
+
+  // 大舵または急反転時に、目標点と最終舵を記録する。
+  const bool large_steer = std::abs(requested_steer) > 25.0 * M_PI / 180.0;
+  const bool sharp_reversal = requested_steer * prev_requested_steer_ < 0.0 &&
+    std::abs(requested_steer - prev_requested_steer_) > 20.0 * M_PI / 180.0;
+  if ((large_steer || sharp_reversal) &&
+      (this->now() - last_steer_diag_log_).seconds() > 0.25)
+  {
+    last_steer_diag_log_ = this->now();
+    RCLCPP_WARN(get_logger(),
+      "操舵診断 nearest=%zu lookahead=%zu 距離=%.2fm alpha=%+.1fdeg "
+      "要求=%+.1fdeg 前回=%+.1fdeg 最終=%+.1fdeg 速度=%.1fkm/h "
+      "追越=%d 曲率倍率=%.2f 目標=(%.2f,%.2f)",
+      closet_traj_point_idx, lookahead_idx, lookahead_distance,
+      alpha * 180.0 / M_PI, requested_steer * 180.0 / M_PI,
+      prev_requested_steer_ * 180.0 / M_PI,
+      static_cast<double>(cmd.lateral.steering_tire_angle) * 180.0 / M_PI,
+      current_longitudinal_vel * 3.6, overtaking_ ? 1 : 0,
+      lookahead_scale_now_, lookahead_point_x, lookahead_point_y);
+  }
+  prev_requested_steer_ = requested_steer;
+
+  // 要求舵が実舵上限を超えている間は前向きの加速度を抑える。
+  if (sat_accel_guard_) {
+    const double v_abs_for_guard = std::abs(current_longitudinal_vel);
+    const double phys =
+      std::abs(static_cast<double>(cmd.lateral.steering_tire_angle)) /
+      std::max(static_cast<double>(steering_tire_angle_gain_), 1e-6);
+    // sat_guard_min_speed_ 未満では効かせない。
+    if (v_abs_for_guard > sat_guard_min_speed_ &&
+        phys > sat_steer_rad_ && cmd.longitudinal.acceleration > sat_accel_max_) {
+      const double before = cmd.longitudinal.acceleration;
+      cmd.longitudinal.acceleration = static_cast<float>(sat_accel_max_);
+      const auto tnow = this->now();
+      if ((tnow - last_sat_log_).seconds() > 1.0) {
+        last_sat_log_ = tnow;
+        RCLCPP_WARN(get_logger(),
+          "舵が飽和しているので加速を抑える 要求実舵%.1fdeg(上限%.1f) "
+          "加速度 %.2f -> %.2f 自車%.1fkm/h",
+          phys * 180.0 / M_PI, sat_steer_rad_ * 180.0 / M_PI,
+          before, cmd.longitudinal.acceleration, current_longitudinal_vel * 3.6);
+      }
+    }
   }
 
   pub_cmd_->publish(cmd);

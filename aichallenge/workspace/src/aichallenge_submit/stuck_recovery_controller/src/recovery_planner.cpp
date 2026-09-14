@@ -112,12 +112,6 @@ double localRadius(const Corridor & c, std::size_t idx, std::size_t span)
   return ab * bc * ca / (2.0 * area2);
 }
 
-// 目標地点 gi を速度 v_end で通過したあと、共通の評価地点まで走るのに要る時間[s]。
-//
-// 【なぜ要るか】ユーザー指摘「後退を減らすと大きく回転して逆に速度が落ちる」。
-// 復帰の経路だけを比べると「短く済む経路」が勝つが、**復帰した地点と
-// そのときの速度**で、その後の走りが決まる。共通の地点までの時間で比べれば、
-// 大きく回頭して速度を失う経路は自動的に負ける。
 double tailTime(const Corridor & c, std::size_t start_idx, std::size_t gi,
                 double v_end, const GoalPlanParams & prm)
 {
@@ -218,15 +212,6 @@ bool ObstacleMap::load(const std::string & yaml_path)
 
   // make_corridor.py と同じ判定にそろえる(白 > 200 を走行可能とみなす)
   const float kInf = 1e12f;
-  // 距離場を2つ作る。走行可能側からは「壁までの距離」、壁側からは
-  // 「走行可能なところまでの距離」。後者を負にして符号付き距離場にする。
-  //
-  // 片側だけだと壁の内側がすべて 0 になり、「どれだけ食い込んでいるか」を
-  // 表現できない。実測では、車が壁に触れた瞬間に食い込み量が上限
-  // (wall_margin = 0.12m)で頭打ちになり、許容量 0.27m がそれを上回って
-  // **壁を突き抜ける経路が一切棄却されなくなっていた**。
-  // その結果「後退0.75m -> 同じ舵で前進10m」が選ばれ、後退した円弧を
-  // そのまま戻って同じ壁に当たる、を繰り返していた。
   auto edt = [&](bool free_is_source) {
     std::vector<float> f(px.size());
     for (std::size_t i = 0; i < px.size(); ++i) {
@@ -308,20 +293,41 @@ bool Corridor::locate(double px, double py, std::size_t & idx, double & lat) con
 namespace
 {
 
-// 他車を円で近似したときの半径[m]。車体半幅 0.65 + 余裕 0.35。
-//
-// 【1.00 -> 1.49 に拡大】実車は全長約2.6m×全幅約1.46mで、半径1.00mの円では
-// 車体を包みきれていなかった(対角半径 sqrt(1.30^2+0.73^2)=1.49m で初めて包む)。
-// 向き(ヨー)を使って楕円などで近似しない理由: v2x で配られるのは相手の位置だけで
-// 向きは無い。速度ベクトルから向きを推定する案もあるが、スタックした車は他車に
-// 押されたりアクセルを踏み続けたりして**その場で回転する**ことがあり、
-// 速度からの向き推定はいちばん危険な場面(相手がスタックして向きが不定)で
-// 必ず外れる(ユーザー指摘)。そのため向きを使わない単一の円で安全側に包む。
-//
-// 副作用: 半径を大きくすると、相手中心が前方2.6m以内(旧)だった「初手から
-// 重なり判定になり解なしを返す」距離が3.1m(新)まで伸びる。これは plan() の
-// best_effort 引数(棄却条件を外して最も離れられる案を返す)で受ける。
-constexpr double kCarRadius = 1.49;
+// 他車を全長約2.6m×全幅約1.46mの外接円で安全側に近似する。
+
+// 停止中の相手を包む円の半径。向きが不定なので最も遠い隅までを取る。
+double stoppedCarRadius(const OpponentShape & sh)
+{
+  return std::hypot(std::max(sh.front, sh.rear), sh.half_width) + sh.margin;
+}
+
+// 点 (px,py) から、基準点 (cx,cy)・向き yaw の相手の車体矩形までの距離[m]。
+// 矩形の中なら負を返す。
+double distToOpponentBox(
+  double px, double py, double cx, double cy, double yaw, const OpponentShape & sh,
+  double extra_half_width)
+{
+  const double dx = px - cx;
+  const double dy = py - cy;
+  const double cs = std::cos(yaw), sn = std::sin(yaw);
+  // 相手の車体座標系へ回す(前方が +lx)
+  const double lx = dx * cs + dy * sn;
+  const double ly = -dx * sn + dy * cs;
+  // 基準点から前へ sh.front、後ろへ sh.rear の矩形。margin ぶん外へ広げる。
+  const double ex = std::max(lx - (sh.front + sh.margin), (-(sh.rear + sh.margin)) - lx);
+  const double ey = std::abs(ly) - (sh.half_width + sh.margin + extra_half_width);
+  if (ex <= 0.0 && ey <= 0.0) { return std::max(ex, ey); }   // 矩形の内側
+  return std::hypot(std::max(ex, 0.0), std::max(ey, 0.0));
+}
+
+// 相手1台に対する距離。停止中は円、走行中は向き付き矩形。
+double distToOpponent(double px, double py, const CarObstacle & c, const OpponentShape & sh)
+{
+  if (c.moving) {
+    return distToOpponentBox(px, py, c.x, c.y, c.yaw, sh, c.extra_half_width);
+  }
+  return std::hypot(px - c.x, py - c.y) - stoppedCarRadius(sh);
+}
 
 // 車体の外周点を返す。四隅だけだと、隅の間にある壁の出っ張りを跨いでしまう。
 int bodyPoints(const VehicleParams & v, const Pose & p, double * bx, double * by)
@@ -342,11 +348,6 @@ int bodyPoints(const VehicleParams & v, const Pose & p, double * bx, double * by
 }
 
 
-// 車体が壁へどれだけ食い込んでいるか[m]。0 なら余裕を保てている。
-//
-// 「常に壁から離れている」を条件にすると経路が1本も見つからない。スタックした車は
-// すでに壁に触れているので初手から不成立になる(実測4例すべて)。
-// 脱出問題の正しい条件は「今より食い込まない、かつ最後は離れる」。
 double wallViolation(const ObstacleMap & map, const Corridor & c,
                      const VehicleParams & v, const Pose & p)
 {
@@ -388,45 +389,111 @@ double carClearanceAt(const std::vector<CarObstacle> & cars,
   if (cars.empty()) { return kFar; }
   double bx[8], by[8];
   const int n = bodyPoints(veh, p, bx, by);
+  const OpponentShape sh{};
   double best = kFar;
   for (const auto & c : cars) {
     for (int i = 0; i < n; ++i) {
-      best = std::min(best, std::hypot(bx[i] - c.x, by[i] - c.y) - kCarRadius);
+      best = std::min(best, distToOpponent(bx[i], by[i], c, sh));
     }
+  }
+  return best;
+}
+
+double carClearanceAt(const CarObstacle & car,
+                      const VehicleParams & veh, const Pose & p)
+{
+  double bx[8], by[8];
+  const int n = bodyPoints(veh, p, bx, by);
+  const OpponentShape sh{};
+  double best = 1e3;
+  for (int i = 0; i < n; ++i) {
+    best = std::min(best, distToOpponent(bx[i], by[i], car, sh));
   }
   return best;
 }
 
 // 他車との重なりの深さ[m]。0 以下なら当たっていない。
 //
-// 相手は円で近似する。半径は「相手の車体半分 + 自車外周点が代表する幅」で、
-// 実測の車幅 1.30m から片側 0.65m、そこへ余裕を少し足す。
-// 向きまで見ないのは、止まっている車の向きが信用できないため
-// (スピンして止まっていることがある)。円のほうが安全側に出る。
+// 相手は向きを持たないV2X位置から外接円で近似し、自車外周点との距離を測る。
 double carViolation(const std::vector<CarObstacle> & cars,
                     const VehicleParams & veh, const Pose & p)
 {
   if (cars.empty()) { return 0.0; }
   double bx[8], by[8];
   const int n = bodyPoints(veh, p, bx, by);
+  const OpponentShape sh{};
   double worst = 0.0;
   for (const auto & c : cars) {
     for (int i = 0; i < n; ++i) {
-      const double d = std::hypot(bx[i] - c.x, by[i] - c.y);
-      worst = std::max(worst, kCarRadius - d);
+      // めり込みの深さ。停止中は円、走行中は向き付き矩形(carClearanceAt と同じ形)。
+      worst = std::max(worst, -distToOpponent(bx[i], by[i], c, sh));
     }
   }
   return worst;
 }
 
+// 車体の前半分・後半分それぞれの最小余裕[m]を返す。
+void wallClearanceSplit(
+  const ObstacleMap & map, const VehicleParams & veh, const Pose & p,
+  double & front_clear, double & rear_clear)
+{
+  front_clear = 1e3;
+  rear_clear = 1e3;
+  if (!map.valid()) { return; }
+  const double cs = std::cos(p.yaw);
+  const double sn = std::sin(p.yaw);
+  const double length = veh.front_overhang + veh.rear_overhang;
+  const double mid = (veh.front_overhang - veh.rear_overhang) * 0.5;   // 車体中央の縦座標
+  auto sample = [&](double longitudinal, double lateral) {
+    const double x = p.x + cs * longitudinal - sn * lateral;
+    const double y = p.y + sn * longitudinal + cs * lateral;
+    const double d = map.clearance(x, y);
+    if (longitudinal >= mid) { front_clear = std::min(front_clear, d); }
+    else                     { rear_clear = std::min(rear_clear, d); }
+  };
+  constexpr double kEdgeStep = 0.10;
+  const int longitudinal_steps = std::max(1, static_cast<int>(std::ceil(length / kEdgeStep)));
+  for (int i = 0; i <= longitudinal_steps; ++i) {
+    const double x = -veh.rear_overhang + length * i / longitudinal_steps;
+    sample(x, veh.half_width);
+    sample(x, -veh.half_width);
+  }
+  const int lateral_steps = std::max(
+    1, static_cast<int>(std::ceil(2.0 * veh.half_width / kEdgeStep)));
+  for (int i = 0; i <= lateral_steps; ++i) {
+    const double y = -veh.half_width + 2.0 * veh.half_width * i / lateral_steps;
+    sample(veh.front_overhang, y);
+    sample(-veh.rear_overhang, y);
+  }
+}
+
 double wallClearanceAt(const ObstacleMap & map, const VehicleParams & veh, const Pose & p)
 {
   if (!map.valid()) { return 1e3; }
-  double bx[8], by[8];
-  const int n = bodyPoints(veh, p, bx, by);
   double worst = 1e3;
-  for (int i = 0; i < n; ++i) {
-    worst = std::min(worst, map.clearance(bx[i], by[i]));
+  const double cs = std::cos(p.yaw);
+  const double sn = std::sin(p.yaw);
+  auto sample = [&](double longitudinal, double lateral) {
+    const double x = p.x + cs * longitudinal - sn * lateral;
+    const double y = p.y + sn * longitudinal + cs * lateral;
+    worst = std::min(worst, map.clearance(x, y));
+  };
+  // Corners and midpoints can straddle a narrow wall protrusion. Sample every
+  // body edge at map-scale spacing so a swept-path certificate covers the body.
+  constexpr double kEdgeStep = 0.10;
+  const double length = veh.front_overhang + veh.rear_overhang;
+  const int longitudinal_steps = std::max(1, static_cast<int>(std::ceil(length / kEdgeStep)));
+  for (int i = 0; i <= longitudinal_steps; ++i) {
+    const double x = -veh.rear_overhang + length * i / longitudinal_steps;
+    sample(x, veh.half_width);
+    sample(x, -veh.half_width);
+  }
+  const int lateral_steps = std::max(
+    1, static_cast<int>(std::ceil(2.0 * veh.half_width / kEdgeStep)));
+  for (int i = 0; i <= lateral_steps; ++i) {
+    const double y = -veh.half_width + 2.0 * veh.half_width * i / lateral_steps;
+    sample(veh.front_overhang, y);
+    sample(-veh.rear_overhang, y);
   }
   return worst;
 }
@@ -500,52 +567,19 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
 
   // --- 当たり判定の許容。開始時点で食い込んでいるならそのぶんは許す ---
   // 許さないと「いま壁に触れている」状態から一歩も動かせない。
-  // --- 許容は「出だしだけ」に限る(2026-09-06) ---
-  //
-  // 【何が起きていたか】開始時点の食い込みを経路の終わりまで許していたので、
-  // **壁に 0.32m 食い込んだままの経路**を「到達できる」として返していた。
-  // 押し付けるので進めず、引き直すと同じ姿勢から同じ答えが返る。
-  // 実測: 同一の計画(切り返し0回 前進9.5m 余裕壁-0.32)を **189回** 出し直した。
-  // ユーザーが見た「複数回の切り返し」は、1つの計画の中の切り返しではなく
-  // この引き直しの繰り返しだった。
-  //
-  // 触れている状態から動き出すには最初の数十cmの許容が要る。
-  // そこで **開始から kAllowLen[m] までは開始時の食い込みを許し、
-  // それ以降は食い込み 0 を要求する。**
   const double start_wall_vio = wallViolation(obstacles, corridor, veh, start);
   const double start_car_vio = carViolation(cars, veh, start);
-  // --- 許容は「悪化させない」ことで表す(2026-09-06) ---
-  //
-  // 【距離で切り替えるのが誤りだった】「開始から kAllowLen[m] までは開始時の
-  // 食い込みを許し、それ以降は 0 を要求する」としていたが、
-  // **壁に 0.85m 食い込んだ状態から 0.6m 走って完全に領域内へ**は不可能。
-  // その結果 0.6m より先のすべての素片が棄却され、**経路が1本も作れなかった**
-  // (ユーザー指摘「切り返しを行えば基本的に計画が出ないとはならないはず」)。
-  //
-  // 正しい条件は距離ではない。**食い込んでいる間は深くしない**、
-  // **一度抜けたらもう食い込まない**、の2つで表せる。
-  // これなら 0.85m 入った車は何m後退しても離れる向きなら通り、
-  // 深くなる向きは1歩でも棄却される。距離の閾値は要らない。
-  // 【「悪化させない」では足りなかった 2026-09-06】
-  // 悪化させないだけでは **「壁に 1.12m 食い込んだまま、深さを変えずに
-  // 前進する 7m の経路」** が通る。実測でそれが採用され、切り返しが 0 回、
-  // 壁前進禁止に毎回止められて位置が 1mm も変わらなかった。
-  //
-  // 食い込んでいる間に求めるべきは「悪化させない」ではなく
-  // **「改善する向きへ動く」**。食い込み量が減る素片だけを通す。
-  // 壁に食い込んだ状態から改善する向きは多くの場合 後退なので、
-  // 切り返しが自然に出る。前進は領域内へ出てから始まる。
-  //
-  //   食い込んでいる(vio > 0)   -> 直前より減っていることを求める
-  //   食い込んでいない(vio = 0) -> 0 のままであることを求める
+  // 食い込み中は素片ごとの改善、脱出後は再侵入しないことを要求する。
   constexpr double kImprove = 0.01;   // 改善とみなす最小量[m]
   auto ok_step = [&](double vio, double prev_vio) {
     if (prev_vio > 1e-6) { return vio <= prev_vio - kImprove; }
     return vio <= 1e-3;
   };
-  // --- 素片。舵は最大舵角を5段階 ---
-  const double steers[5] = {-veh.max_steer, -veh.max_steer * 0.5, 0.0,
-                            veh.max_steer * 0.5, veh.max_steer};
+  // --- 素片。舵は最大舵角を7段階 ---。
+  const double steers[7] = {-veh.max_steer, -veh.max_steer * 0.8,
+                            -veh.max_steer * 0.4, 0.0,
+                            veh.max_steer * 0.4, veh.max_steer * 0.8,
+                            veh.max_steer};
 
   struct Node
   {
@@ -556,6 +590,7 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
     double run{0.0};      // 開始からの走行距離[m]
     double wall_vio{0.0}; // その姿勢での壁への食い込み[m]。悪化の判定に使う
     double car_vio{0.0};  // 同 他車との重なり[m]
+    std::vector<double> car_vio_by_id;  // aggregate min must not hide a different car
     int dir{0};           // 直前の素片の向き +1 前進 / -1 後退 / 0 開始
     int switches{0};      // ここまでの切り返し回数
     int parent{-1};
@@ -597,6 +632,10 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
   s0.pose = start;
   s0.wall_vio = start_wall_vio;
   s0.car_vio = start_car_vio;
+  for (const auto & car : cars) {
+    s0.car_vio_by_id.push_back(
+      std::max(0.0, -carClearanceAt(car, veh, start)));
+  }
   s0.g = 0.0;
   s0.v = 0.0;          // 復帰に入る時点では止まっている前提
   s0.f = heuristic(start);
@@ -620,9 +659,6 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
     if (top.first > nodes[ci].f + 1e-9) { continue; }   // 古い項目
     ++expanded;
     {
-      // 到達したら、共通の評価地点までの時間を足した合計で比べる。
-      // **後退量ではなく所要時間で選ぶ**ので、大きく回頭して速度を失う経路は
-      // ここで負ける(ユーザー指摘の訂正を反映)。
       std::size_t gi = 0;
       if (nodes[ci].dir > 0 && reached(nodes[ci].pose, gi)) {
         const double total = nodes[ci].g +
@@ -637,6 +673,8 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
       }
     }
     for (int dir : {+1, -1}) {
+      if (prm.first_phase != 0 && nodes[ci].dir == 0 &&
+          dir != (prm.first_phase > 0 ? +1 : -1)) { continue; }
       const int sw = nodes[ci].switches +
                      ((nodes[ci].dir != 0 && dir != nodes[ci].dir) ? 1 : 0);
       if (sw > prm.max_switch) { continue; }
@@ -650,6 +688,7 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
         double run = nodes[ci].run;
         double prev_wall = nodes[ci].wall_vio;
         double prev_car = nodes[ci].car_vio;
+        std::vector<double> prev_car_by_id = nodes[ci].car_vio_by_id;
         for (int k = 0; k < sub; ++k) {
           p = advance(p, ds, st, veh.wheel_base);
           run += std::abs(ds);
@@ -658,6 +697,16 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
           // 食い込んでいる間は改善する向きだけを通す。
           if (!ok_step(wv, prev_wall)) { ok = false; break; }
           if (!ok_step(cv, prev_car)) { ok = false; break; }
+          for (std::size_t car_i = 0; car_i < cars.size(); ++car_i) {
+            const double car_vio =
+              std::max(0.0, -carClearanceAt(cars[car_i], veh, p));
+            if (!ok_step(car_vio, prev_car_by_id[car_i])) {
+              ok = false;
+              break;
+            }
+            prev_car_by_id[car_i] = car_vio;
+          }
+          if (!ok) { break; }
           prev_wall = wv;
           prev_car = cv;
         }
@@ -698,6 +747,7 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
         nd.run = run;
         nd.wall_vio = prev_wall;
         nd.car_vio = prev_car;
+        nd.car_vio_by_id = std::move(prev_car_by_id);
         nd.f = ng + heuristic(p);
         nd.dir = dir;
         nd.switches = sw;
@@ -725,17 +775,23 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
     int cur_dir = 0;
     double len = 0.0;
     double steer0 = 0.0;
+    std::size_t phase_begin = 0;
     for (std::size_t k = 1; k < chain.size(); ++k) {
       const Node & nd = nodes[chain[k]];
       if (nd.dir != cur_dir) {
-        if (cur_dir != 0) { out.phases.push_back({cur_dir > 0, steer0, len}); }
+        if (cur_dir != 0) {
+          out.phases.push_back({cur_dir > 0, steer0, len, phase_begin, k});
+        }
+        phase_begin = k - 1;
         cur_dir = nd.dir;
         steer0 = nd.steer;
         len = 0.0;
       }
       len += prm.step;
     }
-    if (cur_dir != 0) { out.phases.push_back({cur_dir > 0, steer0, len}); }
+    if (cur_dir != 0) {
+      out.phases.push_back({cur_dir > 0, steer0, len, phase_begin, chain.size()});
+    }
   }
   // 最初の方向転換までの点数。後退用と合流用で経路を分けるのに使う。
   out.rev_points = 0;
@@ -759,15 +815,6 @@ Plan planToGoal(const Corridor & corridor, const ObstacleMap & obstacles,
     out.min_car_clear = min_car;
   }
   out.cost = nodes[goal_node].g;
-  // --- 食い込む経路は採らない(2026-09-06) ---
-  // 出だしの許容(kAllowLen)を抜けたあとに食い込む案は、実行できない。
-  // 実測: `余裕壁 -0.40` の案を70回返し、壁前進禁止に毎回止められて
-  // 位置が変わらないまま無限に引き直していた。
-  // 採れないなら「計画なし」を返す。そのほうが上位が停止を選べる。
-  // 【条件を緩めた 2026-09-06】「前進区間の最小余裕が負なら採らない」は
-  // 厳しすぎた。上の「悪化させない」条件で深くなる経路は既に棄却されており、
-  // 残るのは「食い込んだまま離れていく」経路。それは実行してよい。
-  // 終端で食い込んでいる案だけを落とす(戻った先が壁の中では意味がない)。
   if (!out.path.empty() &&
       wallViolation(obstacles, corridor, veh, out.path.back()) > 1e-3)
   {
@@ -795,12 +842,6 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
   double start_lat = 0.0;
   if (!corridor.locate(start.x, start.y, start_idx, start_lat)) { return best; }
 
-  // 復帰先として狙う範囲。ここに終端が入っていれば「戻れた」とみなす。
-  // 以前はこの範囲の各点との方位差の最小値を評価に使っていたが、
-  // ヘアピンでは 4m 先と 16m 先で中心線の向きが 90 度以上変わるため、
-  // 「どれかの点とは向きが合う」がほぼ常に成り立ってしまい、
-  // 実測で 97 度傾いたまま「方位差ゼロ」と評価されていた。
-  // 向きは終端位置における中心線の向きと比べる。
   {
     Pose probe;
     if (!poseAhead(corridor, start_idx, ahead_min, probe)) { return best; }
@@ -821,47 +862,24 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
   const double st[5] = {-veh.max_steer, -veh.max_steer * 0.5, 0.0,
                         veh.max_steer * 0.5, veh.max_steer};
   // 後退距離の候補。0 は「後退せずに前進だけで戻る」場合。
-  // 車体が大きく傾いているときは、フルロックでも向きを戻すのに数 m の後退が要る
-  // (ホイールベース 2.14m・最大舵角 35deg なら旋回半径 3.06m、
-  //  90 度向きを変えるのに円弧 4.8m)。刻みと上限はそれに合わせる。
-  const double rev_len[10] = {0.0, 0.75, 1.5, 2.25, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+  const double rev_len[16] = {0.0, 0.25, 0.4, 0.55, 0.75, 1.0, 1.5, 2.0,
+                              2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0};
   // 前進距離の候補。
-  const double fwd_len[7] = {1.5, 3.0, 4.5, 6.0, 8.0, 10.0, 12.0};
+  // A contact chain sometimes has no safe forward continuation yet: the rear
+  // vehicle must first reverse away so the front vehicle can leave the wall.
+  // Requiring every candidate to end with >=1.5m forward made that useful
+  // partial move impossible and both controllers safe-stopped for 30 seconds.
+  const double fwd_len[8] = {0.0, 1.5, 3.0, 4.5, 6.0, 8.0, 10.0, 12.0};
 
   // 出発時点の食い込み量。これより悪化させない範囲で動かす。
   // わずかな増加は許す(切り返しで一時的に角が出るのは避けられない)。
   const double start_violation = wallViolation(obstacles, corridor, veh, start);
   const double allow = start_violation + 0.15;
 
-  // 壁に触れているなら、まず「食い込みが減る方向」へ動き出さなければならない。
-  //
-  // 実測(対戦で敗因になった事例): 車体が壁に 0.22m 食い込み、左後ろの角が
-  // 接触した状態で、計画が「前進 舵+18度 10m」を出していた。終端はコリドアの
-  // 中央に戻れる計算(評価1.50)で最良に見えるが、**接触している角を壁へ
-  // 押し付けたまま回る**動きなので実車はまったく動かず、90秒間その場に留まった。
-  //
-  // 終端だけを見て評価すると、この「出だしで詰む」経路を弾けない。
-  // 動き出しの 1.5m で食い込みが増える候補は捨てる。
   const bool touching = start_violation > 1e-6;
   const double kEarlyLen = 1.5;
 
   // 他車についても壁とまったく同じ扱いにする。
-  //
-  // 【直したバグ(ユーザー報告: 90付近でぶつかって復帰が働かずアクセル踏みっぱなし)】
-  // ここは「他車は壁と違って、今すでに触れていることを許す理由がない」として
-  // `carViolation(...) > 0.0` で無条件に棄却していた。ところが `carViolation` は
-  // **相手中心の半径 kCarRadius=1.00m の円と自車8点の重なりの深さ**で、自車前端は
-  // 原点から front_overhang=1.6m ある。つまり **相手中心が前方 2.6m 以内にいる時点で
-  // 開始姿勢が既に「重なり」判定**になる。
-  //
-  // 棄却は 0.25m 刻みの1歩目で `break` するので、後退候補も前進候補も全滅し、
-  // 全フォールバックが同じ理由で空を返す。実測(3台走行 d2): 相手が前方 1.5m の
-  // 位置で `復帰 経路を計算できない` が 20 秒以上出続け、その間ずっと通常制御が
-  // 10.8km/h を指令して相手へ押し付けていた。**いちばん要る距離で必ず動けない。**
-  //
-  // 壁側には `allow = start_violation + 0.15` という「今より悪くしなければ可」の
-  // 逃げ道があるのに、他車側にだけ無かったのが原因。同じ形にそろえる。
-  // 抜け出すには 1.1m 以上下がる必要があるが、悪化しない限り通せば下がりきれる。
   const double start_car_violation = carViolation(cars, veh, start);
   const double car_allow = start_car_violation + 0.05;
   const bool car_touching = start_car_violation > 1e-6;
@@ -910,7 +928,7 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
         // 前進は最長まで一度だけ積分して、途中を各候補の終端として使う。
         Pose q = after_rev;
         std::vector<Pose> fpath;
-        const double fmax = fwd_len[6];
+        const double fmax = fwd_len[7];
         const int fnmax = static_cast<int>(std::ceil(fmax / kStep));
         // 後退から始まる計画なら前進時には既に壁から離れている。
         // 前進から始まる計画(rl==0)のときだけ、出だしの条件を課す。
@@ -953,7 +971,8 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           if (fl > ahead_max + 1e-6) { continue; }
           const int fn = static_cast<int>(std::ceil(fl / kStep));
           if (static_cast<int>(fpath.size()) < fn) { continue; }   // 途中で壁
-          const Pose e = fpath[fn - 1];
+          if (rl < 1e-6 && fl < 1e-6) { continue; }
+          const Pose e = fn > 0 ? fpath[fn - 1] : after_rev;
 
           // 終端がどれだけ経路へ戻れているかで評価する。
           std::size_t ei = 0;
@@ -970,11 +989,6 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           if (advance_idx > static_cast<double>(n_pts) / 2.0) { advance_idx -= n_pts; }
           const double back_penalty =
             advance_idx < 0.0 ? -advance_idx * mean_spacing : 0.0;
-          // その場で終わる案を捨てる。距離を軽く見るようにした結果、
-          // 「方位差も横ずれも合格圏内」の候補が大量に同点になり、
-          // そのなかで最短の 1.5m 前進(実質その場)が勝つようになった。
-          // 実測では、それを4回繰り返して復帰を諦めていた。
-          // 復帰は「詰まった場所から離れる」ことが目的なので下限を課す。
           if (std::hypot(e.x - start.x, e.y - start.y) < min_escape) { continue; }
           const double end_violation = wallViolation(obstacles, corridor, veh, e);
           // 「今より改善する計画だけ」を求められている場合(やり直し時)は、
@@ -999,8 +1013,11 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
           if (best.valid && cost >= best.cost) { continue; }
 
           best.phases.clear();
-          if (rl > 1e-6) { best.phases.push_back({false, rs, rl}); }
-          best.phases.push_back({true, fs, fl});
+          if (rl > 1e-6) { best.phases.push_back({false, rs, rl, 0, rev_pts}); }
+          const std::size_t fwd_begin = rev_pts > 0 ? rev_pts - 1 : 0;
+          if (fl > 1e-6) {
+            best.phases.push_back({true, fs, fl, fwd_begin, rev_pts + fn});
+          }
           best.path.assign(path.begin(), path.begin() + rev_pts);
           best.path.insert(best.path.end(), fpath.begin(), fpath.begin() + fn);
           best.rev_points = rev_pts;
@@ -1023,18 +1040,25 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
     }
   }
 
-  // 【best_effort】ここまでの探索で「どこにも当たらない・改善する」案が
-  // 1つも無かった(best.valid == false)場合、円を1.49mへ拡げた副作用で
-  // 「解なしを返す」距離が伸びた分をここで受ける。
-  //
-  // ユーザー指示: 「どこにも当たらない案が無いなら、一番離れられる案を返す」。
-  // 解なしのまま通常制御に返すと、相手や壁へ押し付けたまま何もしない時間が
-  // 続く(過去の実測で20秒以上)。best_effort が立っているときだけ、
-  // 1回目とまったく同じ候補列挙(rev_len x st x fwd_len)をもう一度回すが、
-  // 今回は棄却条件(vio/cvio の閾値・touching/car_touching の出だし条件・
-  // min_gain・min_escape)を一切適用せず、経路の積分も最後まで行う。
-  // 評価は「経路上の全点での壁クリアランスと車クリアランスの最小値」とし、
-  // それが最大の候補(同点なら短いほう)を採用する。1回目の挙動には影響しない。
+  // ここまでの探索で「どこにも当たらない・改善する」案が。
+  if (best_effort && best.valid) {
+    const double start_wall_clearance = wallClearanceAt(obstacles, veh, start);
+    const double wall_floor = start_wall_clearance < 0.0
+      ? start_wall_clearance - 0.02 : 0.0;
+    bool fully_clear = wallClearanceAt(obstacles, veh, best.path.back()) >= 0.0;
+    for (const auto & pose : best.path) {
+      fully_clear = fully_clear && wallClearanceAt(obstacles, veh, pose) >= wall_floor;
+    }
+    for (const auto & car : cars) {
+      const double start_clearance = carClearanceAt(car, veh, start);
+      const double floor = start_clearance < 0.0 ? start_clearance - 0.02 : 0.0;
+      fully_clear = fully_clear && carClearanceAt(car, veh, best.path.back()) >= 0.0;
+      for (const auto & pose : best.path) {
+        fully_clear = fully_clear && carClearanceAt(car, veh, pose) >= floor;
+      }
+    }
+    if (!fully_clear) { best = Plan{}; }
+  }
   if (best_effort && !best.valid) {
     // 開始時点の方位差。総当りで「向きが直る案」を選ぶための基準。
   std::size_t syi = 0; double syl = 0.0;
@@ -1043,6 +1067,16 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
     start_yaw_ok ? std::abs(wrap(start.yaw - trackYaw(corridor, syi))) : 0.0;
   double best_score = -1e18;
     double best_len = 1e18;
+    double best_terminal_penetration = 1e18;
+    const double start_wall_clearance = wallClearanceAt(obstacles, veh, start);
+    std::vector<double> start_car_clearances;
+    start_car_clearances.reserve(cars.size());
+    double start_car_penetration = 0.0;
+    for (const auto & car : cars) {
+      const double clearance = carClearanceAt(car, veh, start);
+      start_car_clearances.push_back(clearance);
+      start_car_penetration += std::max(0.0, -clearance);
+    }
 
     for (double rl : rev_len) {
       if (first_phase < 0 && rl < 1e-6) { continue; }
@@ -1065,7 +1099,7 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
         for (double fs : st) {
           Pose q = after_rev;
           std::vector<Pose> fpath;
-          const double fmax = fwd_len[6];
+          const double fmax = fwd_len[7];
           const int fnmax = static_cast<int>(std::ceil(fmax / kStep));
           for (int i = 0; i < fnmax; ++i) {
             q = advance(q, kStep, fs, veh.wheel_base);
@@ -1075,57 +1109,79 @@ Plan plan(const Corridor & corridor, const ObstacleMap & obstacles,
             if (fl > ahead_max + 1e-6) { continue; }
             const int fn = static_cast<int>(std::ceil(fl / kStep));
             if (static_cast<int>(fpath.size()) < fn) { continue; }
+            if (rl < 1e-6 && fl < 1e-6) { continue; }
 
             double score = 1e18;
+            double min_wall_clearance = 1e18;
+            std::vector<double> min_car_clearance(cars.size(), 1e18);
             for (std::size_t k = 0; k < rev_pts; ++k) {
-              score = std::min(score, wallClearanceAt(obstacles, veh, path[k]));
+              const double wall = wallClearanceAt(obstacles, veh, path[k]);
+              score = std::min(score, wall);
+              min_wall_clearance = std::min(min_wall_clearance, wall);
               score = std::min(score, carClearanceAt(cars, veh, path[k]));
+              for (std::size_t car_i = 0; car_i < cars.size(); ++car_i) {
+                min_car_clearance[car_i] = std::min(
+                  min_car_clearance[car_i], carClearanceAt(cars[car_i], veh, path[k]));
+              }
             }
             for (int k = 0; k < fn; ++k) {
-              score = std::min(score, wallClearanceAt(obstacles, veh, fpath[k]));
+              const double wall = wallClearanceAt(obstacles, veh, fpath[k]);
+              score = std::min(score, wall);
+              min_wall_clearance = std::min(min_wall_clearance, wall);
               score = std::min(score, carClearanceAt(cars, veh, fpath[k]));
+              for (std::size_t car_i = 0; car_i < cars.size(); ++car_i) {
+                min_car_clearance[car_i] = std::min(
+                  min_car_clearance[car_i], carClearanceAt(cars[car_i], veh, fpath[k]));
+              }
             }
-            // --- 総当りでも方位差を見る(実測 2026-09-05) ---
-            //
-            // 【なぜ必要か】壁ペナルティの原因を実測で切り分けた結果、
-            // 経路(コリドア)でも追従でもなく **車体の姿勢**だった。
-            //   方位差 < 10度 : 壁に接触 0 / 545 周期 (0%)
-            //   方位差 >= 45度: 4123 / 4123 周期 (100%)
-            // ある車はレースの 87% を「横向きのまま壁際で速度0」で過ごした。
-            //
-            // 主評価(cost)は方位差を見ている(`yaw_over * 12.0`)が、
-            // **解が無いときに落ちるこの総当りは方位差を一切見ていない**
-            // (余裕と長さだけ)。横向きで壁際にいる状況はまさに解が無い状況なので、
-            // **そこで回転が評価されない。** 回転そのものが脱出になる場面
-            // (1.30 x 2.2m の車体は45度で必要半幅 1.24m、揃えば 0.65m)を
-            // 選べるようにする。
-            const Pose & ep = fpath[fn - 1];
+            const Pose & ep = fn > 0 ? fpath[fn - 1] : after_rev;
+            const double terminal_wall = wallClearanceAt(obstacles, veh, ep);
+            const double wall_floor = start_wall_clearance < 0.0
+              ? start_wall_clearance - 0.02 : 0.0;
+            if (min_wall_clearance < wall_floor || terminal_wall < 0.0) { continue; }
+            bool per_car_safe = true;
+            double terminal_car_penetration = 0.0;
+            for (std::size_t car_i = 0; car_i < cars.size(); ++car_i) {
+              const double floor = start_car_clearances[car_i] < 0.0
+                ? start_car_clearances[car_i] - 0.02 : 0.0;
+              if (min_car_clearance[car_i] < floor) {
+                per_car_safe = false;
+                break;
+              }
+              terminal_car_penetration += std::max(
+                0.0, -carClearanceAt(cars[car_i], veh, ep));
+            }
+            if (!per_car_safe) { continue; }
+            if (start_car_penetration > 0.0 && terminal_car_penetration > 0.0 &&
+                terminal_car_penetration > start_car_penetration - 0.10)
+            {
+              continue;
+            }
             std::size_t eyi = 0; double eyl = 0.0;
             double yaw_gain = 0.0;
             if (corridor.locate(ep.x, ep.y, eyi, eyl) && start_yaw_ok) {
               const double end_yaw_err = std::abs(wrap(ep.yaw - trackYaw(corridor, eyi)));
               yaw_gain = std::max(0.0, start_yaw_err - end_yaw_err);
             }
-            // 余裕を主、方位差の改善を従にする。余裕がほぼ同じなら向きが直る案を採る。
-            // 【計測とユーザー報告で戻した 2026-09-05】重み 0.30 は
-            // 方位差の改善(最大 π rad)を最大 0.94m 相当の余裕に化けさせるので、
-            // **実際の余裕が 0.94m 悪くても「よく回る案」が勝つ。**
-            // 長い後退は大きく回るので選ばれ続け、
-            // ユーザー報告「ずっと後ろに下がり続けて前進しない」になった。
-            // 完走できなかった車も 10% -> 25% に増えていた。
-            // 余裕を主にするという設計自体は正しいので、重みは残して既定を 0 にする。
             const double obj = score + kYawGainWeight * yaw_gain;
             const double length = rl + fl;
-            const bool better = obj > best_score + 1e-9 ||
-              (std::abs(obj - best_score) <= 1e-9 && length < best_len);
+            const bool better =
+              terminal_car_penetration < best_terminal_penetration - 1e-9 ||
+              (std::abs(terminal_car_penetration - best_terminal_penetration) <= 1e-9 &&
+               (obj > best_score + 1e-9 ||
+                (std::abs(obj - best_score) <= 1e-9 && length < best_len)));
             if (!better) { continue; }
             score = obj;
 
             best_score = score;
             best_len = length;
+            best_terminal_penetration = terminal_car_penetration;
             best.phases.clear();
-            if (rl > 1e-6) { best.phases.push_back({false, rs, rl}); }
-            best.phases.push_back({true, fs, fl});
+            if (rl > 1e-6) { best.phases.push_back({false, rs, rl, 0, rev_pts}); }
+            const std::size_t fwd_begin = rev_pts > 0 ? rev_pts - 1 : 0;
+            if (fl > 1e-6) {
+              best.phases.push_back({true, fs, fl, fwd_begin, rev_pts + fn});
+            }
             best.path.assign(path.begin(), path.begin() + rev_pts);
             best.path.insert(best.path.end(), fpath.begin(), fpath.begin() + fn);
             best.rev_points = rev_pts;

@@ -15,12 +15,27 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <v2x_msgs/msg/v2_x_vehicle_position_array.hpp>
 
+#include "v2x_overtaker/lateral_interval.hpp"
+#include "v2x_overtaker/launch_gate.hpp"
+#include "v2x_overtaker/alongside_guard.hpp"
+#include "v2x_overtaker/lateral_lag.hpp"
+#include "v2x_overtaker/pass_completion_side.hpp"
+#include "v2x_overtaker/corridor_funnel.hpp"
+#include "v2x_overtaker/rear_end_inpath.hpp"
+#include "v2x_overtaker/rear_end_release.hpp"
+#include "v2x_overtaker/overtake_start.hpp"
+#include "v2x_overtaker/stopped_pass_reachability.hpp"
+#include "v2x_overtaker/stop_nopass_latch.hpp"
+#include "v2x_overtaker/trajectory_speed_cap.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <deque>
+#include <array>
 #include <map>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -33,8 +48,6 @@ using v2x_msgs::msg::V2XVehiclePositionArray;
 // 後方この距離[m]より後ろの車は回避の対象にしない。
 // 完全に 0 にすると真横の車が前後の判定で揺れるので、少しだけ後ろを許す。
 constexpr double kRearIgnore = 1.0;
-// カートの車幅[m](実測)。2台が触れずに並ぶには中心間でこれだけ要る。
-// 「横に離れている」の判断がこれを下回ると、重なっているのに安全と誤判定する。
 constexpr double kCarWidth = 1.30;
 constexpr double kBandAbs = 6.0;  // バンドの既定の広さ[m]
 // 走行可能領域の境界からこれだけ[m]内側にいるなら、壁には当たっていないとみなす。
@@ -42,30 +55,6 @@ constexpr double kContactMargin = 0.35;
 // 相手の走行データの要約を出す間隔[s]
 constexpr double kStatsLogSec = 20.0;
 
-// --- AWSIM のペナルティ判定(Assembly-CSharp.dll の
-//     AIChallenge2026.Penalty.VehiclePenaltyController から実測) ---
-//
-//   ClampedSpeedMps          = 1.38889  (= 5 km/h)
-//   CooldownSecondsP1        = 10.0     Crash
-//   CooldownSecondsP2        = 5.0      Wall
-//   CooldownSecondsP3        = 2.0      Over
-//   WallNormalDotThreshold   = 0.6      壁か車かを接触面の法線で判別
-//   OverAccelerationThreshold= 3.0
-//   ReverseSpeedThresholdMps = 0.1
-//   レイヤー: BumperFront / BumperRear / Vehicle
-//
-// ペナルティは「時間を足される」のではなく **その秒数だけ 5km/h に固定される**。
-// Crash なら 10 秒間 5km/h なので、失う距離は 30m 以上になる。
-//
-// 前バンパーと後バンパーがレイヤーで分かれており、追突専用の処理
-// (HandleRearEndOverlap)がある。つまり Crash は「自分の前で当てた」ときに付き、
-// 後ろから当てられた側には付かない。横からの接触は Vehicle レイヤーの
-// 衝突として扱われ、追突の判定には入らない。
-//
-// この構造から、取るべき方針は次のとおり:
-//   - 前から突っ込むのは最悪(10秒 5km/h)。止まりきれないなら横へ逃げる
-//   - 後ろから当てられるのは無罰。後方の車を避ける必要はない
-//   - 横に並んでの軽い接触は追突より安い。抜けるなら多少詰めてよい
 using std_msgs::msg::Float32MultiArray;
 
 struct Corridor
@@ -87,13 +76,12 @@ struct OtherState
   double last_s{0.0};
   bool prog_init{false};
 
-  // --- 走行データの蓄積 ---
-  // 相手が遅いのか(NPCか、性能が低いのか)を、推測ではなく実測で判断する。
-  // 相手を抜けるかどうかの判断は、今の瞬間の速度差だけでは当てにならない
-  // (コーナーで一時的に落ちているだけかもしれない)。区間ごとに平均を取る。
   static constexpr int kSections = 24;      // 走行ラインを24分割して集計
   double sec_sum[kSections]{};              // 区間ごとの速度の合計
   int    sec_cnt[kSections]{};              // 同 サンプル数
+  double prev_sec_sum[kSections]{};
+  int    prev_sec_cnt[kSections]{};
+  bool   prev_sec_valid{false};
   double speed_sum{0.0};                    // 全体の平均用
   int    speed_cnt{0};
   double lap_start_time{0.0};               // 周回計測用
@@ -102,16 +90,6 @@ struct OtherState
   double last_lap_time{0.0};
   double best_lap_time{0.0};
 
-  // --- 相手の走行ラインの学習 ---
-  // 相手(既定MPC)はほぼ同じラインを毎周なぞる。1周目に「どの地点で
-  // 走行ラインからどれだけ横にいるか」を記録しておけば、
-  // 2周目以降は「その地点で自分がどちら側から並べるか」を先に決められる。
-  // 目の前の瞬間値だけで側を決めると、相手がラインを横切る場面で
-  // 余地の無い側を選んでしまう(実測: 側OK=0 の 48% は反対側なら成立していた)。
-  // --- 追い越しの実測 ---
-  // 「追越試行 成功」は試行として記録できた分しか数えない。
-  // 抜いた/抜かれたを実験の指標にするなら、試行の記録とは切り離して
-  // 「前後関係が入れ替わった回数」そのものを数える必要がある。
   int rel_sign{0};        // +1 = 自分が前、-1 = 自分が後ろ、0 = 未確定
   int rel_hold{0};        // 反転を確定させるまでの連続周期数
   int passed_cnt{0};      // この相手を抜いた回数
@@ -125,12 +103,6 @@ struct OtherState
   static constexpr int kLatBins = 256;      // 走行ラインを256分割して横位置を集計
   double lat_sum[kLatBins]{};
   int    lat_cnt[kLatBins]{};
-  // --- 相手の走り方の録画(ユーザー指示) ---
-  // 横位置だけでなく**その地点で相手が出している速度**も地点ごとに覚える。
-  // 2周目以降に「どこで抜くか」を決めるとき、
-  //   ・相手が遅い場所ほど詰めやすい
-  //   ・相手の横位置が片側に寄っている場所ほど反対側が空いている
-  // の2つが要る。横位置(lat)だけでは前者が分からない。
   double spd_sum[kLatBins]{};
   int    spd_cnt[kLatBins]{};
 
@@ -183,29 +155,6 @@ struct OtherState
     spd_cnt[bin]++;
   }
 
-  // ================================================================
-  // 相手の走り方のモデル(ユーザー指示 2026-09-05)
-  //
-  // 【なぜ録画をやめるか】従来は「地点ごとの横位置と速度」を録画した表
-  // (kLatBins=256 の lat_sum/spd_sum)だけを使っていた。**決勝の相手は
-  // 他チームの車で、事前に録画する機会がない。** 実測(決勝構成4レース)では
-  // 抜きどころ計画の不成立 163回のうち **83% が「対象車の学習点0」**だった。
-  //
-  // 【代わりに何をするか】相手の挙動を**モデル**で表し、その少数の
-  // パラメータを**走行中に相手ごとに当てはめる**。
-  //
-  //   縦: v(i) = min(v_top, sqrt(ay_max * R(i)))
-  //       レーシングカートの速度は「最高速」と「横加速度の限界」で決まる。
-  //       R(i) はコースの曲率半径で既知。v_top と ay_max を実測から当てる。
-  //   横: lat(i) = bias + gain * inside(i)
-  //       inside(i) は「その地点でイン側がどちらか、どれだけ強いか」を
-  //       -1..+1 で表した既知量。bias(全体の寄り)と gain(インを取る度合い)を
-  //       最小二乗で当てる。
-  //
-  // どちらも**1周目の途中から値を返せる**。地点ごとの表と違い、
-  // 一度も通っていない地点でも予測できるのが要点。
-  // 録画した値がある地点ではそちらを優先し、モデルは受け皿として使う。
-  // ================================================================
   double m_v_top{-1.0};      // 観測した最高速[m/s](緩やかに減衰させる)
   double m_ay_max{-1.0};     // 観測した最大横加速度[m/s^2](同上)
   // lat = bias + gain * inside の最小二乗用
@@ -217,11 +166,6 @@ struct OtherState
   void noteModel(double v, double radius, double lat, double inside)
   {
     if (v > 0.3 && v < 30.0) {
-      // 最高速は「最大値」で当てる。平均だと行列で遅い相手を過小評価する。
-      // ただし固定の最大値だと一度の外れ値が残るので、緩やかに減衰させる。
-      // 減衰は「1周(約47秒・約2400サンプル)で 0.5m/s 落ちる」程度にする。
-      // 0.002/サンプルだと 30秒で 39.8 -> 35.5km/h まで落ちてしまい(実測)、
-      // 相手の実力を過小評価して「抜けない」と判断してしまう。
       m_v_top = (m_v_top < 0.0) ? v : std::max(v, m_v_top - 0.0002);
       if (radius > 1.0 && radius < 1e6) {
         const double ay = v * v / radius;
@@ -280,6 +224,26 @@ struct OtherState
   {
     return speed_cnt >= 20 ? speed_sum / speed_cnt : -1.0;
   }
+  double topSectionSpeedRecent() const
+  {
+    const double * su = prev_sec_valid ? prev_sec_sum : sec_sum;
+    const int    * cn = prev_sec_valid ? prev_sec_cnt : sec_cnt;
+    double best = -1.0;
+    for (int i = 0; i < kSections; ++i) {
+      if (cn[i] < 5) { continue; }
+      best = std::max(best, su[i] / cn[i]);
+    }
+    return best;
+  }
+  double topSectionSpeed() const
+  {
+    double best = -1.0;
+    for (int i = 0; i < kSections; ++i) {
+      if (sec_cnt[i] < 5) { continue; }
+      best = std::max(best, sec_sum[i] / sec_cnt[i]);
+    }
+    return best;
+  }
 };
 
 class V2XOvertaker : public rclcpp::Node
@@ -322,6 +286,8 @@ private:
   {
     // --- 最終的な指令。各層がこの 2 つを詰めていく
     double target_offset{0.0};   // 走行ラインからの横オフセット目標[m]
+    double lat_fallback{0.0};
+    bool lat_feasible{true};
     double speed_cap{-1.0};      // 速度上限[m/s]。負なら制限なし
     // 追突までの余裕が尽き、通常の上限レート制限を待てない状態。
     // このときだけ publishTrajectory 側の減速平滑化を通さない。
@@ -329,9 +295,13 @@ private:
 
     // --- 前方の状況
     std::string blocker;         // 前をふさいでいる相手の名前。空なら前は空き
+    // 今周期の decideAllow が追越開始を許可した対象。blocker と同じIDの
+    // 許可証があるときだけ recordAttempt が状態遷移を開始できる。
+    std::string pass_authorized_target;
     double best_gap{0.0};        // その相手までの車間[m]
     bool slow_leader{false};     // 前の相手が明らかに遅い
     bool pressed_from_behind{false};  // 後ろから詰められている
+    double rear_gap{1e9};             // 後方車までの距離[m](無ければ 1e9)
 
     // --- この地点で並走できるか
     bool in_zone{true};
@@ -357,24 +327,18 @@ private:
     // 軌道そのものではなくこの 1 点だけを次の層へ渡す。
     double ego_target_speed{0.0};
 
-    // --- 速度上限の調停(2026-09-02 ユーザー指示で統一) ---
-    // 各層は speed_cap を直接書き換えず、requestCap() で「上限[m/s]と理由」を
-    // 積む。最後に applyCapRequests() が最小値を採り、縛った層の名前を残す。
-    // 以前は9層が後勝ちで書き換え、うち2層が std::max で上げ直していたため、
-    // 層の順序に依存した事故が起きていた(onTimer のコメント参照)。
-    // --- 横位置の調停(2026-09-02 ユーザー指示で統一) ---
-    // 【なぜ要るか】従来は11の層が target_offset を後勝ちで上書きしており、
-    // 追い越しで横間隔 2.89m まで出た直後に別の層が 0.00m へ引き戻して失敗して
-    // いた(実測 20260902-150954)。holdSideBySide / holdAttemptSide は
-    // 「上書きされた自分の指令を上書きし返す」ための対症療法だった。
-    // 意図は優先度で1つだけ選び、制約は区間として交差させ、最後にクランプする。
     enum class LatPrio : int {
       kBase        = 0,   // 基準ライン
       kGridLane    = 10,  // 発進時のグリッド保持
+      // 追い越す側が既に決まっているとき、相手に着く前から寄せておく。
+      kPrePosition = 15,
       kRepulse     = 20,  // 近接車からの反発
       kOvertake    = 30,  // 追い越しの目標横位置
+      kStartHold   = 35,
       kStoppedCar  = 40,  // 停止車集団の回避
       kCollision   = 50,  // TTC 切迫の緊急回避
+      // の車体位置がコリドア/相手に食い込んだときの引き戻し。
+      kBodyGuard   = 60,
     };
     struct LatIntent { double v; LatPrio prio; const char * why; };
     struct LatBound  { double lo; double hi; const char * why; };
@@ -387,38 +351,92 @@ private:
     const char * lat_bound_why{"なし"};   // 最終的にクランプした側の理由
 
     // 意図を出す。優先度が今のものより高いときだけ置き換える。
-    // 同じ優先度なら**後から出したほうが勝つ**(同一層の内部で値を更新できる)。
+    struct LatTrace { const char * why; double a; double b; char kind; bool won; };
+    static constexpr int kLatTraceMax = 24;
+    LatTrace lat_trace[kLatTraceMax];
+    int lat_trace_n{0};
+    void noteLat(char kind, const char * why, double a, double b, bool won)
+    {
+      if (lat_trace_n >= kLatTraceMax) { return; }
+      lat_trace[lat_trace_n++] = {why ? why : "?", a, b, kind, won};
+    }
     void requestLat(double v, LatPrio prio, const char * why)
     {
       if (!std::isfinite(v)) { return; }
-      if (static_cast<int>(prio) >= static_cast<int>(lat_intent.prio)) {
-        lat_intent = {v, prio, why};
-      }
+      const bool won = static_cast<int>(prio) >= static_cast<int>(lat_intent.prio);
+      // kind 'R' = 要求(採用) / 'r' = 要求(優先度で却下)
+      noteLat(won ? 'R' : 'r', why, v, static_cast<double>(prio), won);
+      if (won) { lat_intent = {v, prio, why}; }
     }
     // 制約を出す。区間を狭める方向にだけ効く。
     void boundLat(double lo, double hi, const char * why)
     {
-      if (std::isfinite(lo) && lo > lat_lo) { lat_lo = lo; lat_lo_why = why; }
-      if (std::isfinite(hi) && hi < lat_hi) { lat_hi = hi; lat_hi_why = why; }
+      const bool nlo = std::isfinite(lo) && lo > lat_lo;
+      const bool nhi = std::isfinite(hi) && hi < lat_hi;
+      // kind 'B' = 制約が実際に狭めた / 'b' = 効かなかった
+      noteLat((nlo || nhi) ? 'B' : 'b', why, lo, hi, nlo || nhi);
+      if (nlo) { lat_lo = lo; lat_lo_why = why; }
+      if (nhi) { lat_hi = hi; lat_hi_why = why; }
     }
-    // 途中の層が「いま決まりかけている横目標」を読むための値。
-    // 【なぜ必要か】調停を入れると target_offset は最後まで確定しない。
-    // 従来 c.target_offset を読んでいた層(追突防止の進路判定、壁回避の
-    // want、試行の保持値)がそのまま読むと常に 0 になり、判定が壊れる。
-    // 採用中の意図を、そこまでに積まれた制約で丸めた値を返す。
     double latWant() const
     {
-      double lo = lat_lo, hi = lat_hi;
-      if (lo > hi) { const double m = 0.5 * (lo + hi); lo = hi = m; }
-      return std::clamp(lat_intent.v, lo, hi);
+      auto hard = v2x_overtaker::Hard::kNone;
+      if (hardBound(lat_lo_why) && !hardBound(lat_hi_why)) {
+        hard = v2x_overtaker::Hard::kLo;
+      } else if (hardBound(lat_hi_why) && !hardBound(lat_lo_why)) {
+        hard = v2x_overtaker::Hard::kHi;
+      }
+      return v2x_overtaker::resolveLateralInterval(
+        lat_intent.v, lat_fallback, lat_lo, lat_hi, hard).target;
     }
+    // 境界が「物理的に譲れないもの」か判定する。
+    // 壁・コリドアは越えれば当たるので譲れない。相手との余裕は譲れる。
+    static bool hardBound(const char * why)
+    {
+      if (why == nullptr) { return false; }
+      const std::string w(why);
+      // 「姿勢ぶんの余裕」は車体の張り出しぶんを壁から引いたもので、
+      // これも越えれば当たる。壁と同じ扱いにする。
+      return w.find("壁") != std::string::npos ||
+             w.find("コリドア") != std::string::npos ||
+             w.find("姿勢") != std::string::npos;
+    }
+
+    // 空集合を壁側で解いた回数。効果を数えられないと判定もできない。
+    std::size_t lat_relaxed_n{0};
+    bool lat_relaxed{false};
+
     // 採用した意図を制約へクランプして target_offset を確定する。
     void applyLatDecision()
     {
-      double lo = lat_lo, hi = lat_hi;
-      if (lo > hi) { const double m = 0.5 * (lo + hi); lo = hi = m; }
       const double want = lat_intent.v;
-      target_offset = std::clamp(want, lo, hi);
+      auto hard = v2x_overtaker::Hard::kNone;
+      if (hardBound(lat_lo_why) && !hardBound(lat_hi_why)) {
+        hard = v2x_overtaker::Hard::kLo;
+      } else if (hardBound(lat_hi_why) && !hardBound(lat_lo_why)) {
+        hard = v2x_overtaker::Hard::kHi;
+      } else if (!hardBound(lat_lo_why) && !hardBound(lat_hi_why)) {
+        // 両側とも「相手との余裕」= 譲れる制約。左右を車に挟まれた形。
+        hard = v2x_overtaker::Hard::kNeither;
+      }
+      const bool was_empty = (lat_lo > lat_hi);
+      const auto decision = v2x_overtaker::resolveLateralInterval(
+        want, lat_fallback, lat_lo, lat_hi, hard);
+      target_offset = decision.target;
+      lat_feasible = decision.feasible;
+      lat_relaxed = was_empty && decision.feasible;
+      if (lat_relaxed) { ++lat_relaxed_n; }
+      if (!lat_feasible) {
+        lat_bound_why = "横制約空集合";
+        emergency_brake = true;
+        requestCap(0.0, "横制約空集合");
+        return;
+      }
+      if (lat_relaxed) {
+        // 壁側で解いた。縦は止めないが、由来は残す。
+        lat_bound_why = "空集合を壁側で解決";
+        return;
+      }
       lat_bound_why = (target_offset > want + 1e-6) ? lat_lo_why
                     : (target_offset < want - 1e-6) ? lat_hi_why
                     : "なし";
@@ -427,6 +445,7 @@ private:
     struct CapReq { double v; const char * why; };
     std::vector<CapReq> cap_reqs;
     const char * cap_why{"なし"};
+    std::string cap_all;
 
     // 上限を要求する。負値・非有限は無視する。
     void requestCap(double v, const char * why)
@@ -434,14 +453,19 @@ private:
       if (!std::isfinite(v) || v < 0.0) { return; }
       cap_reqs.push_back({v, why});
     }
-    // 積まれた要求の最小値を speed_cap へ確定し、cap_why に理由を入れる。
     void applyCapRequests()
     {
       double best = -1.0;
       const char * bw = "なし";
+      cap_all.clear();
+      char buf[96];
       for (const auto & r : cap_reqs) {
         if (best < 0.0 || r.v < best) { best = r.v; bw = r.why; }
+        std::snprintf(buf, sizeof(buf), "%s%s=%.1f",
+                      cap_all.empty() ? "" : " ", r.why ? r.why : "-", r.v * 3.6);
+        cap_all += buf;
       }
+      if (cap_all.empty()) { cap_all = "なし"; }
       speed_cap = best;
       cap_why = bw;
     }
@@ -464,6 +488,7 @@ private:
     bool self_ok{false};          // 自力(ブーストなし)で抜ける
     bool lap_traffic{false};      // 一度抜いた運営NPC（周回遅れ）
     bool timed_plan{false};       // 予測区間出口までの前後運動を計算済み
+    bool planned_spot_ready{false}; // 動的展開距離内にいる対象別の計画
     double accel_delay{0.0};      // 全開加速を開始できる最も遅い時刻[s]
     bool timed_boost{false};      // この成立時刻には新規ブーストが必要
     bool allow{false};     // 抜きにいってよいか
@@ -495,7 +520,12 @@ private:
                    size_t from, double stretch, double olat_now,
                    double & run_left, double & run_right, int & known,
                    double * room_left = nullptr,
-                   double * room_right = nullptr) const;
+                   double * room_right = nullptr,
+                   // 決め直しゾーンの番号。>=0 ならその区間の外で窓を打ち切る。
+                   int zone_clip = -1,
+                   bool * zone_clipped = nullptr) const;
+  int mapMinPts(bool zone_clipped) const;
+  bool mapKnownOk(int known, bool zone_clipped) const;
   void onTimer();
   void decideAllow(const Frame & f, PlanCtx & c, const std::string & name,
                    const OtherState & o, size_t oi, double gap, double olat,
@@ -523,46 +553,35 @@ private:
   bool sideStaysOpen(const Frame & f, double off, double ahead) const;
   double spotGateDistance(const Frame & f, const OtherState & o) const;
   bool spotPathSafe(const Frame & f, const OtherState & o, double ahead) const;
+  // --- 能力だけで「抜き切れるか」を判定する(ゾーンを使わない) ---。
+  bool passPathCapable(const Frame & f, double ahead, double w_need,
+                       double & fail_at, double & min_w) const;
   double latestPassAccelDelay(const Frame & f, const std::string & name,
                               const OtherState & o, double gap,
                               double exit_distance, bool use_boost,
                               double pass_start_dist) const;
   double distToSidePickZoneEnd(const Frame & f) const;
-  double zoneMeanLat(const OtherState & o, std::size_t n, int & known) const;
+  double zoneMeanLat(const OtherState & o, std::size_t n, int & known,
+                     int zone = -1) const;
+  // idx が属する決め直しゾーンの番号(属さないなら -1)
+  int sidePickZoneIndex(std::size_t idx) const;
   void dumpTrace(const Frame & f);
   bool passAllowedThisLap(const std::string & name, const OtherState & o,
                           bool clearly_slower) const;
-  // 指定した相手に対して、いま追い越しが進行中で、かつ横方向にその相手の
-  // 進路から十分外れているか。
-  //
-  // 【なぜ作ったか】追従(followAndCommit)と追突防止(preventRearEnd)が
-  // 「いま追い越し中か」を別々の条件で判定していた。追従の commit_now は
-  // attempt_active_ を見ず、追突防止の緩和は attempt_active_ 必須。速度上限は
-  // 両者の min を採るため、片方だけが緩んでももう片方が押さえ込み、実測では
-  // 全周期の96%で 8〜12km/h に張り付いていた。判定を1本にして揃える。
   bool passUnderway(const std::string & name, double lat_sep) const;
 
-  // ================= 追い越しの状態機械 (2026-09-02) =================
-  // 【なぜ作るか】従来は attempt_active_ という真偽値ひとつで「追い越し中か」を
-  // 表し、速度制御・横位置・中断判定がそれぞれ別の条件で「今追い越しているか」を
-  // 判断していた。そのため追従用の速度制限が追い越し中も効き続け(実測で全周期の
-  // 大半が 12.8km/h に制限)、横へ出るには速度が要るのに横へ出るまで速度が出ない
-  // という循環が起きていた。また「抜こうとしている相手が遅い」ことを理由に
-  // 停止車回避が試行を中断していた(実測で中断理由の最多)。
-  // 状態を1つ持ち、状態ごとに「誰が速度を決めてよいか」「何を理由に中止するか」を
-  // 明示する。
-  //
-  //   FOLLOW   : 追わない/追従する。通常の追従速度制限が効く
-  //   PREPARE  : 計画した抜きどころへ接近中。追従制限は効くが目標車間を詰める
-  //   MOVE_OUT : 横へ出ている最中。追従制限は外れ、衝突安全だけが残る
-  //   PASS     : 並走〜追い抜き中。同上
-  //   MERGE    : 抜き切ってラインへ戻る最中。同上
-  //   COOLDOWN : 中止直後の休止。次の計画を作るまで仕掛けない
   enum class OvState { kFollow, kPrepare, kMoveOut, kPass, kMerge, kCooldown };
   OvState ov_state_{OvState::kFollow};
   std::string ov_target_;        // 状態機械が対象としている相手
   double ov_state_since_{-1.0};  // 現在の状態に入った時刻[s]
   double ov_cooldown_until_{-1.0};
+  std::string prepare_wish_;        // この周期に「接近準備してよい」と判定した相手
+  double prepare_wish_gap_{1e18};   // その相手までの車間(最も近い車を選ぶため)
+  // 準備状態のばたつき対策。
+  bool prepare_target_seen_{false};    // この周期に対象を評価したか
+  bool prepare_target_hard_ok_{true};  // 対象に対し 側/幅/禁止区間 が成立
+  double prepare_lost_since_{-1.0};    // 希望が対象を指さなくなった時刻[s]
+  bool prepare_free_active_{false}; // 録画なしの入口で PREPARE に入っているか
   // 「横の余地が物理的に消えた」を数えるための計時。帯幅 < band_car_w_ が
   // spot_abort_sec_ 以上続いたときだけ中断する。負なら余地はある。
   double ov_narrow_since_{-1.0};
@@ -575,9 +594,6 @@ private:
   bool wall_push_now_{false};
   static const char * ovStateName(OvState s);
   const char * ovStateName() const { return ovStateName(ov_state_); }
-  // 追い越しの実行中(追従制限を外してよい状態)か
-  // 【追加 2026-09-03】接近中(PREPARE)にその相手を対象にしているか。
-  // 抜く場所へ「速度を持って」到達するための助走に使う。
   bool ovPreparingTarget(const std::string & name) const {
     return ov_state_ == OvState::kPrepare && !ov_target_.empty() &&
            ov_target_ == name;
@@ -592,21 +608,27 @@ private:
   }
   // 状態遷移。planOvertake の後、実行層の前で毎周期呼ぶ。
   void updateOvertakeState(const Frame & f, PlanCtx & c);
-  // ブーストを解禁してよい周回か(ユーザー指示: 3周目以降)。
   bool boostLapOk() const { return !lap_gate_enable_ || lap_ >= boost_min_lap_; }
   void planOvertake(const Frame & f, PlanCtx & c);
   void preventRearEnd(const Frame & f, PlanCtx & c);
-  // 指定 idx が公式オーバーテイクレーンの中か。
   bool inOtLane(std::size_t idx) const;
   // 車体を丸ごとレーンへ入れられる区間の中か。
   bool inOtLaneUse(std::size_t idx) const;
   // idx から先 look[m] の範囲にレーンがあるか(横移動の遅れを織り込むため)。
   bool otLaneAhead(std::size_t idx, double look) const;
-  // いま公式オーバーテイクレーンを使ってよいか(位置と自車速度で判定)。
   bool otLaneUsable(std::size_t idx) const;
-  // idx から公式オーバーテイクレーンの入口までの距離[m]。
-  // look[m] 以内に入口が無い(またはレーンの中にいる)なら負を返す。
+  bool laneGuardSuppressed(const Frame & f) const;
   double otLaneEntryDistance(std::size_t idx, double look) const;
+  double otLaneSpeedDeadlineDistance(std::size_t idx, double look) const;
+  // 止まっている車の占有に足す余裕[m]。max(stopped_size_pad_, size_pad_)。
+  double stoppedPad() const;
+  // 助走が使う加速度[m/s^2]の唯一の計算箇所。ブースト分の加算も含む。
+  double runupAccelMps2() const;
+  // ブースト抜きの助走加速度[m/s^2]。ブースト有無を両方比較したい
+  // 呼び出し側(ブーストを撃つべきか判定する側)はこちらを使い、
+  // 自分で `+ boost_accel_` する。
+  double runupAccelBase() const;
+  bool otLaneAimWindow(std::size_t idx, double & lo_out, double & hi_out) const;
   // レーンの中にいる、または「入口までに攻撃側の速度へ到達できる位置にいる」か。
   // 横位置は指令から約20m先で実現するので、レーンに入ってから許可を出しても
   // その許可ではレーンへ入れない。入口の手前から許可する必要がある。
@@ -614,10 +636,6 @@ private:
   // いまの順位で許される速度上限[m/s]。
   double rankSpeedCap() const;
 
-  // --- 相手の走り方のモデル(ユーザー指示 2026-09-05) ---
-  // 「イン側がどちらで、どれだけ強いか」を地点ごとに -1..+1 で表した表。
-  // 曲率の符号(左旋回で +1)に、曲率半径から作った強さを掛けたもの。
-  // モデルの横位置の説明変数になる。経路の点数が変わったときだけ作り直す。
   void buildInsideTable(const Trajectory & in);
   double insideAt(std::size_t idx) const;
   // その地点で相手がいると見込む横位置[m]。録画があればそれを優先し、
@@ -663,8 +681,12 @@ private:
   const double latch_width_gain_; // イン側から抜くときの必要幅の倍率
   double curve_sign_{0.0};         // 現在地点の曲率の向き (+1=左旋回)
   const double pass_gap_;
+  const double pass_gap_clear_ratio_;  // 相手との車体の隙間を車幅の何倍取るか
   const double pass_side_clear_;  // 追い越し中とみなす最小の横間隔[m]
-  const double follow_gap_;
+  const bool gate_sidestep_after_merge_;  // 門への横逃がしは合流後だけ
+  const bool predict_all_targets_;  // 予測判定を全相手に適用する
+  // 追突防止を完全に外してよい横間隔[m]。既定は車体の全幅 1.45m。
+  double pass_beside_sep_;
   const double offset_rate_;
   const double corridor_safety_;
   const double corridor_safety_pass_;  // 追い越し試行中に使う縁からの余裕[m]
@@ -674,7 +696,8 @@ private:
   const int side_flip_max_;        // 対象車1台につき側を変更してよい回数(バースト)
   const double side_flip_regen_;   // 変更の枠がこの秒数につき1回ぶん回復する
   const bool lane_learn_;          // 相手の横位置を地点ごとに学習するか
-  const bool lane_map_side_;       // 学習結果を側の判断に使うか
+  const bool lane_map_side_;
+  const bool side_model_fill_;  // 側の選択で地図の穴をモデルで埋めるか
   const double lane_map_stretch_;  // 側の判断で見る先の距離[m]
   const int lane_map_min_pts_;     // 学習点がこの数以上あるときだけ信用する
   const double lane_map_margin_;   // 足りている連続区間がこの差[m]を超えたら長いほうを選ぶ
@@ -685,8 +708,6 @@ private:
   const double window_back_;
   const double start_merge_dist_;
   const double start_lat_max_;
-  const bool start_p3_follow_;   // 3位スタートで2位側へ寄せるか
-  const double start_p3_lat_;    // 3位スタートで寄せる横位置[m](正=左, 負=右は符号次第)
   const double stop_hold_gap_;   // 停止車がこれ[m]より近ければ下限速度を課さない
   const double stop_hold_sec_;   // その猶予[s]。過ぎたら膠着対策の下限を戻す
   const double stop_hold_move_;  // 自車がこれ[m/s]以上で動いているときだけ待つ
@@ -697,76 +718,27 @@ private:
   const double attempt_stall_gain_;  // その間に進行度差がこの量[m]増えなければ降りる
   const double attempt_stall_cool_;  // 進展なしで降りた相手へ再挑戦しない時間[s]
   const double pass_len_;            // 抜き切るのに必要な相対距離[m]
-  // 【追加 2026-09-02】追い越しを「完了した」と認めるための相対距離と継続時間。
-  // 旧実装は diff>0 が3周期(0.15秒)続けば成功としており、並走中に差がゼロ
-  // 付近で振動するだけで成立していた。成功と判定すると attempt_active_ を
-  // 落とすため、横に並んだ瞬間に試行を終えてラインへ戻り、また後ろへ落ちる。
   const double pass_done_len_;       // 完全に前へ出たと認める相対距離[m]
-  // 【追加 2026-09-02】「今ここから抜き切れる」と予測が示したとき、そこも
-  // 抜きどころとして認めるか。計画した1点でしか仕掛けられない設計では、
-  // 相手が8km/h・自車36km/hでも「より良い場所」を待って結局抜かなかった。
   const bool spot_here_enable_;      // 即時の抜きどころを認めるか
   const double spot_here_range_;     // 即時判定を行う車間の上限[m]
   const double pass_done_sec_;       // その状態を維持すべき時間[s]
   const double pass_done_min_sec_;   // 追い越し1件の所要時間の下限[s]
-  // ================= ペナルティの推定 (2026-09-03) =================
-  // AWSIM のペナルティは「その秒数だけ最高速度を 5km/h に固定」する形で効き、
-  // 通知トピックは無い(単独走行の評価 JSON にしか出ない)。したがって
-  // 速度が 5km/h に張り付いていることからしか推定できない。
-  // 誤検出を減らすため、許容幅の内側に一定時間入り続けた場合だけ「ペナルティ中」
-  // とみなす。通常走行で 5.0km/h ちょうどを維持し続けることは稀。
   const double pen_speed_;           // ペナルティ時の固定速度[m/s] (5km/h)
   const double pen_tol_;             // 許容幅[m/s]
   const double pen_hold_;            // この秒数continuousで確定[s]
-  // ================= 壁衝突の予測監視 (2026-09-03) =================
-  // 「今の速度・今の横目標のまま走ると、この先で車体が走行可能領域から
-  // はみ出す」ことを先に見つけて、横位置の制約と速度上限として出す層。
-  // 意図(requestLat)は一切出さない。範囲を狭める / 上限を下げる方向にしか
-  // 働かないので、他層と喧嘩したり発振したりしない。
-  //
-  // 【寸法について】公式 vehicle_info.param.yaml は wheel_base 1.087 /
-  // 車幅 1.30m だが、このプロジェクトの実測はホイールベース 2.14m /
-  // 実幅 1.46m(半幅 0.73)で、比 1.97 を steering_tire_angle_gain が
-  // 吸収している。予測は実測値を既定にするが、どちらが正しいか確証は
-  // 無いのでパラメータで振れるようにしてある。
   const bool wall_guard_enable_;         // 有効化
   const double wall_guard_horizon_;      // 予測する秒数[s]
   const double wall_guard_dt_;           // 刻み[s]
   const double veh_half_width_;          // 車体半幅[m](実測 1.46m の半分)
-  const double veh_wheel_base_;          // ホイールベース[m](実測値)
+  const double veh_wheel_base_;          // 制御モデル上の実効ホイールベース[m]
   const double veh_front_overhang_;      // 前オーバーハング[m]
   const double veh_rear_overhang_;       // 後オーバーハング[m]
   const double veh_max_steer_;           // 最大舵角[rad]
   const double wall_guard_margin_;       // 走行可能領域の内側に残す余裕[m]
   const double wall_guard_run_;          // この長さ[m]以上連続で違反したら作動
   const double wall_guard_ay_max_;       // 速度制限に使う横加速度上限[m/s^2]
-  // corridor_ten.csv の lo/hi は make_corridor.py が
-  // 「境界 - (半幅 + 余裕)」で作っており、**すでに半幅が控除済み**。
-  // (コード内の実測メモ: 物理的な壁 -2.85 / csv の lo -1.67
-  //  = 差 1.18 = 半幅 0.73 + 余裕 0.45)
-  // よって予測でもう一度 veh_half_width_ を丸ごと引くと二重計上になり、
-  // 常時作動して極端に遅くなる。控除済みの半幅をここで宣言し、
-  // 車体の張り出しのうち**超過したぶんだけ**を足す。
   const double wall_guard_corridor_half_;
 
-  // ================= 占有格子による舵角ガード (2026-09-03) =================
-  // 【なぜ要るか】上の CSV(corridor_ten.csv)ベースの判定は、車体の内輪差や
-  // 前端の振り出しを **近似式で横位置に足す** 間接的なものだった。占有格子を
-  // 直接引けば、車体の四隅の座標をそのまま地図に当てられるので近似が要らない。
-  //
-  // 【出力は舵角の範囲だけ】(2026-09-03 ユーザー訂正)
-  // この層は /control/wall_guard/steer_limit へ流す舵角の許容範囲しか作らない。
-  // requestCap も boundLat も呼ばない。縦方向(減速)は preventRearEnd と TTC の
-  // 担当で、追突の正しい対処は減速であって転舵ではないため。
-  //
-  // 【他車を除外条件にしない】前方に車がいるだけで「直進が禁止」になると、
-  // 強制的に横へ切る挙動になってしまう。他車は予測位置として評価し、
-  // ログには残すが候補からは落とさない。
-  //
-  // 【逃げ場が無いとき】(2026-09-03 ユーザー訂正)
-  // 余裕 >= 0 の候補が1つも無いときはフェイルオープンせず、
-  // 「最も食い込みが浅い舵角」= 幾何的に最も壁と平行に近い舵角へ固定する。
-  // 正面から突っ込むより接触が浅くなる(= 壁に沿う)。
   const bool occ_enable_;            // 占有格子ガードの有効化
   const std::string occ_map_yaml_;   // 占有格子地図の yaml(絶対パス)
   const double occ_sample_step_;     // 車体の辺を刻む間隔[m]
@@ -817,30 +789,14 @@ private:
 
   void wallGuard(const Frame & f, PlanCtx & c);
   // 方位差 e[rad](正=左を向く)のときの車体の左右の張り出し[m]。
-  void bodyExtent(double e, double & ext_left, double & ext_right) const;
+  // その地点の曲率半径[m]。取れなければ -1。
+  double curveRadiusAt(std::size_t idx) const;
+  void bodyExtent(double e, double & ext_left, double & ext_right,
+                  double curve_radius = -1.0, int curve_sign = 0) const;
   // 車体が縦に重なっている相手へ、横に近づく動きを禁じる。
   void holdSideAlongside(const Frame & f, PlanCtx & c);
-  // 【舵角の許容範囲を制御側へ渡す】
-  // wallGuard は横位置の制約(boundLat)と速度上限(requestCap)しか出さないので、
-  // 「経路がどうであれ制御が壁へ向かう」場合を止められない。そこで、現在地点で
-  // 壁に当たらない舵角の範囲を毎周期 /control/wall_guard/steer_limit へ流し、
-  // simple_pure_pursuit 側で最後にクランプさせる。ここは publish するだけで、
-  // wallGuard の既存の出力(boundLat / requestCap)には一切触れない。
+  void bodyGuardByMeasured(const Frame & f, PlanCtx & c);
   void publishSteerLimit(double lo, double hi, bool viol);
-  // ================= 記録を rosbag へも載せる (2026-09-03 ユーザー指示) =================
-  // 【なぜ必要か】車両状態・制御指令・他車位置は既に rosbag に入っているが、
-  // 「なぜその判断をしたか」(却下の決め手・速度上限を決めた層・横位置の意図と制約・
-  // 状態遷移・占有格子の判定・接触の局面)はどのトピックにも流れておらず、
-  // bag からは復元できない。テキストログにしか無いため、後処理が grep 頼みになり、
-  // レート制限のせいで発生回数を誤読する事故も起きた(「最終回避35回」は
-  // 2秒制限のログ行数で、実際は数百回だった)。
-  //
-  // 【同期を構造で保証する】diagLog / diagWarn は「1回のフォーマットで
-  // テキストログと診断トピックの両方へ出す」。記録を追加するときはこの関数を
-  // 使う限り、両方へ自動的に載る。片方だけ追加されることが起こらない。
-  //
-  // 形式は JSON Lines。1 メッセージ = 1 行の JSON で、後処理が容易。
-  //   {"t":123.456,"node":"v2x_overtaker","type":"追越記録","msg":"..."}
   void diagEmit(const char * type, bool warn, const char * text);
   void diagLog(const char * type, const char * fmt, ...)
     __attribute__((format(printf, 3, 4)));
@@ -871,32 +827,19 @@ private:
   bool attempt_self_pen_{false};     // 試行中に自車がペナルティ中だった
   std::size_t attempt_idx0_{0};      // 開始地点のインデックス
   const double pass_time_limit_;     // この時間[s]以内に抜けるなら実行する。
-                                     // 実測: 2位で前車20km/h・車間8m のとき 5.3秒、
-                                     // 前車24km/h なら 6.5秒かかる。4秒では全て却下される。
-  const double boost_gain_;          // ブーストで得られる接近速度の上乗せ[m/s]
   const double boost_retry_sec_;     // 1個目が効かなかったと判断するまでの時間[s]
   const double boost_min_speed_;     // これ未満[m/s]では撃たない(密集した発進直後を避ける)
   const double boost_accel_;         // ブーストの加速度上乗せ[m/s^2] (実装値 0.5)
-  const double boost_duration_;      // ブーストの継続時間[s] (実装値 10.0)
   const double boost_min_headroom_;  // 加速余地[m/s]がこれ未満なら撃たない
   const double vehicle_accel_;       // 実効加速度[m/s^2]。AWSIM のクランプは1.0だが
-                                     // 抵抗があるので実測 0.9 程度を使う
   const double zone_exit_margin_;    // ゾーン出口を越えても許す距離[m]。
                                      // 追い越しには 40〜50m 要るがゾーンは 14〜24m しかない。
                                      // ゾーン内で並びかけ、出口を越えて完了する形を許す。
   const double leader_speed_cap_;    // 1位の速度制限[km/h] (実装値 25.0)
-  // 順位別のコーナー速度係数。sweep.sh の順位別計測から決める
   const double rank1_corner_gain_;   // 1位(25km/h制限あり)のとき
   const double rank2_corner_gain_;   // 2位以下(制限なし)のとき
   const double rank2_speed_cap_;     // 2位以下の上限[km/h] (driveFadeSpeed 36.0)
   const bool rank_shape_enable_;
-  // --- 最終区間の決めうち(ブーストの温存とタイミング) ---
-  // 【一次情報】parallel.sh は --boosts 2 --laps 6。ブーストは有限資源。
-  // 評価は docs/interface/evaluation-interface.md より final_position のみ。
-  // 【AWSIM実測】rank==1 のとき駆動の頭打ちが 25km/h、2位以下は 36km/h。
-  // 【実測】1位でいた車のベストラップ中央値 47.2s / 2位 35.7s。
-  // 周長 334.5m なので先頭は 1周あたり 11.5秒(81m)を失う。
-  // よってレース中の順位に価値は無く、最後に先にラインを切ることだけに価値がある。
   const bool   final_dash_enable_;   // マスタ退避スイッチ
   const int    boost_reserve_final_; // 最終区間用に残す個数
   const double final_dash_dist_;     // フィニッシュまでの残り[m]。以下を最終区間とする
@@ -906,8 +849,6 @@ private:
   const bool   final_dash_boost_when_leading_;  // 検証用。1位でも最終区間で撃つ
   const double near_radius_;
   const double min_lat_sep_;
-  // true にすると反発力を追い越し許可(can_pass_now_)で門番する旧挙動に戻る。
-  // A/B 計測用。既定は false(帯で幅を判定する新挙動)。
   const bool repulse_need_allow_;
   // 反発で逃げるとき、帯の端に残す余白[m]。0 だと端に張り付いて壁接触が増えた。
   const double repulse_band_margin_;
@@ -915,37 +856,208 @@ private:
   const double boost_side_gap_;
   const double min_pass_width_;
   const bool rear_end_lat_release_;   // 横にずれた分だけ追突防止を緩めるか
-  const double rear_end_free_min_;    // 車体が触れない横間隔[m]。これ未満は緩めない
+  const double rear_end_free_min_;
+  const bool lat_lag_by_speed_;
+  const double lat_lag_sec_;
+  const bool stop_nopass_release_on_pass_;  // 通れる判定に戻ったらラッチを解く
+  const double lat_lag_base_;
+  const double lat_lag_max_;
+  // 準備(横へ出始める)を開始する車間を、必要距離から決める。
+  const bool prepare_early_;
+  const double prepare_early_margin_;
+  rclcpp::Time last_prepare_gate_log_{0, 0, RCL_ROS_TIME};
+  std::size_t prepare_early_count_{0};
+  const bool spot_look_local_;
+  rclcpp::Time last_look_short_log_{0, 0, RCL_ROS_TIME};
+  std::size_t look_short_count_{0};
+  const std::string caution_zone_spec_;
+  std::vector<std::pair<std::size_t, std::size_t>> caution_zones_;
+  const bool side_recheck_;
+  const double side_recheck_sec_;
+  const bool side_by_completion_;
+  // 側を「広いほう」ではなく「早く通せるほう」で決めるか。
+  const bool side_plan_enable_;
+  const double side_plan_reach_gain_;   // 到達時間に掛ける安全率
+  const double side_plan_room_margin_;  // 通れると認める最小の空き[m]
+  const double side_plan_ay_max_;       // 追従可能性の判定に使う横加速度の限界[m/s^2]
+  // 計算が「抜ける」と答えた側を、失敗するまで決め直さないか。
+  const bool side_commit_;
+  bool side_committed_{false};
+  std::string side_commit_target_;
+  // 計画のときに見る窓の範囲(抜き切り距離に対する比)。0 で全域。
+  const double side_plan_window_;
+  // 側の判定に使う窓の最低の長さ[m]。短いと『開いている側が反転する』手前で切れる。
+  const double side_window_min_m_;
+  // 側の判定に要る横間隔へ rear_end_free_min を含めるか。
+  const bool side_need_rear_free_;
+  // どちらの側でも必要間隔に届かないとき、横へ出るのをやめるか。
+  const bool side_hold_when_none_;
+  const bool allow_need_full_;
+  // 「どちらの側も抜けない」がこの秒数続いたら試行を降りる。0 で無効。
+  const double attempt_giveup_time_;
+  double attempt_nopass_since_{-1.0};
+  std::size_t attempt_nopass_n_{0};
+  // 同上の判定結果(その周期で「どちらでも抜けない」か)。
+  bool no_pass_side_{false};
+  std::string no_pass_side_target_;   // その判定が誰についてのものか
+  rclcpp::Time last_no_side_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_no_start_log_{0, 0, RCL_ROS_TIME};
+  std::size_t no_side_hold_n_{0};
+  // 窓の探索を、いま走っている直線の中に閉じ込めるか。
+  const bool side_search_in_zone_;
+  const bool side_zone_end_clamp_;
+  // plan_mode で縮尺 0.85(窓の短縮)を使わない
+  const bool side_plan_full_scale_;
+  const double pass_need_room_m_;
+  // 計画が側を決められなかったとき、**直線の幾何そのもの**を既定にする。
+  const bool side_zone_geom_default_;
+  // 停止車の横を通るときの要る横移動を「帯に入るまで」で測る。
+  const bool stopped_band_edge_;
+  // 先の閉まり方から逆算して、戻れない縁へ横目標を出さない(idx170 対策)。
+  const bool reachable_lat_clamp_;
+  const double reachable_lat_ahead_;
+  const bool side_default_by_room_;
+  const double side_default_room_hyst_;
+  // その判定に使う、抜き切り地点の手前の長さ[m]。
+  const double side_geom_tail_m_;
+  // 直線の残りがこれ未満なら幾何の既定も出さない[m](端切れで決めない)。
+  const double side_geom_min_m_;
+  // 助走の基準を、録画の抜きどころではなく計画の「抜き始める地点」にする。
+  const bool runup_use_plan_;
+  // 助走の加速度にブーストぶんを足す。
+  const bool runup_boost_accel_;
+  // 抜き切り距離に加速フェーズを入れる。
+  const bool pass_dist_accel_;
+  // 抜き切り計算が「ブーストが要る」と答えたら撃つ。
+  const bool pass_boost_gate_;
+  // 停止車の占有帯にコーナーの張り出しを足す。
+  const bool occupied_yaw_pad_;
+  // 車体の張り出しにコーナーの振り出しを足す。
+  const bool body_curve_pad_;
+  const bool occupied_real_width_;
+  const bool side_meanlat_live_;
+  // 相手の横位置だけで決める枝にもコリドアを見させる。
+  const bool side_fallback_room_;
+  // 側を相手と壁の間の空きで決める。
+  const bool side_room_first_;
+  const bool ot_lane_log_;
+  const double side_run_tie_;
+  // 既定の側を通せる連続長で決める。
+  const bool side_default_run_;
+  // 抜ける判定が出ないとき試行の開始を止める / 横移動まで止めるか。
+  const bool no_pass_attempt_hold_;
+  const bool no_pass_lat_hold_;
+  // 「隙間が続く距離 >= 抜き切り距離」で側を決める。
+  const bool side_run_decide_;
+  mutable rclcpp::Time last_run_decide_log_{0, 0, RCL_ROS_TIME};
+  mutable rclcpp::Time last_run_short_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_creep_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_lane_aim_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_gap_open_log_{0, 0, RCL_ROS_TIME};
+  // 判定→ブーストの接続。どちらも「その周期の計算結果」で毎周期入れ替える。
+  bool gate_boost_want_{false};      // 門に間に合わせるにはブーストが要る
+  bool straight_need_boost_{false};  // 直線内に抜き切るにはブーストが要る
+  rclcpp::Time last_gate_boost_log_{0, 0, RCL_ROS_TIME};
+  bool   dbg_runup_reached_{false};   // 助走ブロックに入ったか
+  bool   dbg_runup_charge_{false};    // 助走が「全開」と答えたか
+  bool   dbg_gate_runup_{false};      // レーン入口を基準にしたか
+  double dbg_d_gate_{-1.0};           // レーン入口までの距離[m]
+  double dbg_runup_vtgt_{-1.0};       // 助走の目標速度[m/s]
+  double dbg_runup_accel_at_{-1.0};   // 加速開始点[m]
+  double dbg_runup_dref_{-1.0};       // 加速開始の基準距離[m]
+  double dbg_eff_safe_{-1.0};         // 助走が要求した車間[m]
+  double runup_holding_gap_{0.0};     // 助走がいま保とうとしている車間[m]
+  double dbg_gap_{-1.0};              // そのときの車間[m]
+  bool   dbg_charge_now_{false};      // 最終的に全開になったか
+  rclcpp::Time last_runup_audit_log_{0, 0, RCL_ROS_TIME};
+  std::map<std::string, size_t> reject_why_n_;
+  std::map<std::string, size_t> reject_why_straight_n_;
+  size_t reject_total_n_{0};
+  rclcpp::Time last_reject_sum_log_{0, 0, RCL_ROS_TIME};
+  mutable rclcpp::Time last_otlane_log_{0, 0, RCL_ROS_TIME};
+  const double side_run_need_;
+  // 相手と自車を少し大きく見る余裕[m]。経路が無ければ外す。
+  const double size_pad_;
+  // 横間隔のパラメータに「物理の下限 + size_pad」の床を張る。
+  const bool sep_floor_enable_;
+  mutable rclcpp::Time last_occ_relax_log_{0, 0, RCL_ROS_TIME};
+  mutable rclcpp::Time last_meanlat_log_{0, 0, RCL_ROS_TIME};
+  // 相手の中心からこれだけ離れないと当たる、という半幅[m]。
+  double occupiedHalfWidth(std::size_t idx, bool pad = true) const;
+  // 「ブーストを使えば直線の中で抜き切れる」と判定したか。
+  mutable bool pass_need_boost_{false};
+  mutable rclcpp::Time last_pass_accel_log_{0, 0, RCL_ROS_TIME};
+  // plan_mode の出力(監査ログ用)
+  // 相手の生座標と最近傍点の idx(位置の問題か変換の問題かを切り分ける)
+  mutable double audit_opp_x_{0.0}, audit_opp_y_{0.0};
+  mutable int audit_opp_idx_{-1};
+  mutable double audit_plan_start_{-1.0};
+  mutable double audit_plan_y_{0.0};
+  mutable int audit_plan_feas_{0};      // bit0=左 bit1=右
+  mutable double audit_early_l_{-1.0};
+  mutable double audit_early_r_{-1.0};
+  mutable int audit_rej_l_[4]{0, 0, 0, 0};
+  mutable int audit_rej_r_[4]{0, 0, 0, 0};
+  // 相手の観測が何秒前のものか。**これが無いとログの古さと実際のずれを。
+  mutable double audit_opp_age_{-1.0};
+  // completionSide をこの周期で実際に呼んだか。0 なら下の値は前周期の残り。
+  mutable int audit_cs_fresh_{0};
+  // 側が幾何の既定から出たか(1)、計画から出たか(0)。
+  mutable int audit_geom_{0};
+
+  mutable std::size_t plan_start_idx_{0};
+  mutable bool plan_start_valid_{false};
+  mutable std::string plan_start_target_;
+  mutable double plan_y_target_{0.0};
+  const double side_completion_window_;   // 抜き切り窓の比(0.5 = 後半半分)
+  // 抜き切り地点の空きで側を決めたか / そこに入れるか。
+  // side_fits_ の判定(別スコープ)まで持ち越すのでメンバにする。
+  bool want_from_completion_{false};
+  bool completion_room_ok_{false};
+  bool ot_lane_side_{false};
+  std::size_t ot_lane_side_kept_n_{0};
+  rclcpp::Time last_ot_lane_keep_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_latgate_log_{0, 0, RCL_ROS_TIME};
+  std::size_t latgate_block_count_{0};
+  rclcpp::Time last_completion_side_log_{0, 0, RCL_ROS_TIME};
+  std::size_t completion_side_count_{0};
+  // 抜き切る地点の空きから側を返す。決められなければ 0。
+  int completionSide(const Frame & f, const OtherState & o, double pass_dist,
+                     double need_sep, double olat_now,
+                     double & room_l, double & room_r) const;
+  const bool rear_end_predict_release_;
+  const double rear_end_predict_floor_;    // 真後ろ扱いにする横間隔[m]
+  const double rear_end_predict_max_sec_;  // 外挿してよい時間[s]
+  // 横間隔の変化率を作るための追跡(相手ごと)。V2X も自車も横速度を直接は持たない。
+  struct SepTrack
+  {
+    double sep{0.0};
+    double rate{0.0};                          // なました変化率[m/s]
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+    bool init{false};
+  };
+  std::map<std::string, SepTrack> sep_track_;
+  rclcpp::Time last_rear_predict_log_{0, 0, RCL_ROS_TIME};
+  std::size_t rear_predict_release_count_{0};
+  double sepRate(const std::string & name, double sep_now, const rclcpp::Time & now);    // 車体が触れない横間隔[m]。これ未満は緩めない
   const double rear_end_free_full_;   // ここまで離れたら完全に開放[m]
   const double rear_end_free_speed_;  // 完全に外れたときに許す速度[m/s]
   rclcpp::Time last_release_log_{0, 0, RCL_ROS_TIME};
-  const double min_pass_sep_;
+  double min_pass_sep_;
   const double pass_sep_floor_;   // 追い越しで確保する横間隔の下限[m]   // 並走時に必要な横間隔[m](カート幅 1.45)
   const double min_closing_kmh_;  // これ未満[km/h]の速度差では仕掛けない(同速対策)
   const double pass_dist_max_;    // 抜き切るのにこれ以上[m]要るなら仕掛けない
   const double stopped_speed_;       // これ以下なら「止まっている」[m/s]
+  // 停止判定(<= stopped_speed)への入口と、ラッチからの出口を分ける。
+  // 速度推定が 1.0m/s 前後で揺れても、1.5m/s を超えて 1秒続くまでは
+  // 「通れない」を保持する。
+  const double stop_nopass_exit_speed_;
+  const double stop_nopass_release_sec_;
   const double stopped_look_ahead_;  // 停止車両を探す前方距離[m]
   const double stop_margin_;         // 停止車両の手前に空ける距離[m]
-  // 停止車回避の制動距離に掛ける係数。実測減速度は中央値0.48 m/s^2 しかなく、
-  // a_min(2.5) をそのまま使うと制動距離を約5倍過小評価する。
   const double stop_brake_k_;
   const double stop_hold_margin_;    // 追突判定で制動距離へ足す余裕[m]
 
-  // 「このまま行くと前の停止車へ追突する」か。
-  //
-  // 【直したバグ(ユーザー報告: スタートがとても遅い / P2 が1位になれない)】
-  // ここは `gap < stop_hold_gap_(3.0) && my_speed > stop_hold_move_(0.5)` という
-  // **固定車間 + 自分が動いているか**で判定していた。
-  // スタートではグリッド間隔が 2.0〜3.1m しかなく、青信号で発進した瞬間に
-  // 「自分は動いている・前車はまだ 2.0m 先で停止中」が成立するため**必ず発動**し、
-  // 速度上限が 10.8km/h から 0.0km/h へ落ちる。
-  // 実測(d2): t=602.9 に 0.0km/h、そこから 8 秒間 0〜8km/h。
-  // devnote 159 で足した `my_speed > stop_hold_move_` は、発進した瞬間に
-  // 自分が動く以上まったく効いていなかった。
-  //
-  // 待つべきなのは「接近速度があって、その車間では止まりきれない」ときだけ。
-  // スタートは前車も同時に加速するので接近速度がほぼ 0 になり、待たなくなる。
-  // 走行中に止まっている車へ突っ込む場面は接近速度が大きいので従来どおり待つ。
   bool wouldRearEnd(double gap, double other_speed) const
   {
     const double closing = my_speed_for_gap_ - std::max(other_speed, 0.0);
@@ -956,27 +1068,13 @@ private:
   }
   const double stopped_cluster_span_;  // 同じ場所で止まっているとみなす前後差[m]
   const double stopped_slack_;         // 余裕をもって通れるとみなす空き幅[m]
-  const double stopped_thread_speed_;  // かろうじて通るときの速度[m/s]
-  const double stopped_clear_speed_;   // 十分な空き幅があるときに許す速度[m/s]
-  const double stopped_clear_gain_;    // 空き幅1mあたりの上限引き上げ[m/s]
-  const double stopped_clear_in_;      // 帯の端からこれだけ内側に入っていること[m]
 
-  // ---- 全域バンド(壁 + 他車の予測位置)----
-  // 【なぜ作ったか(ユーザー指示)】
-  // これまでは「今この瞬間どこへ寄るか」を表す **スカラー1個** (offset_) を
-  // 12 層が上書きし合い、それを自車前後 30m の窓だけに掛けていた
-  // (window_full=15 / window_end=30)。先読みが原理的に不可能で、
-  // rviz でも自車の近くしか経路が変わらない。
-  // ここでは走行可能な横方向の範囲を **周回全域** で持ち、
-  //  (a) rviz に出してデバッグできるようにし、
-  //  (b) 軌道オフセットを全域でそこへ収める。
   const bool   band_enable_;      // バンドを計算して rviz に出す
   const bool   band_clamp_;       // 軌道オフセットをバンドへ収める
   const bool   band_predict_;     // 他車を「自分が着く時刻」まで進めて塞ぐ
   const double band_horizon_;     // 先読みする距離[m]
   const double band_long_;        // 縦にこれだけ近ければ塞ぐ[m]
-  const double band_car_w_;       // 相手の中心から塞ぐ横幅[m]
-  const double band_v_floor_;     // 到達時刻を出すときの自車速度の下限[m/s]
+  double band_car_w_;       // 相手の中心から塞ぐ横幅[m]
   const double band_slope_;       // 横オフセットの傾きの上限[m/m]
   const double band_smooth_;      // バンドの時間方向の平滑化係数(0-1)
   const double band_side_hyst_;   // 通す側を入れ替えるのに必要な差[m]
@@ -986,8 +1084,6 @@ private:
   // 相手の速度がこれ[m/s]未満なら、予測経路の中で相手を進めない。
   // 止まっている車を「参照ラインの20%で走り続ける」と予測していた不具合の対策。
   const double band_stop_speed_;
-  // バンドの「どちら側を開けるか」を、追い越しの側(side_sign_)に合わせるか。
-  // 既定 true。false で従来の独立判断に戻せる(A/B 用)。
   const bool band_side_follow_;
   const double band_side_hold_;         // バンドの側を変えるのに要る保持時間[s]
   const double side_fix_cool_;          // 側を直したあと再反転しない時間[s]
@@ -1020,15 +1116,20 @@ private:
   const double pass_margin_r_curve_;    // これ以下の半径は従来どおり[m]
   const double pass_margin_r_straight_; // これ以上の半径は詰めきる[m]
   bool c_stop_avoid_active_{false};     // 直近の周期で停止車回避が働いていたか
+  // 前周期の停止車回避の結果。追突防止(層の順序では先に走る)が。
+  bool   c_stop_avoid_pass_{false};     // 通過/減速して通過 と判定していた
+  double c_stop_avoid_lo_{0.0};         // その空き帯の右限
+  double c_stop_avoid_hi_{0.0};         // その空き帯の左限
+  std::string c_stop_avoid_target_;     // 対象の停止車
   // 予測の当たり具合を測る先読み時間[s]。0 で無効。
   const double predict_check_sec_;
-  // 相手ごとに仮定する MPC の最高速度[km/h]。実測が溜まるまでの初期値に使う。
   const double predict_speed_fast_;   // P1/P2(相手チームのコード)
   const double predict_speed_slow_;   // 運営NPC のスロット
   const int predict_prior_samples_;   // これだけ標本が溜まったら実測へ移る
   const double band_long_grow_;       // 塞ぐ長さの伸び[m/s](予測誤差ぶん)
   const double band_lat_grow_;        // 同 横幅の伸び[m/s]
   const bool   band_side_lead_;   // 抜く側の判断を予測バンドに任せる
+  const double cap_slow_log_kmh_; // これ未満の上限で「遅い原因」を必ず残す[km/h]
   const double band_side_look_;   // 側を決めるとき先まで見る距離[m]
 
 
@@ -1038,6 +1139,7 @@ private:
   const double launch_free_decel_;  // 判定に使う実測の減速度[m/s^2]
   const double launch_free_react_;  // 指令が効くまでの空走時間[s]
   const double launch_free_room_;   // 止まりきったあとに残す車間[m]
+  const double launch_stopped_grace_; // 実移動開始後、停止車分類を待つ時間[s]
   const double look_width_ahead_;
   const double v2x_timeout_;
   bool race_started_{false};       // /awsim/state が Start になったか
@@ -1049,77 +1151,35 @@ private:
   const double follow_kp_;
   const double follow_keep_gap_;  // これ以上の車間なら相手より遅くしない[m]
   const double min_follow_speed_;
-  const double side_hold_time_;
   const bool capped_self_enable_;   // 1位ハンデ中の closing 足切り緩和を使うか
   const double capped_self_closing_;// そのときに要る最低速度差[km/h]
   const double capped_self_dist_;   // そのときに許す抜き切り距離[m]
   const bool commit_pass_;          // 横に出切ったら追従キャップを外すか
-  // true で従来挙動(latch が速度上限の解除まで救う)に戻す退避スイッチ。
   const bool latch_commit_;
-  const double commit_sep_;         // 外すのに要る実測の横間隔[m]
+  double commit_sep_;         // 外すのに要る実測の横間隔[m]
   const double commit_gap_;         // 外すのに要る前後の車間[m](これ以内)
   const double commit_release_;     // 解除のヒステリシス(commit_sep への倍率)
   const double commit_look_;        // 抜き切り前に横位置を保てるか見る距離[m]
   const double commit_crush_;       // 横位置がこれ[m]潰されるなら保てない
   const bool attempt_hold_side_;    // 試行中は寄ると決めた側を保持しきるか
-  const double attempt_hold_sep_;   // そのとき保持する横オフセットの最小値[m]
+  double attempt_hold_sep_;   // そのとき保持する横オフセットの最小値[m]
   const double attempt_latfail_time_; // 横に出られない試行を打ち切る秒数(0で無効)
-  // 追越試行の開始に「横位置の調停で追越の意図が採用されていること」を要求する。
-  // false にすると従来どおり横間隔のしきい値だけで数える(A/B 用)。
   const bool attempt_require_intent_;
   // latch に追い越しの「許可」を持たせるか。false なら latch は横位置の保持だけ。
   const bool latch_allow_enable_;
-  // latch は「横に出続けてよい」を保持するための仕組みだが、許可(allow)まで
-  // 持たせているため、**許可が下りない理由が安全に直結するものでも継続する**。
-  //
-  // 【実測(20260905-012703 d1、玉突きの最初の1台)】
-  //   19.2s latchで継続 allow_base落ち=ゾーン外 幅=2.60(要1.80)
-  //   21.2s latchで継続 allow_base落ち=禁止区間 idx=91
-  //   22.5s stuck detected 横=-1.31 [-0.45,3.600] 領域外  <- 走行可能領域の外で壁に食い込む
-  // latch が許可の下りない追い越しをコース最狭部(幅2.60m)と
-  // 自前の追い越し禁止区間(idx89-95)へ運び込み、そこで壁に刺さった。
-  //
-  // 2026-09-03 の計測では「latch 継続 451窓 = 走行時間の24.9%、
-  // その内訳 ゾーン外185 / 側の余地なし111 / 速度差不足88 / 禁止区間55」で、
-  // **「側の余地なし」と「禁止区間」だけが安全に直結する**と分かっている。
-  // latch を全部外す A/B は結論が出なかったので、この2つだけ外す。
   const bool latch_never_no_pass_;   // 禁止区間と側の余地なしは latch で越えない
 
-  // --- 停止車回避の判定の作り直し(2026-09-05) ---
-  //
-  // 【実測(20260905-012703 d2 の接近)】
-  //   39.0m 空き幅2.95m -> 通過(上限なし)
-  //   21.8m 空き幅3.31m -> 通過(上限なし)
-  //   11.3m 空き幅3.25m -> 通過(上限なし)
-  //    6.8m 横目標2.34 が壁帯[-1.60,0.40]で0.40に潰された -> 上限8.6km/h
-  //    2.6m 空き幅1.69m -> 通過(上限なし)      <- 解除される
-  //   TTC0.68s 正面衝突を回避
-  //
-  // 原因は3つ。
-  //  (1) 壁の走行可能帯を**停止車の地点だけ**で見ている。抜け切るまでの
-  //      区間で最も狭いところを見ていないので、存在しない経路に全開で向かう。
-  //  (2) **横位置が実現するまでの距離を見ていない。** 横位置は指令から
-  //      約20m走ってから実現する(offset_rate 1.2m/s の他に追従遅れ)。
-  //      36km/h で 1m 寄せるには rate だけで 8.3m、遅れを足すと約28m 要る。
-  //      6.8m 手前で気づく設計では制御上間に合わない。
-  //  (3) 判定に履歴が無く毎周期やり直すので、上限が「なし→8.6→なし」と振動する。
-  //
-  // 直し方は3つに対応させる。設計は ChatGPT にも相談した
-  // (`work/chatgpt_avoid_20260905.txt`)。
   const bool stop_avoid_fix_;        // この作り直しを使うか
+  const bool stop_avoid_band_local_;
+  const double stop_avoid_band_span_;
   const double stop_avoid_span_;     // 壁帯を最狭で見る s 区間の長さ[m]
   const double stop_avoid_lat_lag_;  // 横位置が実現するまでの距離[m]
   const double stop_avoid_emg_margin_;  // 緊急制動の判定に足す余裕[m]
   const double stop_avoid_emg_accel_;   // 緊急制動で見込む減速度[m/s^2]
-  // 「通れない」と決めた状態のラッチ。抜け切るか止まるまで解除しない。
-  std::string stop_nopass_target_;
-  bool stop_nopass_latched_{false};
+  // 「通れない」と決めた状態のラッチ。対象IDで保持し、現在の先頭車の
+  // 入替りでは解除しない。
+  v2x_overtaker::StopNoPassLatch stop_nopass_latch_;
   rclcpp::Time last_stop_fix_log_{0, 0, RCL_ROS_TIME};
-  // ラッチした対象を最後に見た時刻。抜け切ると探索対象から外れて
-  // `stopped` が空になり、解除処理自体が走らなくなる
-  // (外部レビュー レビュー 2026-09-05: 同じ名前の車が次周も停止していると
-  //  古いラッチがそのまま効いてしまう)。時刻で切る。
-  rclcpp::Time stop_nopass_seen_{0, 0, RCL_ROS_TIME};
   const double attempt_infeasible_time_;   // 継続不能が続いたら打ち切る秒数(0で無効)
   const double attempt_wall_look_time_;    // 壁余裕を見る先読み時間[s]
   const double attempt_wall_abort_clear_;  // これを下回ったら「壁に当たる」[m]
@@ -1139,8 +1199,6 @@ private:
   const double straight_pass_hold_;   // 区間を出てから維持する時間[s]
   const double straight_finish_margin_;  // 直線の残りに足して使える距離[m]
   const double stop_avoid_crush_;     // 横目標がこれ[m]以上潰されたら通れない扱い
-  // true にすると、潰された「量」ではなく **潰された後の位置が空き帯に入るか**
-  // で通れるかを判定する。A/B 計測用。
   const bool stop_avoid_fit_;
   // 停止車までこの距離[m]以内のときだけ、横目標が壁帯で潰されたことを
   // 「通れない」とみなして減速する。遠方では手前の狭さは通過可否と無関係。
@@ -1158,14 +1216,8 @@ private:
   const bool wedge_forward_;
   // wedge 発火中は再クランプに corridor_safety ではなく wedge_room を使う。
   const bool wedge_keep_room_;
-  // 車体端-物理壁の余裕がこれ[m]未満のときだけ相手側へ寄る。
-  // 実測168件では帯端でも余裕は最小0.70/中央値1.10m あり、
-  // 「壁が本当に近い」件は1件も無かった。
   const double wall_pick_need_;
-  // make_corridor.py --margin の値。帯端から実壁までの追加余裕[m]。
-  // コリドアCSVを作り直したらこの値も合わせること。
   const double corridor_extra_;
-  // 退避スイッチ。true で「相手から crash_safe_sep まで詰める」旧挙動へ戻す。
   const bool wall_pick_legacy_;
   const double crash_front_near_;   // 相手が「自分の前」とみなす前後距離の下限[m]
   const double crash_front_far_;    // 同 上限[m]
@@ -1174,13 +1226,7 @@ private:
   const double wall_margin_tight_;  // きついコーナーで足す余裕の最大[m]
   const bool enable_;
 
-  // ===================================================================
-  // スタートの発進制御 / 追い越し地点の計画 / 周回による解禁
-  // (ユーザー指示 2026-08-29)
-  // ===================================================================
-  //
-  // 【スタート】発進待ちと P1 の右寄せは実走で機能せず削除した(2026-08-29)。
-  //   横位置をコリドアで丸める処理だけ残してある。
+  // ===================================================================。
   const double start_lat_abs_;       // スタート横位置の絶対上限[m](保険)
   const double start_wall_margin_;   // スタートの横位置を壁から空ける量[m]
   // --- 発進レーンの保持(holdGridLane)。既定 off の第2段つき ---
@@ -1201,10 +1247,6 @@ private:
   const bool   launch_p1_hold_until_pass_;  // 抜き切るまで層を降ろさない
   const double launch_no_pass_guard_dist_;  // 禁止区間の手前で発進追越を諦める距離[m]
   const double start_offset_rate_;   // 合流までの横方向のレート[m/s]
-  //
-  // 【追い越し地点の計画】録画した相手のラインと速度から、
-  // 「どこで・どちら側から抜くか」を先に決める。決めた地点までは詰めるだけで
-  // 仕掛けず、地点の入口でちょうど pass_gap になるように助走する。
   const bool spot_enable_;
   const double spot_range_;      // 前方これだけ[m]先まで候補を探す
   const double spot_min_len_;    // 候補として認める連続区間の下限[m]
@@ -1216,12 +1258,16 @@ private:
   const double spot_gate_slack_; // 地点の手前これだけ[m]から仕掛けてよい
   const double spot_gate_max_wait_;  // 抜きどころ待ちの上限[s]
   const double spot_path_tol_;    // spotPathSafeで許容するクランプ量[m]
+  bool zone_free_;                // ゾーンをやめ、能力計算だけで許可する
+  double zone_free_brake_decel_;  // 中止して後ろへ戻るときの減速度[m/s^2]
+  double zone_free_keep_;         // 中止時に相手の後ろへ残す距離[m]
   const double spot_path_bad_len_;  // 連続して超過してよい区間長の上限[m]
   const double spot_path_min_w_;  // 線が外れても帯としてこの幅[m]以上あれば通行可とみなす
+  bool spot_w_ref_;               // 帯の幅判定を帯の基準に合わせる
+  double spot_w_ref_min_;         // そのときの要求幅[m](帯が空でない余裕)
   const double spot_stuck_max_;   // 抜きどころに着いて仕掛けられない状態の許容[s]
   const double spot_avoid_sec_;   // 破棄した地点を候補から外す時間[s]
   const double spot_abort_sec_;   // 予測不成立が継続したら中断するまでの時間[s]
-  const double side_room_margin_; // 左右の空き幅の差がこれ[m]を超えたら広いほうへ
   const double side_room_hold_;   // 反対側が連続で勝つべき時間[s]
   const std::string side_pick_zone_spec_;  // 側を録画で決める区間
   const double side_pick_tie_;    // 相手の平均横位置がこれ[m]以内なら右から抜く
@@ -1229,7 +1275,6 @@ private:
   const double rear_end_range_;   // 前方これだけ[m]の車を見る
   const double rear_end_sep_;     // 横間隔がこれ[m]未満なら自分の進路上
   const double rear_end_margin_;  // 止まりきる位置に残す余裕[m]
-  const double start_gap_closing_max_;  // 開始車間緩和を許す接近速度の上限[m/s]
   const double start_gap_floor_;  // 開始車間の最小限(貼り付き直後の新規横出しを防ぐ)[m]
   const double rear_end_brake_k_; // 減速の見積りを割り引く係数
   const double rear_end_brake_k_pass_;  // 抜く算段が付いているときの制動係数
@@ -1237,31 +1282,18 @@ private:
   const double rear_end_time_;    // 反応の遅れとして見込む時間[s]
   const double squeeze_ahead_;    // 前に車がいるとき帯を見る先の距離[m]
   const double squeeze_gap_;      // この車間[m]以内のときだけ帯で丸める
-  const double guard_decel_;      // 追突防止で上限を下げる最大の率[m/s^2]
   const bool cap_rate_limit_;     // 速度上限の下げ方に全層まとめて制限を掛けるか
   const double cap_decel_;        // その最大の減速率[m/s^2]
   const double rear_end_near_;    // この距離[m]以内は横ずれに関係なく見る
   const double rear_end_near_closing_;  // そのとき要る接近速度[m/s]
   const double cross_gap_;        // この車間[m]未満では相手をまたがない
   const double cross_dead_;       // 真後ろ扱いにする横間隔[m]
-  //
-  // 【周回による解禁】1周目は録画のために NPC 以外を抜かない。
-  // P1 が僚車(P2)を抜き始めるのは3周目以降。ブーストも3周目以降。
   const bool lap_gate_enable_;
   const int npc_slot_;           // 運営NPC のグリッド番号(既定 3 = 最前列)
   const int record_laps_;        // この周回数(0起点)の間は NPC 以外を抜かない
   const int teammate_pass_lap_;  // P1 が僚車を抜き始める周回(0起点)
   const int leader_pass_last_laps_;  // 先頭を抜いてよい残り周回数(0で無効)
   const bool zone_fallback_enable_;  // 予測計画が無いとき汎用ゾーンで仕掛けてよいか
-  // --- 公式のオーバーテイクレーン(SIM決勝で追加。s2r-final のみ有効) ---
-  // AWSIM のシーン(level1)から実測した位置: レースライン idx234-21、
-  // 自車ラインの右 2.15〜5.0m、幅 2.5m x 長さ 36m。走行可能幅は 2.2〜2.5m。
-  // ルール: 車体全体がレーン内で 27km/h 以上の車が「アタッカー」。
-  // アタッカーがいる間、レーンに触れている 27km/h 以下の車は3秒以内に
-  // 完全退出しないと BLOCK(20秒間 5km/h 固定)。27km/h 未満での進入も違反。
-  // → **27km/h 以上を出せるときだけ入る**。1位はハンデで 25km/h に固定され
-  //   条件を満たせないので、この一つの条件で自動的に入らなくなる
-  //   (順位推定に依存しない。順位推定はずれることが分かっている)。
   const bool ot_lane_enable_;      // オーバーテイクレーンを使うか
   const bool ot_lane_guard_;       // 低速でレーンへ入らないガード(常時有効)
   const bool yaw_margin_enable_;      // 姿勢ぶん横の許容範囲を狭めるか
@@ -1269,38 +1301,15 @@ private:
   const double ot_lane_guard_look_;  // ガードを効かせ始める先読み距離[m]
   const double ot_lane_guard_time_;  // 同、速度に比例して足す時間[s]
   const double ot_lane_min_kmh_;   // レーンを使うのに要る自車速度[km/h]
+  const bool prepare_free_enable_;     // 録画なしで PREPARE に入るか
+  const double prepare_free_gap_;      // 相手がこの距離[m]以内なら準備してよい
+  const double prepare_free_vgain_;    // 自由走行の到達速度が相手+これ[m/s]以上
+  const double prepare_free_grace_;    // 希望が消えてから降りるまでの猶予[s]
   const bool ot_lane_prepare_;         // レーンの手前から許可を出すか
   const double ot_lane_prepare_look_;  // 入口の何m手前から許可するかの基本値
   const double ot_lane_prepare_time_;  // それに足す「速度×この秒数」
-  // レーンを使うときに狙う横位置[m](自車ラインからの符号つきオフセット)。
-  // 帯は右 2.15〜5.0m。車体を丸ごと帯へ入れるには -2.80 より右へ寄せる必要がある。
-  // レーンへ入るとき、コリドアの右端からどれだけ内側を狙うか[m]。
-  // 端に張り付けると壁に触れる。
-  // --- 車体の張り出し(内輪差)を左右別に見る(ユーザー指示 2026-09-06) ---
-  // 後軸中心を基準に、前端 F = wheel_base + front_overhang、後端 R = rear_overhang。
-  // 方位差 e があると、左右の張り出しは
-  //   左 = max(F*sin e, -R*sin e) + 半幅*|cos e|
-  //   右 = max(-F*sin e, R*sin e) + 半幅*|cos e|
-  // になる。**左右で違う**のが要点(従来は同じ値を左右に足していた)。
-  // レーンへ入るとき、コリドアの右端からどれだけ内側を狙うか[m]。
   const double ot_lane_inset_;
   const bool body_margin_asym_;
-  // --- 車体の幾何(公式値)。実効ホイールベースとは別物 ---
-  //
-  // 【私の誤り 2026-09-06 ユーザー指摘】ここに実効ホイールベース 2.14m を
-  // 入れていた。2.14m は「自転車モデルが実際の旋回挙動に合うように当てはめた値」で
-  // `steering_tire_angle_gain 2.8` が吸収している分を含む。
-  // **車体の角がどこにあるかという幾何の計算に実効値を入れてはいけない。**
-  //
-  // 公式 `racing_kart_description/config/vehicle_info.param.yaml`:
-  //   wheel_base 1.087 / front_overhang 0.467 / rear_overhang 0.510
-  //   wheel_tread 1.12 / left,right_overhang 0.09
-  // 公式 `docs/specifications/simulator.ja.md`:
-  //   全長 200cm / 全幅 **145cm** / ホイールベース 108.7cm
-  //
-  // 後軸中心から 前端 1.087+0.467 = 1.554m / 後端 0.510m(全長 2.06m)。
-  // 幅は当たり判定には車体の 145cm を採る(param の 1.30m はタイヤ基準の箱)。
-  // 誤って 2.61m を使っていたので張り出しを 68% 過大に見ていた。
   const double geom_front_;      // 後軸中心から前端[m]
   const double geom_rear_;       // 後軸中心から後端[m]
   const double geom_half_width_; // 車体の半幅[m]
@@ -1312,45 +1321,221 @@ private:
   // 上を効かせる横間隔の上限に足す余裕[m]。
   const double alongside_extra_;
   const std::string ot_lane_use_zone_spec_;
-  // 相手の走り方をモデルで予測するか。false にすると録画だけの旧挙動に戻る。
+  const bool side_window_search_;
+  const double side_window_search_m_;   // 何m 先まで探すか
+  mutable double audit_found_at_{-1.0};
+  // completionSide が**実際に使った**相手の横位置(監査ログ用)。
+  mutable double audit_used_olat_{9.99};
+  mutable bool audit_used_set_{false};
+  mutable double audit_win_from_{0.0};
+  mutable double audit_win_to_{0.0};
+  mutable int audit_win_used_{0};
+  mutable double audit_win_scale_{1.0};
+  mutable double audit_win_span_{0.0};
+  std::string audit_room_target_{};
+  bool rear_end_inpath_predict_{false};
+  double rear_end_inpath_max_sec_{1.5};
+  rclcpp::Time last_stall_log_{0, 0, RCL_ROS_TIME};
+  bool stopped_funnel_{true};
+  // 停止車を「同時に避ける」ではなく「順に抜ける」として空き幅を出すか。
+  bool stopped_seq_pass_{true};
+  bool pass_need_room_{true};
+  std::size_t side_swap_n_{0};
+  std::size_t side_none_n_{0};
+  rclcpp::Time last_side_swap_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_side_none_log_{0, 0, RCL_ROS_TIME};
+  bool lat_relaxed_prev_{false};
+  bool lat_relax_yield_{true};
+  double lat_relax_drop_mps_{1.5};
+  std::size_t lat_relax_yield_n_{0};
+  rclcpp::Time last_relax_yield_log_{0, 0, RCL_ROS_TIME};
+  bool corridor_funnel_{true};
+  double funnel_ahead_m_{20.0};
+  double funnel_speed_floor_{2.0};
+  double funnel_ds_acc_{-1.0};
+  int funnel_empty_at_{-1};
+  bool spot_keep_completion_side_{false};
+  std::size_t spot_side_kept_n_{0};
+  rclcpp::Time last_spot_keep_log_{0, 0, RCL_ROS_TIME};
+  bool pre_position_enable_{true};
+  double pre_position_range_{45.0};
+  // 側が決まっていれば、抜く気が無くても抜けそうな側へ寄せておくか。
+  bool pre_position_always_{true};
+  // 射程のどれだけを詰めた時点で寄せ量が満額になるか(0.6 = 60%)。
+  double pre_position_gain_{0.6};
+  bool   pre_position_pass_ok_{true};   // 抜けると判断している間も寄せ続ける
+  bool   rear_end_sep_plan_ok_{true};   // 計画後が足りていれば現在値で判定
+  bool   rear_end_stop_band_{true};     // 停止車は回避帯での横間隔で判定する
+  bool   follow_skip_stop_pass_{true};  // 通せる停止車には追従の上限を出さない
+  rclcpp::Time last_follow_skip_log_{0, 0, RCL_ROS_TIME};
+  bool   stopped_bound_enable_{true};   // 停止車の側へは寄らない(制約)
+  double stopped_bound_range_{25.0};    // 前方この距離[m]の停止車を見る
+  rclcpp::Time last_stopped_bound_log_{0, 0, RCL_ROS_TIME};
+  bool   fwd_clear_floor_{true};        // 前方が空いていれば止めない
+  double fwd_clear_need_m_{6.0};        // 空いているとみなす距離[m]
+  double fwd_clear_floor_kmh_{8.0};     // そのときの速度の下限[km/h]
+  rclcpp::Time last_fwd_clear_log_{0, 0, RCL_ROS_TIME};
+  bool   rear_audit_{true};             // 追突防止の入力を1行で残す
+  double rear_audit_sec_{0.5};
+  rclcpp::Time last_rear_audit_log_{0, 0, RCL_ROS_TIME};
+  double runup_hold_gap_k_{1.35};       // 助走の目標車間の倍率
+  bool   runup_hold_until_gap_{true};   // 目標車間に届くまで点火しない
+  double runup_hold_ratio_{0.9};        // 目標のこの割合で点火を許す
+  double runup_hold_margin_k_{1.15};    // 点火に要る距離の余裕係数
+  double runup_react_sec_{0.35};        // 指令から実速度までの遅れ[s]
+  bool   runup_hold_lat_{true};         // 横へ寄る距離も点火時期に入れる
+  bool   runup_hold_block_charge_{true};// 保留中は通常の全開判定も止める
+  rclcpp::Time last_runup_time_log_{0, 0, RCL_ROS_TIME};
+  double runup_hold_gap_abs_{12.0};     // 目標車間の絶対的な下限[m]
+  bool   dbg_hold_for_gap_{false};
+  double dbg_want_hold_{0.0};
+  double runup_hold_min_room_m_{12.0};  // 入口までこれ未満なら保留を解く
+  int    runup_open_from_idx_{190};     // 車間を開け始める idx
+  int    runup_open_to_idx_{241};       // 開けるのをやめる idx
+  bool   runup_open_leader_only_{true}; // 1位に対してだけ開ける
+  bool   runup_open_keep_reach_{true};  // 門に間に合う速度より遅くしない
+  bool   runup_open_dv_auto_{true};     // 減速量を残り距離から逆算する
+  double runup_open_dv_max_{2.0};       // その上限[m/s]
+  // 「車間を開ける」dv_need 計算専用の入口探索地平[m]。ot_lane_runup_look_。
+  double runup_open_look_m_{90.0};
+  double stopped_size_pad_{0.25};   // 止まっている車にだけ使う余裕[m]
+  bool   runup_gap_open_cmd_{true};     // 車間を開けるのを指令として出す
+  bool   runup_charge_relax_{true};     // 点火中は追従/追突防止を緩める
+  double runup_charge_follow_gap_{3.5}; // 点火中の追従の安全車間[m]
+  bool   start_hold_priority_{true};    // 合流までグリッド列の保持を優先
+  bool   npz_look_by_lat_{true};        // 禁止区間を横復帰距離ぶん先読みする
+  double npz_look_max_m_{25.0};
+  double ot_lane_win_safety_{0.15};     // レーンの窓を出すときの余裕[m]
+  bool   ot_lane_aim_seek_{true};       // 狙い点に窓が無ければ前方を探す
+  std::size_t ot_lane_aim_seek_max_{30};
+  double pass_gap_margin_{0.15};        // 相手の輪郭に足す安全マージン[m]
+  double pass_wall_keep_{0.25};         // 壁側の帯の縁に残す量[m]
+  rclcpp::Time last_pass_gap_log_{0, 0, RCL_ROS_TIME};
+  bool   ot_abort_in_nopass_{true};     // 禁止区間では追越の横要求を出さない
+  rclcpp::Time last_npz_abort_log_{0, 0, RCL_ROS_TIME};
+  bool   body_guard_enable_{true};      // 実測位置での引き戻しを使う(round125)
+  bool   body_guard_after_merge_{true}; // 合流が終わるまで実位置ガードを止める
+  bool   lane_guard_start_off_{true};   // スタート直後はレーン回避を止める
+  int    lane_guard_off_from_idx_{230};
+  int    lane_guard_off_to_idx_{30};
+  bool   start_merge_smooth_{true};     // 合流の減衰を smoothstep にする
+  double body_guard_react_m_{0.0};      // この余裕[m]を切ったら横を引き戻す
+  double body_guard_hard_m_{0.35};      // これ以上はみ出したときだけ減速する
+  double body_guard_cap_kmh_{14.0};     // はみ出している間の速度上限
+  rclcpp::Time last_body_guard_log_{0, 0, RCL_ROS_TIME};
+  bool   pre_position_sep_{true};       // 追突防止が外れる横間隔を下限にする
+  double pre_position_sep_extra_{0.15}; // 解除境界に足す余裕[m]
+  bool   pre_position_in_prepare_{true};// 準備中(PREPARE)でも事前寄せを続ける
+  bool   pre_reject_log_{true};         // 事前寄せが発火しない理由を数える(観測専用)
+  bool   accel_audit_{true};            // 加速側の判断を毎秒残す(観測専用)
+  bool   start_gap_by_rearend_{true};   // 開始車間を追突防止と同じ式で出す
+  bool   rear_end_target_release_{true}; // 横「目標」で追突防止を先読み解除する
+  bool   rear_end_lat_plan_{true};       // 横の計画で回避できるなら減速しない
+  rclcpp::Time last_latplan_log_{0, 0, RCL_ROS_TIME};
+  double rear_end_target_blend_{0.5};    // 実測と目標の混ぜ具合(0=実測のみ)
+  bool   runup_fuel_{true};              // 点火距離を「車間という滑走路」で決める
+  bool   runup_fuel_body_{true};         // 滑走路の計算から車体長を引く
+  bool   runup_sim_{true};               // 点火判定を前向きシミュレーションで行う
+  bool   runup_sim_opp_model_{true};     // 相手の将来速度を modelSpd で推定する
+  double opp_accel_mps2_{0.8};           // 相手の加速能力[m/s^2](予測の変化率の上限)
+  double best_sep_true_{0.0};            // 追突防止の対象との真の横間隔[m](観測用)
+  double best_d3_{0.0};                  // 同 直線距離[m](観測用)
+  bool   gate_runup_in_lane_{true};      // レーン内でも門の目標速度を保つ
+  bool   runup_sim_reach_{false};
+  double runup_sim_v_{0.0};
+  double runup_sim_min_gap_{0.0};
+  rclcpp::Time last_sim_log_{0, 0, RCL_ROS_TIME};
+  bool   gate_runup_ref_gate_{true};     // 点火の基準をレーン入口までの距離にする
+  bool   rear_end_sep_true_{true};       // 横間隔を自車法線への射影で正しく測る
+  bool   normal_gap_by_rearend_{true};   // 通常走行の目標車間も追突防止の式で出す
+  double normal_gap_max_{14.0};          // その上限[m]
+  rclcpp::Time last_normal_gap_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_fuel_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_target_release_log_{0, 0, RCL_ROS_TIME};
+  double start_gap_need_max_{14.0};     // その上限[m]
+  rclcpp::Time last_accel_audit_log_{0, 0, RCL_ROS_TIME};
+  std::map<std::string, size_t> pre_reject_n_;
+  rclcpp::Time last_pre_reject_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_pre_position_log_{0, 0, RCL_ROS_TIME};
+  std::size_t pre_position_count_{0};
+  int audit_cs_{0};
+  double audit_need_here_{0.0};
+  bool audit_cfit_now_{false};
+  bool audit_cfit_ahead_{false};
+  // 追い越し実行中は壁余裕を緩めるか。
+  const bool ov_pass_wall_relax_;
+  // レーン封鎖をアタッカーがいるときだけにするか。
+  const bool ot_lane_hot_enable_;
+  const double ot_lane_hot_range_;   // 後方何m まで見るか
+  bool otLaneHot(const Frame & f) const;
+  const bool lat_audit_;
+  const double lat_audit_sec_;   // 横監査ログの間隔[s]
+  double audit_olat_{9.99};
+  double audit_pass_len_{-1.0};
+  double audit_room_l_{-99.0};
+  double audit_room_r_{-99.0};
+  rclcpp::Time last_lat_audit_log_{0, 0, RCL_ROS_TIME};
+  // 衝突回避の逃げる向きを追い越しの計画側に合わせるか。
+  const bool ov_collide_follow_side_;
+  // 前にいない相手を追い越し対象から外すか。
+  const bool ov_release_stale_;
+  const int lat_pred_mode_;
+  const bool lane_record_enable_;
   const bool opp_model_enable_;
-  // 抜きどころ計画をグリッド最後尾(slot 1)以外にも作るか。
-  // 予選(3台・NPCあり)の名残で slot 1 だけに限定されていた。
+  // 抜きどころ計画をグリッド slot 1 以外でも作るか。
   const bool spot_all_slots_;
   std::vector<double> inside_at_;      // 地点ごとのイン側の向きと強さ(-1..+1)
   rclcpp::Time last_opp_model_log_{0, 0, RCL_ROS_TIME};
-  const double ot_lane_guard_lat_; // 上記未満のとき許す右への最大量[m]
+  const double ot_lane_guard_lat_; // レーン低速ガードで許す右への最大量[m](ot_lane_lat_ が空のとき)
   const bool ot_lane_side_right_;  // レーン内では側を右に固定するか
+  // 低速ガードを「いまの速度」ではなく「レーンに触れる時点の速度」で判定するか。
+  const bool ot_lane_guard_predict_;
+  // レーンで決めた右を下流の層に上書きさせないか。
+  const bool ot_lane_side_sticky_;
+  // レーン区間では抜きどころの左指定に従わないか。
+  const bool ot_lane_side_over_spot_;
+  // 低速ガードの右限に ot_lane_lat_ の幾何を使うか。
+  const bool ot_lane_guard_geom_;
+  // レーンの横範囲 "idx:lo:hi,..."(レースライン基準・左が正)。
+  const std::string ot_lane_lat_spec_;
+  const double ot_lane_touch_margin_;   // 触れ判定に足す余裕[m](ヨーで横幅が増えるぶん)
+  // idx -> (lo, hi)。無い idx はレーンが無い。
+  std::unordered_map<std::size_t, std::pair<double, double>> ot_lane_lat_;
+  // その idx で車体がレーンに触れない中心の右限[m](レーン外は -1e9)。
+  double otLaneNoTouchLat(std::size_t idx) const;
+  // idx から look[m] 先までの区間で最も厳しい右限を返す。
+  double otLaneNoTouchAhead(std::size_t idx, double look) const;
   const bool side_pick_over_curve_;  // 録画で決めた側を曲率より優先するか
-  const bool side_pick_by_room_;     // 側を「相手と壁の空き」で決めるか
+  const bool side_pick_by_room_;
+  const bool side_pick_by_run_;   // 側を連続長で決めるか(平均ではなく)
+  const bool side_zone_repick_;   // 区間が変わったら側を決め直すか
+  const bool side_zone_mean_split_; // 相手の区間平均横を区間ごとに取るか
+  int side_pick_zone_seen_{-2};   // 前周期に属していた決め直しゾーンの番号
+  bool pick_zone_changed_now_{false}; // この周期に区間が変わったか(毎周期更新)
+  bool side_zone_repicked_{false};// この対象で区間変化の決め直しを使ったか
+  const char * side_src_{"未"};   // 側を最後に決めた分岐(計測のみ)
+  const bool curve_side_enable_;
+  const bool curve_side_in_zone_;     // 側を「相手と壁の空き」で決めるか
   const bool side_room_use_min_;     // 側の空きを区間の最小で見るか(falseで平均)
   const bool attempt_lat_hold_enable_;  // 試行中の横位置を試行が保持するか
   double attempt_lat_{0.0};             // 試行が持つ横目標[m]
   bool attempt_lat_valid_{false};       // その値が有効か
   bool attempt_lat_fresh_{false};       // 今周期に evaluateOpponent が出したか
   rclcpp::Time last_lat_hold_log_{0, 0, RCL_ROS_TIME};
-  // 抜きどころの成立条件の調整幅。大きいほど慎重(抜けなくなる)、小さいほど強気(当たる)。
+  rclcpp::Time last_attempt_auth_log_{0, 0, RCL_ROS_TIME};
+  // 抜きどころ成立条件の調整値(大きいほど慎重)。
   const double spot_entry_gap_;      // 横へ出る前に取り返す縦の安全車間[m](負で従来値)
   const double spot_pass_len_gain_;  // 前へ出切る量に掛ける係数
   const double spot_need_margin_;    // 必要距離に掛ける安全率
   const int boost_min_lap_;      // ブーストを解禁する周回(0起点)
   const double trace_dump_sec_;  // 録画を要約してログへ出す間隔[s]
-  // スタート直後は何が起きたのかがログから読めなかった(実測: 速度 0 のまま
-  // 数秒が過ぎるのに、速度上限のログは 10.8km/h と出ていた)。
-  // 合図からこの秒数[s]の間だけ、自車と他車の速度を 2Hz で残す。
+  // スタート合図からこの秒数[s]、自車と他車の速度を 2Hz でログに出す。
   const double telem_sec_;
 
-  // ===================================================================
-  // 【追加 2026-09-03】観測ログ専用の状態(ユーザー指示)
-  //
-  // ここから下は **一切制御に使わない**。requestCap / requestLat / boundLat /
-  // target_offset / speed_cap / 状態遷移のどれからも参照しない。
-  // 目的は「何位が何位を抜いたか」「抜かれたか」「接触の要因は何か」を
-  // 後からログだけで再構成できるようにすること。
-  // ===================================================================
+  // 以下は観測ログ専用で制御には使わない。
   // 被追越の確定に必要な進行度差[m]。これ未満は並走の揺れとみなす。
   const double overtaken_margin_;
-  // その差が続くべき時間[s]。V2X の位置の飛びで1周期だけ前に出ても数えない。
+  // その差が続くべき時間[s]。
   const double overtaken_hold_;
   // 1周期でこれだけ[m/s]速度が落ちたら接触の疑いとする。
   const double contact_decel_;
@@ -1359,23 +1544,45 @@ private:
   // 追越成功からこの時間[s]以内の接触は「追越直後」とする。
   const double contact_after_pass_sec_;
 
-  // ===================================================================
-  // 【追加 2026-09-03】助走(run-up)
-  // 抜きどころへ「速度を持って」到達するためのパラメータ。
-  // 既存の助走(車間を詰めるだけ)には相対速度を作る計算が無かった。
-  // ===================================================================
-  const bool runup_enable_;      // 有効化。false で完全に従来動作へ戻る
+  // 助走: 抜きどころへ速度を持って到達するためのパラメータ。
+  const bool runup_enable_;      // 助走を有効にする
   const double runup_dv_;        // 抜き切るのに要る相対速度[m/s]
   const double runup_gap_max_;   // 開ける車間の上限[m]。離れすぎない
-  const double runup_margin_;    // 加速開始距離に足す余裕[m]
+  const double runup_margin_;
+  const double runup_accel_mps2_;   // 助走が使う加速度[m/s^2](0以下で vehicle_accel*0.60)
+  const bool   ot_lane_runup_;             // レーン入口で門を超えるよう助走する
+  const double ot_lane_runup_look_;        // 入口を探す先読み距離[m]
+  const double ot_lane_runup_margin_kmh_;  // 門に上乗せする余裕[km/h]
+  const double runup_gate_slack_kmh_;  // 門にこれ[km/h]まで届かなくても点火
+  const double ot_lane_entry_pre_m_;       // レーン入口の何m手前を目標にするか
+  const bool   gate_runup_charge_;   // 入口までの残距離から逆算して全開にする
+  const double gate_runup_margin_m_; // 逆算距離に足す余裕[m]
+  const bool   boost_only_if_decisive_;  // ブーストが結果を変えるときだけ撃つ
+  const bool   gate_runup_sidestep_;   // 門への助走中は横へ逃がして追突防止を外す
+  const double gate_sidestep_extra_;   // 解除境界に足す余裕[m]
+  const bool   stopped_aim_edge_;      // 停止車回避は帯の中央でなく手前の端を狙う
+  const double stopped_edge_inset_;    // 端から中へ入れる量[m]
+  const bool   stopped_keep_pass_exclude_;  // true=追い越し対象を停止車から除外する
+  const bool   ot_lane_aim_;           // 追越レーンの窓へ実際に横位置を寄せる
+  const bool   runup_gap_hold_;        // 助走の要車間を「その速度を保てる車間」で決める
+  const bool   runup_gap_cap_;         // 助走の要車間に追従の上限(8m)を掛けない
+  const bool   runup_gap_open_;        // 助走中は後方車がいても相手より遅くしてよい
+  const double runup_open_dv_;         // そのとき相手速度から下げてよい量[m/s]
+  const double runup_open_rear_min_;   // 後方車がこれより遠いときだけ緩める[m]
+  const bool   gate_runup_target_gate_;// 入口への助走の目標を門+余裕に抑える
+  const bool   gate_runup_late_;       // 加速開始点だけを門基準にする(目標は据え置き)
+  const double ot_lane_aim_look_;      // 窓を取る先読み距離[m]
+  const double ot_lane_aim_inset_;     // 窓の内側の端から中へ入れる量[m]
+  const bool   stop_creep_by_band_;    // にじり出しの可否を車間でなく空き帯で決める
+  const double stop_creep_slow_;       // にじり出しの速度[m/s]
+  const double stop_creep_gap_min_;    // これ以下の車間では前へ出さない[m]
   // 観測用(制御には使わない)。ログへ出すだけ。
   double runup_need_gap_{-1.0};
   double runup_accel_at_{-1.0};
   std::string runup_log_state_;                        // 直近に出した状態
   rclcpp::Time runup_log_last_{0, 0, RCL_ROS_TIME};    // 直近に出した時刻
 
-  // 全車の現在順位。累積進行度 prog の降順(= 周回数 -> 周回内進行度の辞書式)。
-  // rank_ (制御が使う自車順位) とは別に、記録用に自前で持つ。
+  // 全車の順位(累積進行度 prog の降順、記録用)。
   std::map<std::string, int> rank_of_;
   int my_rank_obs_{1};            // 記録用に数え直した自車の順位
   // 相手ごとの「抜かれ監視」。前後関係が入れ替わったことを進行度差で見る。
@@ -1386,7 +1593,6 @@ private:
     int rank0{0};             // そのときの自車順位
   };
   std::map<std::string, OvtWatch> ovt_;
-  // 相手の速度履歴(0.5秒ぶん = 20Hz で10点)。接触時の「相手急減速」に使う。
   std::map<std::string, std::deque<double>> spd_hist_;
   double last_overtaken_t_{-1e9};   // 最後に被追越を確定した時刻[s]
   double last_pass_ok_t_{-1e9};     // 最後に「追越記録 成功」を出した時刻[s]
@@ -1426,9 +1632,10 @@ private:
 
   // --- 発進制御の状態
   double launch_since_{-1.0};     // レース開始を検知した時刻[s](計測ログの基準)
+  double launch_motion_since_{-1.0}; // 最初にいずれかの車の実移動を見た時刻[s]
+  double launch_wait_log_at_{-1.0}; // Start後・物理発進前の診断ログ時刻[s]
   double telem_at_{-1.0};         // スタート直後の計測ログを出した時刻[s]
   double last_speed_cap_{-1.0};   // 前の周期で最終的に出した速度上限[m/s]
-  // 公式ペナルティ(速度が 5km/h に固定される)の検出
   double penalty_since_{-1.0};    // 貼り付き始めた時刻[s]
   std::size_t penalty_at_idx_{0}; // その地点
   std::string penalty_near_;      // そのとき最も近かった車
@@ -1444,19 +1651,10 @@ private:
   std::vector<double> band_lo_;   // 各点で許される横オフセットの右限(負)
   std::vector<double> band_hi_;   // 同 左限(正)
   // 追い越し対象だけを障害物から除いた band。
-  // 【なぜ要るか】band は others_ の全車を削るので、追い越し対象そのものも
-  // 障害物として削られる。その band に対して「計画ラインが通れるか」を検査
-  // すると「今から抜く相手を含めて道が空いているか」という自己矛盾になり、
-  // 相手が狭い区間にいる限り帯幅が0になって追い越しが構造的に不可能だった
-  // (実測 20260902-143812: 閉塞地点の帯幅 0.00m が5件)。
-  // 相手との必要横間隔は spot_margin_ で別途担保している。
   std::vector<double> band_lo_ex_;
   std::vector<double> band_hi_ex_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr band_pub_;
-  // 【必ず時計種別を指定する】既定構築するとシミュレータ時刻と食い違い、
-  // 引き算した瞬間に `can't subtract times with different time sources` を
-  // 投げてノードが死ぬ(実測 20260830-231433。起動直後に落ちて素の経路が
-  // 素通りし、回避も追い越しもしない状態になった)。
+  // 時計種別を指定しないとシミュレータ時刻との引き算で例外になる。
   rclcpp::Time last_band_pub_{0, 0, RCL_ROS_TIME};
   // デバッグ表示(GUI)へ流す状態。key=value を改行で並べただけの文字列。
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
@@ -1489,20 +1687,23 @@ private:
   double spot_wait_since_{-1.0};  // 抜きどころ待ちが始まった時刻[s]
   double guard_cap_{-1.0};        // 追突防止の上限(レート制限つき)[m/s]
   double last_cap_out_{-1.0};     // 前の周期で出した速度上限[m/s]
-  double spot_dbg_l_{0.0};
+  double spot_dbg_l_{0.0};        // 見つかった連続区間の最長(左)[m]
   double spot_dbg_need_{0.0};      // 抜き切るのに要る距離[m](最小の候補)
   double spot_dbg_need_len_{0.0};  // そのときの連続区間長[m]
-  double spot_dbg_need_vo_{-1.0};  // そのときの相手速度[m/s]        // 見つかった連続区間の最長(左)[m]
+  double spot_dbg_need_vo_{-1.0};  // そのときの相手速度[m/s]
   double spot_dbg_r_{0.0};        // 同(右)
   int spot_dbg_known_{0};         // 先読み区間で録画があった点の数
   double spot_stuck_since_{-1.0};   // 抜きどころに着いて仕掛けられない状態が始まった時刻[s]
   std::size_t spot_avoid_begin_{0}; // 直前に破棄した地点の入口の経路点
   double spot_avoid_until_{-1.0};   // その地点を候補から外す期限[s]
-  // 【修正J 2026-09-02】spotPathSafe() が false を返す理由を診断するための値。
-  // spotPathSafe() は const メンバ関数なので mutable にする。
   mutable double spot_path_min_w_seen_{-1.0};  // 直近の検査で見た最小の帯幅[m]
   mutable double spot_path_fail_at_{-1.0};     // 落ちた地点までの前方距離[m]
   mutable double spot_path_fail_w_{-1.0};      // 落ちた地点の帯幅[m]
+  // 閉塞判定地点の「車がいない帯幅」と帯の端(診断用)。
+  mutable double spot_path_fail_free_w_ = -1.0;   // その地点の「車がいない帯幅」
+  mutable double spot_path_fail_lo_ = 0.0;        // 帯の下端(交差していれば lo>hi)
+  mutable double spot_path_fail_hi_ = 0.0;
+  mutable int    spot_path_fail_idx_ = -1;
 
   Corridor corridor_;
   std::map<std::string, OtherState> others_;
@@ -1521,9 +1722,7 @@ private:
   int side_flip_cnt_{0};           // この対象車で側を変更した回数(side_flip_max まで)
   double side_flip_at_{0.0};       // 枠の回復を数える基準時刻[s]
   double side_unfit_since_{-1.0};
-  // 反対側が「連続して」余地を持っている時間の起点。
-  // 瞬間的に反対側が空いた瞬間を捉えて回り込むと、寄せ切る前にまた戻ることになる。
-  double side_other_fit_since_{-1.0};  // 余地なしが始まった時刻[s]。負なら余地あり
+  double side_other_fit_since_{-1.0};  // 反対側に余地が続き始めた時刻[s]。負なら無し
   double deadlock_since_{-1.0};    // 停止車両の前で動けなくなった時刻[s]。負なら動いている
   // スタート時のグリッド横位置の保持
   int start_slot_{0};                  // スタート時の並び順(1=P1)
@@ -1551,11 +1750,6 @@ private:
   bool attempt_latok_{false};      // この試行で一度でも commit_sep を満たしたか
   bool attempt_predictive_{false}; // 予測地点へ接続して開始した試行か
   double attempt_plan_dist_{-1.0}; // 試行開始時の予測入口までの距離[m]
-  // ================= 追越ファネル(観測のみ / 2026-09-03) =================
-  // 【なぜ必要か】従来の記録は「追越却下」が2秒ごとの周期単位で出るだけで、
-  // 1回の試行がどこまで到達し、どこで最初に止まったかが分からなかった。
-  // そのため頻度の小さい理由(全試行の 2.5%)を先に直してしまった。
-  // ここは**観測専用**。制御はこれらを一切読まない。
   int  attempt_stage_{0};              // 到達した最大の段階(1..6)
   std::string attempt_fail_first_;     // 最初の失敗理由(後から上書きしない)
   bool attempt_runup_used_{false};     // 助走(runup_charge)が一度でも立ったか
@@ -1573,15 +1767,11 @@ private:
   int attempt_lead_cnt_{0};          // 相手より前に出ている周期数(3周期で成功)
   double attempt_diff0_{1e18};       // 試行開始時の進行度差[m]。1e18 は未取得
   double attempt_stall_until_{-1.0}; // この時刻[s]まで下の相手へは仕掛けない
-  // 停止車回避で中断した直後の同一相手には、横に出直す前に状況を安定させる。
-  // 「停止/低速」の観測が数周期揺れても、試行開始と安全中断を繰り返さないため。
+  // 停止車回避で中断した直後の同一相手へ再試行しない期限[s]。
   double stop_avoid_retry_until_{-1.0};
   std::string stop_avoid_target_;
   std::string attempt_stall_name_;   // 進展なしで降りた相手
-  // 追越試行が降りた理由を追うための直近の判定内容
-  // 接触した瞬間に「回避層が何をしていたか」を振り返るための記録。
-  // 接触の原因が「回避が働かなかった」のか「働いたが足りなかった」のかを
-  // 区別できないと直しようがない。
+  // 接触時に回避層が何をしていたかの記録(観測用)。
   double dbg_avoid_offset_{0.0};   // 横に逃げた量[m]
   double dbg_avoid_cap_{-1.0};     // 減速の上限[m/s]。負なら減速していない
   double dbg_avoid_ttc_{-1.0};     // 最も近い相手との衝突までの時間[s]
@@ -1610,7 +1800,6 @@ private:
   double band_dbg_moved_{0.0};             // バンドが目標を動かした最大量[m]
   double band_dbg_at_{0.0};                // その地点の前方距離[m]
   rclcpp::Time last_band_dbg_log_{0, 0, RCL_ROS_TIME};
-  // 予測誤差の実測用
   struct PredCheck { std::string id; double due; double x; double y; };
   std::deque<PredCheck> pred_checks_;
   std::map<std::string, double> pred_push_at_;
@@ -1659,6 +1848,38 @@ private:
   std::vector<double> line_x_, line_y_;
   double my_speed_sum_{0.0};
   int my_speed_cnt_{0};
+  // 自車の区間ごとの速度(相手の sec_sum/sec_cnt と同じ bin・更新則)。
+  double my_sec_sum_[OtherState::kSections]{};
+  int    my_sec_cnt_[OtherState::kSections]{};
+  // 自車の直近1周ぶんの区間速度。
+  double my_prev_sec_sum_[OtherState::kSections]{};
+  int    my_prev_sec_cnt_[OtherState::kSections]{};
+  bool   my_prev_sec_valid_ = false;
+  int    my_last_sec_ = -1;
+  double mySectionTop() const
+  {
+    double best = -1.0;
+    for (int i = 0; i < OtherState::kSections; ++i) {
+      if (my_sec_cnt_[i] < 5) { continue; }
+      best = std::max(best, my_sec_sum_[i] / my_sec_cnt_[i]);
+    }
+    return best;
+  }
+  // 直近1周ぶんの自車の区間平均の最大[m/s]。
+  double mySectionTopRecent() const
+  {
+    const double * su = my_prev_sec_valid_ ? my_prev_sec_sum_ : my_sec_sum_;
+    const int    * cn = my_prev_sec_valid_ ? my_prev_sec_cnt_ : my_sec_cnt_;
+    double best = -1.0;
+    for (int i = 0; i < OtherState::kSections; ++i) {
+      if (cn[i] < 5) { continue; }
+      best = std::max(best, su[i] / cn[i]);
+    }
+    return best;
+  }
+  bool slow_rival_by_top_;
+  bool slow_rival_recent_;   // 最大を直近1周だけで取る
+  double slow_rival_top_ratio_;
   rclcpp::Time last_stats_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_ot_lane_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_alongside_log_{0, 0, RCL_ROS_TIME};
@@ -1672,11 +1893,14 @@ private:
   std::vector<std::pair<double, double>> grid_slots_;  // 記録したグリッド座標
   std::vector<std::pair<std::size_t, std::size_t>> no_pass_zones_;  // 追い越し禁止区間
   std::vector<std::pair<std::size_t, std::size_t>> ot_lane_zones_;  // 公式オーバーテイクレーン
-  // レーンへ実際に「車体を丸ごと入れられる」区間。公式のルール区間(ot_lane_zones_)
-  // より狭い。理由は下の inOtLaneUse のコメント。
   std::vector<std::pair<std::size_t, std::size_t>> ot_lane_use_zones_;
   std::vector<std::pair<std::size_t, std::size_t>> right_zones_;   // 右から抜く区間
   std::vector<std::pair<std::size_t, std::size_t>> side_pick_zones_;  // 側を録画で決める区間
+  // 直線の終わりを表す区間(抜き切り判定用)。
+  const std::string pass_finish_zone_spec_;
+  std::vector<std::pair<std::size_t, std::size_t>> pass_finish_zones_;
+  bool inPassFinishZone(std::size_t idx) const;
+  double distToPassFinishZoneEnd(const Frame & f) const;
   double slow_rival_ratio_{0.85};
   bool start_boost_enable_{true};
   int start_boost_laps_{2};       // この周回数以内なら「序盤」とみなす
@@ -1720,7 +1944,9 @@ private:
   rclcpp::Time last_rearend_log_{0, 0, RCL_ROS_TIME};
   // 横位置の調停結果を 2秒に1回だけ出すための時刻
   rclcpp::Time last_lat_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_lat_conflict_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_deadlock_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_slow_cap_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cap_arbitration_log_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Publisher<Trajectory>::SharedPtr pub_;

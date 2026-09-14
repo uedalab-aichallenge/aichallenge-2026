@@ -58,25 +58,18 @@ class SimplePurePursuit : public rclcpp::Node {
   const double steering_tire_angle_gain_;
   // ラインから離れているときに lookahead を伸ばす係数(横ずれ e に対し e*gain)
   const double lookahead_cte_gain_;
-  // 曲率に応じて lookahead を縮める。半径 curve_ref 以上で等倍、
-  // それより曲がっているほど curve_min まで縮める
-  const double lookahead_curve_ref_;
-  const double lookahead_curve_min_;
-  // --- 低速でだけ曲率に応じて目標点を近づける(ユーザー指示)
-  // 基準速度以上では一切変更しない。以下では曲率と現在速度で lookahead に上限を掛ける。
+  // 低速時だけ曲率と速度で lookahead に上限を掛ける。
+  // 基準速度以上では変更しない。
   const double lookahead_slow_speed_;   // これ[m/s]以上なら従来どおり
-  const double lookahead_slow_full_;    // これ[m/s]以下で効果100%
   const double lookahead_curve_k_;      // 上限 = 曲率半径 x この係数
   const double lookahead_slow_min_;     // 縮めすぎ防止の下限[m]
   const double lookahead_slow_exp_;     // 低速での縮め方の鋭さ(指数)
-  const double lookahead_slow_far_;     // 低速でも直線ならここまで[m]
   // 追い越し試行中は目標点を近づける。横にずらした軌道へ素早く追従させるため。
   const double lookahead_overtake_scale_;
   bool overtaking_{false};
   double overtake_scale_now_{1.0};   // なましてから掛ける
   // 場所を指定して lookahead を縮める区間。"開始:終了:倍率" をカンマ区切り。
-  // 曲率で決めると、直したい idx165-185(R7.0m) より きつい
-  // idx51-65(R4.0m) 等のほうが強く縮まって左右に発振する。
+  // 区間指定は、曲率だけでは不要な区間まで縮めて発振し得るために使う。
   const std::string lookahead_zone_spec_;
   struct LookaheadZone { std::size_t from; std::size_t to; double scale; };
   std::vector<LookaheadZone> lookahead_zones_;
@@ -92,6 +85,8 @@ class SimplePurePursuit : public rclcpp::Node {
   double steer_limit_flag_{0.0};         // 1.0 なら壁予測が違反を検知している
   rclcpp::Time steer_limit_time_{0, 0, RCL_ROS_TIME};   // 受信時刻
   rclcpp::Time last_steer_override_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_steer_diag_log_{0, 0, RCL_ROS_TIME};
+  double prev_requested_steer_{0.0};
   static constexpr double kScaleSmooth = 0.08;   // なまし係数(1周期あたり)
   const double lookahead_curve_ahead_;
   // 自車の少し先の軌道の曲率半径[m]を返す。取れなければ大きな値
@@ -100,6 +95,11 @@ class SimplePurePursuit : public rclcpp::Node {
   const double start_steer_speed_;   // この速度[m/s]未満で制限を掛ける
   const double start_steer_limit_;   // 停止時の操舵角上限[rad]
   const double stuck_steer_free_speed_;  // これ未満の速度では制限を外す(壁からの脱出用)
+  const bool sat_accel_guard_;    // 舵が飽和している間は前へ加速しない
+  const double sat_steer_rad_;    // 実舵の上限[rad](実測 0.31 = 18deg)
+  const double sat_accel_max_;    // そのときに許す最大加速度
+  const double sat_guard_min_speed_; // この速度[m/s]以下ではガードを効かせない
+  rclcpp::Time last_sat_log_{0, 0, RCL_ROS_TIME};
   const double max_acceleration_;
   // --- 壁ガードによる舵角クランプ(最終手段の安全網)
   // v2x_overtaker が /control/wall_guard/steer_limit へ流す
