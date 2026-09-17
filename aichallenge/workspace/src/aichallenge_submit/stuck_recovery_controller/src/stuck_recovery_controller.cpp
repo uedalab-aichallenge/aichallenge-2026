@@ -151,6 +151,8 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   gear_pub_ = create_publisher<GearCommand>("/control/command/gear_cmd", 1);
   status_pub_ = create_publisher<std_msgs::msg::String>(
       "/control/debug/recovery_status", rclcpp::QoS(1));
+  recovery_layers_pub_ = create_publisher<std_msgs::msg::String>(
+      "/control/debug/recovery_layers", rclcpp::QoS(1));
 
   // 動作確認用の強制発動。壁に当たらなくなると復帰が動く場面に出会えないため。
   const auto traj_qos = rclcpp::QoS(rclcpp::KeepLast(1)).durability_volatile().best_effort();
@@ -214,8 +216,11 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   // 送出より後に起動したノードが開始を受け取れない。安全ゲート(volatile と見られる)にも
   // 対応するため両方の QoS で購読する。処理は !race_started_ で冪等。
   const auto on_race_state = [this](const std_msgs::msg::String::ConstSharedPtr msg) {
-      // 安全ゲートは Start を出さず Grounded で走り出す。実移動を観測するまで判定しないので待機中は安全。
-      if (!race_started_ && (msg->data == "Start" || msg->data == "Grounded")) {
+      // 公式 autostart_orchestrator と同じく Grounded / Ready / Start で開始とみなす。
+      // 後から起動すると最後の Ready しか受け取れないため Ready も必要(2026-09-18 gate2 で再現)。
+      // 実移動を観測するまで判定しないので待機中は安全。
+      if (!race_started_ &&
+          (msg->data == "Start" || msg->data == "Grounded" || msg->data == "Ready")) {
         race_started_ = true;
         moving_observed_ = false;
         stuck_start_time_.reset();
@@ -338,6 +343,8 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   simple_dir_hold_sec_ = declare_parameter<double>("simple_dir_hold_sec", 1.5);
   // 候補が有効なのに実際には動けていないとき、。
   simple_stall_sec_ = declare_parameter<double>("simple_stall_sec", 3.0);
+  press_flip_sec_ = declare_parameter<double>("press_flip_sec", 1.0);
+  press_wall_m_ = declare_parameter<double>("press_wall_m", 0.2);
   simple_stall_min_m_ = declare_parameter<double>("simple_stall_min_m", 0.15);
   simple_lost_confirm_sec_ =
     declare_parameter<double>("simple_lost_confirm_sec", 0.5);
@@ -998,9 +1005,52 @@ std::string StuckRecoveryController::traceLine(const rclcpp::Time & now)
   return std::string(buf);
 }
 
+void StuckRecoveryController::publishRecoveryMeasure(const rclcpp::Time & now)
+{
+  if (!recovery_layers_pub_) { return; }
+  if ((now - last_recovery_measure_).seconds() < 0.2) { return; }
+  last_recovery_measure_ = now;
+  const bool in_rec = recovery_start_time_.has_value();
+  const double rec_sec = in_rec ? (now - recovery_start_time_.value()).seconds() : 0.0;
+  // rviz は日本語を文字化けさせるので英字で出す(日本語の内容は autoware.log にある)。
+  const std::string src = cmd_src_ ? cmd_src_ : "-";
+  const auto has = [&src](const char * k) { return src.find(k) != std::string::npos; };
+  std::string src_en = "OTHER(" + src + ")";
+  if (has("通常制御(舵先回り)")) { src_en = "NORMAL (pre-steer to plan)"; }
+  else if (has("通常制御")) { src_en = "NORMAL (pure_pursuit)"; }
+  else if (has("後退経路")) { src_en = "RECOVERY reverse path"; }
+  else if (has("後退指令待ち")) { src_en = "RECOVERY waiting reverse cmd"; }
+  else if (has("前進経路")) { src_en = "RECOVERY forward path"; }
+  else if (has("復帰(簡易)")) { src_en = "RECOVERY simple"; }
+  else if (has("最終手段")) { src_en = "RECOVERY last resort"; }
+  else if (has("制動")) { src_en = "RECOVERY braking"; }
+  else if (has("待ち")) { src_en = "RECOVERY waiting"; }
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+    "[CTRL] out = %s\n"
+    "  recovery = %s%s | plan = %s phase %zu/%zu%s\n"
+    "  cmd %.1fkm/h accel %+.2f steer %+.0fdeg gear %s | ego %.1fkm/h\n"
+    "  wall clearance %.2fm%s",
+    src_en.c_str(),
+    in_rec ? "ON" : "off",
+    in_rec ? (" " + std::to_string(static_cast<int>(rec_sec)) + "s").c_str() : "",
+    plan_.valid ? "yes" : "no", phase_idx_, plan_.phases.size(),
+    (plan_.valid && phase_idx_ < plan_.phases.size())
+      ? (plan_.phases[phase_idx_].forward ? " forward" : " reverse") : "",
+    sent_speed_ * 3.6, sent_accel_, sent_steer_phys_ * 180.0 / M_PI,
+    sent_gear_ == GearCommand::REVERSE ? "R" : "D",
+    latest_velocity_ * 3.6,
+    wall_clear_now_,
+    (wall_forward_ban_ && wall_clear_now_ < 0.0) ? " | INSIDE WALL (forward banned)" : "");
+  std_msgs::msg::String m;
+  m.data = buf;
+  recovery_layers_pub_->publish(m);
+}
+
 void StuckRecoveryController::traceSample(const rclcpp::Time & now)
 {
   ProfScope prof_scope(prof_, "traceSample");
+  publishRecoveryMeasure(now);
   traceInit();
   // 「1秒で何m進んだか」= 停滞判定の入力そのもの。判断の材料は必ず残す。
   recovery::Pose p;
@@ -2776,6 +2826,39 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
   bool switch_dir = false;
   const char * why_switch = "";
   const bool cur_ok = simple_dir_forward_ ? ok_f : ok_b;
+  // 【2026-09-18】壁に押し付いて動けない状態を、前進・後退のどちらでも見る。
+  // 進もうとしている側(前進なら前端、後退なら後端)の壁までの距離で判定する。
+  bool press_flip = false;
+  {
+    double fc = 1e3, rc = 1e3;
+    if (obstacles_.valid()) {
+      recovery::wallClearanceSplit(obstacles_, veh_, p, fc, rc);
+    }
+    const double clear_dir = simple_dir_forward_ ? fc : rc;
+    const bool moving_now = std::abs(latest_velocity_) > 0.15;
+    if (moving_now || clear_dir >= press_wall_m_) {
+      simple_press_since_ = -1.0;
+    } else {
+      if (simple_press_since_ < 0.0) { simple_press_since_ = now.seconds(); }
+      if (now.seconds() - simple_press_since_ >= press_flip_sec_) {
+        press_flip = true;
+      }
+    }
+    if (press_flip) {
+      const bool other_ok_press = simple_dir_forward_ ? ok_b : ok_f;
+      RCLCPP_WARN(get_logger(),
+        "復帰(簡易) %sで壁に押し付いて %.1fs 動けない(その側の壁まで%.2fm 実速度%.2f)。"
+        "%s",
+        simple_dir_forward_ ? "前進" : "後退",
+        now.seconds() - simple_press_since_, clear_dir, latest_velocity_,
+        other_ok_press ? "反対へ切り替える" : "反対にも候補が無いので続行");
+      simple_press_since_ = -1.0;
+      if (other_ok_press) {
+        switch_dir = true;
+        why_switch = simple_dir_forward_ ? "前進で壁に押し付いた" : "後退で壁に押し付いた";
+      }
+    }
+  }
   // 経路の喪失は連続 simple_lost_confirm_sec_ 続いたときだけ確定する。
   if (cur_ok) {
     simple_lost_valid_ = false;
@@ -2802,7 +2885,9 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
       simple_dir_forward_ ? "前進" : "後退", moved_since_dir,
       simple_dir_max_m_, d_cur_tgt);
   }
-  if (reached) {
+  if (press_flip) {
+    // 押し付きの判断を優先する(下のチェーンは上書きしない)
+  } else if (reached) {
     // 目標点に着いたのに切り替え先の候補が無いと、その場で。
     const bool other_ok2 = simple_dir_forward_ ? ok_b : ok_f;
     if (!other_ok2 && start_wall < 0.0) {
@@ -4027,6 +4112,48 @@ bool StuckRecoveryController::runEscapeProbe(
   return true;
 }
 
+void StuckRecoveryController::logNoMove(
+  const rclcpp::Time & now, float speed, float accel, float steer_phys)
+{
+  // 「動かせと指令しているのに動いていない」状態が続いたら、その場の条件をまとめて出す。
+  const double t = now.seconds();
+  const bool want_move = std::abs(speed) > 0.2f || std::abs(accel) > 0.3f;
+  const bool moving = std::abs(latest_velocity_) > 0.15;
+  if (!want_move || moving) {
+    no_move_since_ = -1.0;
+    return;
+  }
+  if (no_move_since_ < 0.0) { no_move_since_ = t; }
+  if (t - no_move_since_ < 1.0 || t - last_no_move_log_ < 1.0) { return; }
+  last_no_move_log_ = t;
+  recovery::Pose p;
+  const bool have_pose = currentPose(p);
+  // いちばん近い他車(V2X)。押し合いで動けない場合を切り分ける。
+  std::string near_id = "-";
+  double near_d = -1.0;
+  if (v2x_ && have_pose) {
+    for (const auto & v : v2x_->vehicles) {
+      const double d = std::hypot(v.position.x - p.x, v.position.y - p.y);
+      if (d < 0.5) { continue; }
+      if (near_d < 0.0 || d < near_d) { near_d = d; near_id = v.vehicle_id; }
+    }
+  }
+  const double wall_f = wall_clear_now_;
+  RCLCPP_WARN(get_logger(),
+    "動かない診断 %.1fs 指令[速度%+.2f 加速度%+.2f 舵%+.0fdeg ギア%s] "
+    "禁止前[速度%+.2f 加速度%+.2f] 実[速度%+.2f 舵%+.0fdeg ギア%s] "
+    "壁まで%.2fm 復帰=%s 出=%s 近傍車=%s %.2fm 位置=(%.1f,%.1f) 方位%.0fdeg",
+    t - no_move_since_, speed, accel, steer_phys * 180.0 / M_PI,
+    gear_now_ == GearCommand::REVERSE ? "R" : "D",
+    pre_ban_speed_, pre_ban_accel_,
+    latest_velocity_, steer_report_ * 180.0 / M_PI,
+    gear_report_ == GearReport::REVERSE ? "R" : (gear_report_seen_ ? "D" : "?"),
+    wall_f, recovery_start_time_.has_value() ? "中" : "していない",
+    cmd_src_ ? cmd_src_ : "-", near_id.c_str(), near_d,
+    have_pose ? p.x : 0.0, have_pose ? p.y : 0.0,
+    have_pose ? p.yaw * 180.0 / M_PI : 0.0);
+}
+
 void StuckRecoveryController::publishCommand(float speed, float acceleration, float steer)
 {
   const auto stamp = this->now();
@@ -4042,6 +4169,8 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
   speed = std::clamp(speed, -kOutMaxSpeed, kOutMaxSpeed);
 
   wall_ban_steer_valid_ = false;
+  pre_ban_speed_ = speed;
+  pre_ban_accel_ = acceleration;
   applyWallForwardBan(speed, acceleration);
   if (wall_ban_steer_valid_) { steer = wall_ban_steer_; }
   alignGearToSpeed(speed);
@@ -4055,6 +4184,7 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
       applyReachableWallGuard(speed, acceleration, steer);
     }
   }
+  logNoMove(stamp, speed, acceleration, static_cast<float>(steer / steer_cmd_scale_));
   sent_steer_phys_ = static_cast<float>(steer / steer_cmd_scale_);
   sent_speed_ = speed;
   sent_steer_cmd_ = steer;

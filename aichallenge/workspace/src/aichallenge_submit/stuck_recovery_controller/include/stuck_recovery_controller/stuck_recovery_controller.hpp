@@ -290,6 +290,10 @@ private:
   void publishFiltered(AckermannControlCommand cmd);
   rclcpp::Publisher<Trajectory>::SharedPtr reverse_traj_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr recovery_path_pub_;
+  // 【2026-09-18】最終指令の出どころと復帰の状態を rviz の左パネルへ(文字。地図の上には出さない)
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr recovery_layers_pub_;
+  rclcpp::Time last_recovery_measure_{0, 0, RCL_ROS_TIME};
+  void publishRecoveryMeasure(const rclcpp::Time & now);
   rclcpp::Time last_path_marker_{0, 0, RCL_ROS_TIME};
   void publishRecoveryPathMarker(std::size_t from);
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_pub_;
@@ -397,6 +401,18 @@ private:
   bool wall_ban_acted_{false};
 
   double wall_clear_now_{1e9};       // 毎周期の食い込み量[m]。正=余裕あり
+  // 【2026-09-18】「前進を指令しているのに動かない」の原因を出す診断(1秒ごと)。
+  // 長い復帰 41回のうち 34回でこの状態になっており、壁ペナルティの主因。
+  double no_move_since_{-1.0};
+  // 【2026-09-18 ユーザー指示】壁に押し付いて動けないときは、前進・後退のどちらでも
+  // すぐ反対へ切り替える。実測では舵 3〜7度のまま壁に当てて 5秒以上動けていた。
+  double simple_press_since_{-1.0};
+  double press_flip_sec_{1.0};     // この秒数動かなければ切り替える
+  double press_wall_m_{0.2};       // 進もうとしている側の壁までの距離がこれ未満なら「押し付き」
+  double last_no_move_log_{-1e9};
+  float pre_ban_speed_{0.0f};        // 壁前進禁止・壁ガードに入る前の指令
+  float pre_ban_accel_{0.0f};
+  void logNoMove(const rclcpp::Time & now, float speed, float accel, float steer);
   static constexpr int kFwdWallReasons = 6;
   long fwd_in_wall_cnt_[kFwdWallReasons]{};
   double fwd_in_wall_sec_[kFwdWallReasons]{};

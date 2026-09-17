@@ -633,6 +633,9 @@
                  横にいる停止車でも捕まり、横をじりじり進む原因。8/29 に棄却して 0 にしたが、9/4 の 763badb で
                  既定 4.5 に戻っていた(submit_11 は 0)。REAR_END_NEAR で車ごとに振る。小数点必須。 -->
             <param name="rear_end_near" value="$(env REAR_END_NEAR 4.5)"/>
+            <!-- 【2026-09-18・A/B 中】区間内に抜き切れないと判断したら追い越しをやめる/始めない -->
+            <param name="pass_finish_abort" value="$(env PASS_FINISH_ABORT true)"/>
+            <param name="pass_finish_no_start" value="$(env PASS_FINISH_NO_START true)"/>
             <!-- 【2026-08-31】1.9 -> 1.75。pass_gap は「狙う間隔」だが side_fits_ の
                  判定では余地に収まることを要求するため、実質の必要幅になっていた。
                  実測(sepfix01)では 余地に 1.7〜1.8m あるのに 1.9 が入らず却下。

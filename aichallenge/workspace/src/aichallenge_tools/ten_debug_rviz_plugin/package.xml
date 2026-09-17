@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ten_debug_rviz_plugin</name>
+  <version>0.1.0</version>
+  <description>今どの層・処理が軌道と速度に効いているかを rviz の左パネルに文字で出す。
+  提出物(aichallenge_submit)には含めない開発用。</description>
+  <maintainer email="dev@example.com">ten</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rviz_common</depend>
+  <depend>std_msgs</depend>
+  <depend>libqt5-widgets</depend>
+  <depend>qtbase5-dev</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+    <rviz plugin="${prefix}/plugins/plugin_description.xml"/>
+  </export>
+</package>

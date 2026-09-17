@@ -1,4 +1,6 @@
 Panels:
+  - Class: ten_debug_rviz_plugin/LayersPanel
+    Name: 効いている層
   - Class: rviz_common/Displays
     Help Height: 0
     Name: Displays
@@ -547,6 +549,25 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /planning/debug/drivable_band
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: V2X measure
+      Namespaces:
+        band_body: true
+        labels: true
+        lat_bounds: true
+        lat_target: true
+        rear_end_near: true
+        rear_end_zone: true
+        stop_avoid_gap: true
+        stopped_body: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /planning/debug/v2x_measure
       Value: true
     - Alpha: 0.699999988079071
       Class: rviz_default_plugins/Map

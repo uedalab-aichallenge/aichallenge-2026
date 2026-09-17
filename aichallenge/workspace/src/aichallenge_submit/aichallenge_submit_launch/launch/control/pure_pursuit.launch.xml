@@ -52,6 +52,10 @@
     <param name="simple_stall_sec" value="$(env SIMPLE_STALL_SEC 3.0)"/>
     <!-- 【2026-09-17 devTT5 から取り込み】発進(最初の実移動)から8秒は復帰を始めない。 -->
     <param name="launch_no_recovery_sec" value="$(env LAUNCH_NO_RECOVERY_SEC 8.0)"/>
+    <!-- 【2026-09-18】目標指向の復帰計画(planToGoal)を使わない。簡易復帰(recovery_simple=true)は
+         その結果を使っておらず、復帰開始のたびに 1〜5秒 制御周期を止めていた。gate1 で停止中の
+         最大制動が届かず、停止車へ 3.0→8.1km/h で加速した原因。 -->
+    <param name="goal_plan_enable" value="$(env GOAL_PLAN_ENABLE false)"/>
     <param name="simple_stall_min_m" value="$(env SIMPLE_STALL_MIN_M 0.15)"/>
     <!-- いまの向きの候補がこの秒数続けて見つからないときだけ向きを変える(切り返しの発振防止)。 -->
     <param name="simple_lost_confirm_sec" value="$(env SIMPLE_LOST_CONFIRM_SEC 0.5)"/>

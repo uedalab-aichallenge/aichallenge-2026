@@ -1,0 +1,7 @@
+<library path="ten_debug_rviz_plugin">
+  <class name="ten_debug_rviz_plugin/LayersPanel"
+         type="ten_debug_rviz_plugin::LayersPanel"
+         base_class_type="rviz_common::Panel">
+    <description>効いている層・処理を文字で出すパネル</description>
+  </class>
+</library>

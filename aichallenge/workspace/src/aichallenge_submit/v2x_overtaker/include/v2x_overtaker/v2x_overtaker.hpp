@@ -503,6 +503,10 @@ private:
   bool loadCorridor(const std::string & path);
   void buildBand(const Frame & f);
   void publishBand(const Frame & f);
+  // 【2026-09-18】判断に実際に使っている幾何を rviz へ出す(/planning/debug/v2x_measure)。
+  // 相手の当たり判定・停止車の占有・選んだ隙間・追突防止の進路帯と近距離の円・
+  // 横目標とその許容範囲。値はすべてこの周期の計算に使った実値。
+  void publishMeasure(const Frame & f, PlanCtx & c);
   void publishStatus(const Frame & f, const PlanCtx & c);
 
   // 予測バンドが決めた「相手のどちら側を通るか」。+1=左 / -1=右 / 0=未定
@@ -897,6 +901,17 @@ private:
   // 「どちらの側も抜けない」がこの秒数続いたら試行を降りる。0 で無効。
   const double attempt_giveup_time_;
   double attempt_nopass_since_{-1.0};
+  // 【2026-09-18】「この区間では抜き切れない」と判断したら追い越しをやめる(ユーザー指示)。
+  // レーンの出口(idx21)直後 idx22〜33 に衝突25件中21件が集中していた。抜き切れないまま
+  // レーンが終わり、相手の横のまま合流して当てている。
+  bool pass_finish_abort_{true};        // 抜き切れないと分かったら試行を中止する
+  bool pass_finish_no_start_{true};     // 抜き切れないなら始めない(遅い相手でも見る)
+  double pass_finish_hold_{0.3};        // その判断がこの秒数続いたら中止する
+  bool finish_short_now_{false};        // この周期の判断(区間の残りより要る距離が長い)
+  double finish_need_m_{-1.0};          // 抜き切るのに要る距離[m]
+  double finish_left_m_{-1.0};          // 区間(直線/レーン)の残り[m]
+  double attempt_finish_short_since_{-1.0};
+  std::size_t attempt_finish_abort_n_{0};
   std::size_t attempt_nopass_n_{0};
   // 同上の判定結果(その周期で「どちらでも抜けない」か)。
   bool no_pass_side_{false};
@@ -1657,6 +1672,23 @@ private:
   std::vector<double> band_lo_ex_;
   std::vector<double> band_hi_ex_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr band_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr measure_pub_;
+  // 層の一覧(日本語のまま)。rviz の文字で日本語が出ない環境向けに ros2 topic echo 用。
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr layers_pub_;
+  rclcpp::Time last_measure_pub_{0, 0, RCL_ROS_TIME};
+  // preventRearEnd がこの周期に使った値(表示用)
+  struct RearEndDbg
+  {
+    bool ran{false};
+    double sep_th{0.0};
+    double my_now{0.0};
+    double my_want{0.0};
+    std::string name;
+    double gap{0.0};
+    double sep{0.0};
+    double cap{-1.0};
+  };
+  RearEndDbg rear_dbg_;
   // 時計種別を指定しないとシミュレータ時刻との引き算で例外になる。
   rclcpp::Time last_band_pub_{0, 0, RCL_ROS_TIME};
   // デバッグ表示(GUI)へ流す状態。key=value を改行で並べただけの文字列。
@@ -1938,7 +1970,7 @@ private:
   // 片方の QoS では他方と非互換になるので、両方で購読する。
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_state_latched_;
   void onRaceState(const std::string & state);
-  bool race_start_by_grounded_{false};  // Grounded で開始扱いにし、まだ Start を見ていない
+  bool race_start_by_grounded_{false};  // Grounded/Ready で開始扱いにし、まだ Start を見ていない
   rclcpp::Time last_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_reject_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_latch_log_{0, 0, RCL_ROS_TIME};   // latch で継続した周期の記録用

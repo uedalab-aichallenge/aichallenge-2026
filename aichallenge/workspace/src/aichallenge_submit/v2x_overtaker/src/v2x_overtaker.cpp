@@ -1001,6 +1001,10 @@ V2XOvertaker::V2XOvertaker()
   pub_ = create_publisher<Trajectory>("output/trajectory", qos);
   band_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "/planning/debug/drivable_band", rclcpp::QoS(1));
+  measure_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/planning/debug/v2x_measure", rclcpp::QoS(1));
+  layers_pub_ = create_publisher<std_msgs::msg::String>(
+      "/planning/debug/v2x_layers", rclcpp::QoS(1));
   status_pub_ = create_publisher<std_msgs::msg::String>("output/status", rclcpp::QoS(1));
   // 診断ログを rosbag へ載せるためのトピック。絶対名にして record.sh から
   // 直接指定できるようにする。QoS は取りこぼしを避けるため深めに取る。
@@ -1051,6 +1055,10 @@ V2XOvertaker::V2XOvertaker()
   // レース開始の検知。AWSIM は latch(transient_local) で流すので合わせる。
   // 停止車の余裕を外して測り直すか(devTT5 から取り込み。A/B 用に既定は従来の true)。
   stopped_pad_relax_ = declare_parameter<bool>("stopped_pad_relax", true);
+  // 抜き切れないと分かったら追い越しをやめる/始めない(2026-09-18)
+  pass_finish_abort_ = declare_parameter<bool>("pass_finish_abort", true);
+  pass_finish_no_start_ = declare_parameter<bool>("pass_finish_no_start", true);
+  pass_finish_hold_ = declare_parameter<double>("pass_finish_hold", 0.3);
   // 【2026-09-17】AWSIM は state を transient_local で1レース数回しか送らない。
   // volatile だけで購読すると、送出より後に起動したノードは開始を受け取れない。
   // 安全ゲート(volatile と見られる)にも対応するため、両方の QoS で購読する。
@@ -1142,22 +1150,27 @@ void V2XOvertaker::onRaceState(const std::string & state)
       kv.second.vy = 0.0;
     }
   };
-  // 安全ゲートは Start を出さず Grounded で走り出す(公式 autostart_orchestrator も Grounded で開始)。
-  if (!race_started_ && (state == "Start" || state == "Grounded")) {
+  // 公式 autostart_orchestrator と同じく Grounded / Ready / Start のどれでも開始とみなす
+  // (autostart_orchestrator.param.yaml の start_on_vehicle_state)。
+  // AWSIM の state は transient_local・履歴1件で Spawned→Grounded→Ready→Start と進むので、
+  // Grounded の送出より後に起動すると最後の Ready しか受け取れない。Ready を見ないと
+  // 開始を検知できず、回避・追い越しが無効のまま停止車へ突っ込む(2026-09-18 gate2 で再現)。
+  const bool start_state = (state == "Start" || state == "Grounded" || state == "Ready");
+  if (!race_started_ && start_state) {
     race_started_ = true;
-    race_start_by_grounded_ = (state == "Grounded");
+    race_start_by_grounded_ = (state != "Start");
     reset_launch();
     RCLCPP_INFO(get_logger(), "レース開始を検知(%s)。回避と追い越しを有効化する", state.c_str());
     return;
   }
-  // AWSIM では Grounded の約30秒後に Start が来る。合図からの時間窓
+  // AWSIM では Grounded/Ready の後に Start が来る。合図からの時間窓
   // (launch_p1_pass_sec など)を Grounded から数えると発進前に切れるので、
   // Start が来たら基準を Start に付け替える。まだ動いていないときだけ。
   if (race_started_ && race_start_by_grounded_ && state == "Start") {
     race_start_by_grounded_ = false;
     if (launch_motion_since_ < 0.0) {
       reset_launch();
-      RCLCPP_INFO(get_logger(), "Start を検知。合図の時刻を Grounded から Start に付け替える");
+      RCLCPP_INFO(get_logger(), "Start を検知。合図の時刻を Grounded/Ready から Start に付け替える");
     }
   }
 }
@@ -5099,6 +5112,21 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   }
   bool straight_short = false;
   {
+    // 【2026-09-18】区間の残りと「抜き切るのに要る距離」は、遅い相手でも試行中でも毎周期出す。
+    // 以前は「相手が明らかに遅い」「試行中」のときに計算自体を飛ばしていたため、
+    // レーンの出口で抜き切れないまま合流していた。
+    const double d_end0 = distToPassFinishZoneEnd(f);
+    finish_left_m_ = d_end0;
+    finish_need_m_ = -1.0;
+    finish_short_now_ = false;
+    if (d_end0 >= 0.0) {
+      double need0 = pass_dist(t_accel);
+      if (pass_boost_gate_ && boost_remaining_ > 0 && boostLapOk()) {
+        need0 = std::min(need0, pass_dist_a(t_accel_boosted, accel_boosted));
+      }
+      finish_need_m_ = need0;
+      finish_short_now_ = need0 > d_end0 + straight_finish_margin_;
+    }
     // ここは「直線の終わり」が要る。
     const double d_end = distToPassFinishZoneEnd(f);
     if (d_end >= 0.0 && !c.slow_leader && !clearly_slower && !attempt_active_) {
@@ -5155,7 +5183,10 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
                              side_fits_ && width_ok;
   const bool spot_block = spot_block_requested && !local_capable;
   const bool place_ok = zone_free_ ? zf_ok : (zone_ok || local_capable);
-  const bool short_ok = zone_free_ || !straight_short || local_capable;
+  bool short_ok = zone_free_ || !straight_short || local_capable;
+  // 【2026-09-18】「区間内に抜き切れない」を local_capable(通せる幅がある・引き返せる)で
+  // 上書きしていたため、抜き切れないと分かっている状況で試行を始めていた。
+  if (pass_finish_no_start_ && finish_short_now_ && !attempt_active_) { short_ok = false; }
   bool caution_block = false;
   if (!caution_zones_.empty() && !attempt_active_) {
     for (const auto & z : caution_zones_) {
@@ -5231,7 +5262,8 @@ void V2XOvertaker::decideAllow(const Frame & f, PlanCtx & c, const std::string &
   }
 
   const char * why =
-      straight_short                 ? "直線内に抜き切れない"
+      (pass_finish_no_start_ && finish_short_now_) ? "区間内に抜き切れない"
+    : straight_short                 ? "直線内に抜き切れない"
     : !lap_ok                        ? "周回で禁止"
     : spot_block                     ? "抜きどころ待ち"
     : in_no_pass                     ? "禁止区間"
@@ -6624,6 +6656,7 @@ double V2XOvertaker::sepRate(
 
 void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
 {
+  rear_dbg_ = RearEndDbg{};
   if (!rear_end_guard_) { return; }
   const Trajectory & in = f.in;
   const std::vector<double> & s = f.s;
@@ -6639,6 +6672,10 @@ void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
   const bool straight_pass = straight_pass_now_;
   // 通すときは「本当に車体が重なるか」だけで見る(車幅 1.30m + わずかな余裕)。
   const double sep_th = straight_pass ? straight_pass_sep_ : rear_end_sep_;
+  rear_dbg_.ran = true;
+  rear_dbg_.sep_th = sep_th;
+  rear_dbg_.my_now = my_now;
+  rear_dbg_.my_want = my_want;
 
   double best_gap = 1e9;
   double best_speed = 0.0;
@@ -6954,6 +6991,10 @@ void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
       room_dbg, brake_dbg, v_allow * 3.6, exp_dbg * 3.6,
       passing_beside ? 1 : 0, ovPassingTarget(best_name) ? 1 : 0);
   }
+  rear_dbg_.name = best_name;
+  rear_dbg_.gap = best_gap;
+  rear_dbg_.sep = best_sep;
+  rear_dbg_.cap = v_allow;
   if (v_allow >= 0.0) { c.requestCap(v_allow, "追突防止"); }
   // --- 壁に押されて相手側へ寄せられているときは、縦に譲って後ろへ下がる ---。
   if (lat_relax_yield_ && lat_relaxed_prev_ && !best_name.empty() &&
@@ -8317,6 +8358,16 @@ void V2XOvertaker::recordAttempt(const Frame & f, PlanCtx & c)
       const bool nopass_stop =
         attempt_giveup_time_ > 0.0 && attempt_nopass_since_ >= 0.0 &&
         (now.seconds() - attempt_nopass_since_) >= attempt_giveup_time_;
+      // 【2026-09-18 ユーザー指示】この区間では抜き切れないと分かったら追い越しをやめる。
+      // やめれば次の周期から側と可否を計算し直すので、左が空いていれば左で仕切り直せる。
+      if (pass_finish_abort_ && finish_short_now_) {
+        if (attempt_finish_short_since_ < 0.0) { attempt_finish_short_since_ = now.seconds(); }
+      } else {
+        attempt_finish_short_since_ = -1.0;
+      }
+      const bool finish_stop =
+        pass_finish_abort_ && attempt_finish_short_since_ >= 0.0 &&
+        (now.seconds() - attempt_finish_short_since_) >= pass_finish_hold_;
       if (!passed && std::abs(pass_sep_) < min_pass_sep_ * 0.3) {
         if (attempt_fail_since_ < 0.0) { attempt_fail_since_ = now.seconds(); }
       } else {
@@ -8369,11 +8420,22 @@ void V2XOvertaker::recordAttempt(const Frame & f, PlanCtx & c)
                     dbg_feasible_ ? 1 : 0, dbg_latched_ ? 1 : 0, dbg_width_);
         logAttemptFunnel(f, "失敗", elapsed);
       } else if (stalled || lat_stalled || elapsed > attempt_timeout_ ||
-                 infeasible_stop || nopass_stop) {
+                 infeasible_stop || nopass_stop || finish_stop) {
         attempt_active_ = false;
         attempt_ng_++;
         // 失敗したので側の確定を解く。
         side_committed_ = false;
+        if (finish_stop) {
+          ++attempt_finish_abort_n_;
+          diagWarn("抜き切れないのでやめる",
+                   "抜き切れないのでやめる 累計%zu target=%s 所要=%.1fs idx=%zu "
+                   "要る距離%.1fm > 区間の残り%.1fm(+余裕%.1fm) 自車%.1fkm/h "
+                   "横間隔%.2fm(最大%.2fm) 車間%.1fm",
+                   attempt_finish_abort_n_, attempt_target_.c_str(), elapsed, f.ei,
+                   finish_need_m_, finish_left_m_, straight_finish_margin_,
+                   std::abs(f.ev) * 3.6, pass_sep_, attempt_max_sep_, c.best_gap);
+        }
+        attempt_finish_short_since_ = -1.0;
         if (nopass_stop) {
           ++attempt_nopass_n_;
           diagLog("抜けないので降りる",
@@ -9541,7 +9603,11 @@ void V2XOvertaker::buildBand(const Frame & f)
     for (const auto & kv : others_) {
       const OtherState & o = kv.second;
       if (!o.valid) { continue; }
-      if (c_stop_avoid_active_ && kv.first == c_blocker_) { continue; }
+      // 【2026-09-18】以前は停止車回避の対象車をバンドから除外していた(continue)。
+      // 対象車の回避が横目標だけに任され、横目標が縛られたり側が変わったりすると
+      // 軌道が対象車に重なるのを止める層が無かった(rviz の走行可能域が車体に掛かっていた)。
+      // 除外せず、停止車回避が選んだ隙間の側を塞がない向きで入れる(下の is_stop_blocker)。
+      const bool is_stop_blocker = c_stop_avoid_active_ && kv.first == c_blocker_;
       const size_t oi = nearest(f.in, o.x, o.y);
       double nx = 0.0, ny = 0.0;
       normalAt(f.in, oi, nx, ny);
@@ -9685,6 +9751,13 @@ void V2XOvertaker::buildBand(const Frame & f)
           }
         }
         side = want;
+      }
+
+      // 停止車回避の対象車は、停止車回避が選んだ隙間(c_stop_avoid_lo_/hi_)の側を空ける。
+      // バンドと停止車回避で通る側が食い違うと、横目標がバンドで押し戻されるため。
+      if (is_stop_blocker && c_stop_avoid_pass_ && c_stop_avoid_hi_ > c_stop_avoid_lo_) {
+        const double gap_c = 0.5 * (c_stop_avoid_lo_ + c_stop_avoid_hi_);
+        side = (gap_c >= olat) ? 1 : -1;
       }
 
       // 追い越し窓の探索状態を、この相手についてこれから作り直す。
@@ -9932,6 +10005,258 @@ void V2XOvertaker::publishBand(const Frame & f)
     arr.markers.push_back(m);
   }
   if (!arr.markers.empty()) { band_pub_->publish(arr); }
+}
+
+void V2XOvertaker::publishMeasure(const Frame & f, PlanCtx & c)
+{
+  if (!measure_pub_ || f.n < 3) { return; }
+  if ((f.now - last_measure_pub_).seconds() < 0.2) { return; }   // 5Hz
+  last_measure_pub_ = f.now;
+  const Trajectory & in = f.in;
+  const size_t n = f.n;
+  visualization_msgs::msg::MarkerArray arr;
+  {
+    visualization_msgs::msg::Marker clear;
+    clear.header = in.header;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+  }
+  int id = 0;
+  const auto make = [&](const char * ns, int type, double r, double g, double b,
+                        double scale) {
+    visualization_msgs::msg::Marker m;
+    m.header = in.header;
+    m.ns = ns;
+    m.id = id++;
+    m.type = type;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.orientation.w = 1.0;
+    m.scale.x = scale;
+    m.scale.y = scale;
+    m.scale.z = scale;
+    m.color.a = 0.95f;
+    m.color.r = static_cast<float>(r);
+    m.color.g = static_cast<float>(g);
+    m.color.b = static_cast<float>(b);
+    return m;
+  };
+  const auto pt = [](double x, double y, double z) {
+    geometry_msgs::msg::Point p; p.x = x; p.y = y; p.z = z; return p;
+  };
+  // 参照ラインに沿って、自車から from..to [m] 前方を横 lat [m] ずらした線
+  const auto along = [&](visualization_msgs::msg::Marker & m, double from, double to,
+                         double lat, double z) {
+    double run = 0.0;
+    for (size_t k = 0; k < n && run <= to; ++k) {
+      const size_t i = (f.ei + k) % n;
+      if (k > 0) {
+        double ds = f.s[i] - f.s[(f.ei + k - 1) % n];
+        if (ds < 0.0) { ds += f.total; }
+        run += ds;
+      }
+      if (run < from) { continue; }
+      double nx, ny;
+      normalAt(in, i, nx, ny);
+      const auto & p = in.points[i].pose.position;
+      m.points.push_back(pt(p.x + lat * nx, p.y + lat * ny, z));
+    }
+  };
+  const auto text = [&](double x, double y, const std::string & s, double r, double g, double b) {
+    auto m = make("labels", visualization_msgs::msg::Marker::TEXT_VIEW_FACING, r, g, b, 0.45);
+    m.pose.position = pt(x, y, 1.6);
+    m.text = s;
+    arr.markers.push_back(m);
+  };
+  char buf[200];
+
+  // --- 相手ごとの当たり判定
+  //   band_body (水色) : バンドが相手を塞ぐ範囲 横±band_car_w 前後±band_long(予測の広がり前の値)
+  //   stopped_body(赤) : 停止車回避が使う占有 横±(occupiedHalfWidth + 停止車の余裕)
+  for (const auto & kv : others_) {
+    const OtherState & o = kv.second;
+    if (!o.valid || (f.now - o.stamp).seconds() > v2x_timeout_) { continue; }
+    const size_t oi = nearest(in, o.x, o.y);
+    double nx, ny;
+    normalAt(in, oi, nx, ny);
+    const double tx = -ny, ty = nx;   // 進行方向
+    const double sp = std::hypot(o.vx, o.vy);
+    const bool stopped = sp < band_stop_speed_;
+    const auto rect = [&](const char * ns, double lat_half, double long_half,
+                          double r, double g, double b) {
+      auto m = make(ns, visualization_msgs::msg::Marker::LINE_STRIP, r, g, b, 0.06);
+      const double cs[5][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}, {-1, -1}};
+      for (const auto & q : cs) {
+        const double dl = q[0] * long_half, dw = q[1] * lat_half;
+        m.points.push_back(pt(o.x + dl * tx + dw * nx, o.y + dl * ty + dw * ny, 0.3));
+      }
+      arr.markers.push_back(m);
+    };
+    rect("band_body", band_car_w_, band_long_, 0.2, 0.8, 1.0);
+    if (stopped) {
+      rect("stopped_body", occupiedHalfWidth(oi, false) + stoppedPad(), 1.0, 1.0, 0.2, 0.2);
+    }
+    std::snprintf(buf, sizeof(buf), "%s %.1fkm/h%s", kv.first.c_str(), sp * 3.6,
+                  stopped ? " STOP" : "");
+    text(o.x, o.y, buf, 1.0, 1.0, 1.0);
+  }
+
+  // --- 停止車回避が選んだ隙間(緑): 対象車の位置で横 [lo, hi]
+  if (c.stop_avoid_active && c.stop_avoid_have_gap && !c.blocker.empty()) {
+    const auto it = others_.find(c.blocker);
+    if (it != others_.end() && it->second.valid) {
+      const size_t oi = nearest(in, it->second.x, it->second.y);
+      double nx, ny;
+      normalAt(in, oi, nx, ny);
+      const auto & p = in.points[oi].pose.position;
+      auto m = make("stop_avoid_gap", visualization_msgs::msg::Marker::LINE_STRIP, 0.1, 1.0, 0.1, 0.18);
+      m.points.push_back(pt(p.x + c.stop_avoid_lo * nx, p.y + c.stop_avoid_lo * ny, 0.2));
+      m.points.push_back(pt(p.x + c.stop_avoid_hi * nx, p.y + c.stop_avoid_hi * ny, 0.2));
+      arr.markers.push_back(m);
+    }
+  }
+
+  // --- 追突防止(橙): 進路上とみなす帯 と 近距離の円
+  if (rear_dbg_.ran) {
+    const double lo = std::min(rear_dbg_.my_now, rear_dbg_.my_want) - rear_dbg_.sep_th;
+    const double hi = std::max(rear_dbg_.my_now, rear_dbg_.my_want) + rear_dbg_.sep_th;
+    auto ml = make("rear_end_zone", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
+    along(ml, 0.0, rear_end_range_, lo, 0.15);
+    arr.markers.push_back(ml);
+    auto mh = make("rear_end_zone", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
+    along(mh, 0.0, rear_end_range_, hi, 0.15);
+    arr.markers.push_back(mh);
+    if (rear_end_near_ > 0.0) {
+      auto mc = make("rear_end_near", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.05);
+      for (int k = 0; k <= 36; ++k) {
+        const double a = k * M_PI / 18.0;
+        mc.points.push_back(pt(f.ex + rear_end_near_ * std::cos(a),
+                               f.ey + rear_end_near_ * std::sin(a), 0.15));
+      }
+      arr.markers.push_back(mc);
+    }
+    if (!rear_dbg_.name.empty()) {
+      const auto it = others_.find(rear_dbg_.name);
+      if (it != others_.end()) {
+        if (rear_dbg_.cap >= 0.0) {
+          std::snprintf(buf, sizeof(buf), "REAR cap %.1fkm/h gap %.1fm sep %.2f/%.2f",
+                        rear_dbg_.cap * 3.6, rear_dbg_.gap, rear_dbg_.sep, rear_dbg_.sep_th);
+        } else {
+          std::snprintf(buf, sizeof(buf), "REAR released gap %.1fm sep %.2f/%.2f",
+                        rear_dbg_.gap, rear_dbg_.sep, rear_dbg_.sep_th);
+        }
+        auto m = make("labels", visualization_msgs::msg::Marker::TEXT_VIEW_FACING, 1.0, 0.55, 0.0, 0.45);
+        m.pose.position = pt(it->second.x, it->second.y, 2.3);
+        m.text = buf;
+        arr.markers.push_back(m);
+      }
+    }
+  }
+
+  // --- 横目標(白)と、横目標に掛かった許容範囲(紫)。自車から window_full_ 前方まで
+  {
+    const double want = c.latWant();
+    auto mw = make("lat_target", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 1.0, 1.0, 0.05);
+    along(mw, 0.0, window_full_, want, 0.25);
+    arr.markers.push_back(mw);
+    const double lo = std::max(c.lat_lo, -6.0), hi = std::min(c.lat_hi, 6.0);
+    if (c.lat_lo > -1e8) {
+      auto m = make("lat_bounds", visualization_msgs::msg::Marker::LINE_STRIP, 0.8, 0.2, 1.0, 0.05);
+      along(m, 0.0, window_full_, lo, 0.25);
+      arr.markers.push_back(m);
+    }
+    if (c.lat_hi < 1e8) {
+      auto m = make("lat_bounds", visualization_msgs::msg::Marker::LINE_STRIP, 0.8, 0.2, 1.0, 0.05);
+      along(m, 0.0, window_full_, hi, 0.25);
+      arr.markers.push_back(m);
+    }
+  }
+  // --- 今この周期に軌道と速度へ効いている層の一覧(自車の左上に表示)
+  {
+    // rviz の文字は日本語を表示できないことがあるので、主要な理由は英字に置き換える。
+    static const std::pair<const char *, const char *> kNames[] = {
+      {"基準", "BASE"}, {"壁回避", "WALL_AVOID"}, {"停止車回避(最大制動)", "STOPPED_EMG_BRAKE"},
+      {"停止車回避(横到達)", "STOPPED_LAT_REACH"}, {"停止車回避", "STOPPED_AVOID"},
+      {"壁予測", "WALL_PREDICT"}, {"並走中は安全境界を越えない", "ALONGSIDE_BOUND"},
+      {"停止車の側へ寄らない", "STOPPED_SIDE_BOUND"}, {"追突防止(またがない)", "REAR_NO_STRADDLE"},
+      {"追突防止(先の帯)", "REAR_AHEAD_BAND"}, {"追突防止", "REAR_END"}, {"追越レーンへ入る", "OT_LANE_ENTER"},
+      {"追越レーン(低速で入らない)", "OT_LANE_SLOW_BLOCK"}, {"追越", "OVERTAKE"}, {"衝突回避", "COLLISION"},
+      {"姿勢復元", "POSE_RESTORE"}, {"壁に押されて後退", "PUSHED_YIELD"}, {"追従", "FOLLOW"},
+      {"車体の実位置を戻す", "BODY_RETURN"}, {"車体の実位置", "BODY_POS"}, {"車間を開ける", "OPEN_GAP"},
+      {"事前寄せ", "PRE_POSITION"}, {"姿勢ぶんの余裕", "YAW_MARGIN"}, {"近接車反発", "REPULSE"},
+      {"グリッド保持", "GRID_HOLD"}, {"スタートレーン保持", "START_HOLD"}, {"なし", "none"},
+      {"前方は空いている", "FRONT_CLEAR"},
+    };
+    const auto en = [](const char * w) -> std::string {
+      if (!w) { return "-"; }
+      for (const auto & kv : kNames) { if (std::strcmp(w, kv.first) == 0) { return kv.second; } }
+      return w;
+    };
+    std::string ascii, jp;
+    char line[256];
+    std::snprintf(line, sizeof(line), "[LAT] want %.2f <- %s | bound [%.2f %s, %.2f %s]\n",
+                  c.latWant(), en(c.lat_intent.why).c_str(),
+                  std::max(c.lat_lo, -9.99), en(c.lat_lo_why).c_str(),
+                  std::min(c.lat_hi, 9.99), en(c.lat_hi_why).c_str());
+    ascii += line;
+    std::snprintf(line, sizeof(line), "横目標 %.2f <- %s | 範囲 [%.2f %s, %.2f %s]\n",
+                  c.latWant(), c.lat_intent.why ? c.lat_intent.why : "-",
+                  std::max(c.lat_lo, -9.99), c.lat_lo_why ? c.lat_lo_why : "-",
+                  std::min(c.lat_hi, 9.99), c.lat_hi_why ? c.lat_hi_why : "-");
+    jp += line;
+    // 要求(R=採用 r=優先度で却下)と制約(B=狭めた b=効かず)
+    std::string req_a = "  lat:", req_j = "  横の要求:";
+    for (int k = 0; k < c.lat_trace_n; ++k) {
+      const auto & t = c.lat_trace[k];
+      if (t.kind == 'R' || t.kind == 'r') {
+        std::snprintf(line, sizeof(line), " %c:%s=%.2f", t.kind, en(t.why).c_str(), t.a);
+        req_a += line;
+        std::snprintf(line, sizeof(line), " %c:%s=%.2f", t.kind, t.why, t.a);
+        req_j += line;
+      } else if (t.kind == 'B') {
+        std::snprintf(line, sizeof(line), " B:%s[%.2f,%.2f]", en(t.why).c_str(),
+                      std::max(t.a, -9.99), std::min(t.b, 9.99));
+        req_a += line;
+        std::snprintf(line, sizeof(line), " B:%s[%.2f,%.2f]", t.why,
+                      std::max(t.a, -9.99), std::min(t.b, 9.99));
+        req_j += line;
+      }
+    }
+    ascii += req_a + "\n";
+    jp += req_j + "\n";
+    std::snprintf(line, sizeof(line), "[SPEED] cap %.1fkm/h <- %s%s | ego %.1fkm/h\n",
+                  c.speed_cap >= 0.0 ? c.speed_cap * 3.6 : -1.0, en(c.cap_why).c_str(),
+                  c.emergency_brake ? " EMERGENCY" : "", f.ev * 3.6);
+    ascii += line;
+    std::snprintf(line, sizeof(line), "速度上限 %.1fkm/h <- %s%s | 自車 %.1fkm/h\n",
+                  c.speed_cap >= 0.0 ? c.speed_cap * 3.6 : -1.0, c.cap_why ? c.cap_why : "-",
+                  c.emergency_brake ? " 最大制動" : "", f.ev * 3.6);
+    jp += line;
+    std::string caps_a = "  caps:";
+    for (const auto & r : c.cap_reqs) {
+      std::snprintf(line, sizeof(line), " %s=%.1f", en(r.why).c_str(), r.v * 3.6);
+      caps_a += line;
+    }
+    ascii += caps_a + "\n";
+    jp += "  速度の要求: " + c.cap_all + "\n";
+    std::string st;
+    if (attempt_active_) { st += " OVERTAKING(" + attempt_target_ + ")"; }
+    if (c.stop_avoid_active) { st += " AVOID_STOPPED(" + c.blocker + ")"; }
+    if (wedge_active_) { st += " AVOID_HEAD_ON"; }
+    if (is_boosting_) { st += " BOOST"; }
+    if (launch_motion_since_ < 0.0) { st += " WAIT_LAUNCH"; }
+    if (st.empty()) { st = " CRUISING"; }
+    ascii += "[STATE]" + st + "\n";
+    jp += "[状態]" + st + "\n";
+    // 層の一覧は rviz の左パネル(ten_debug_rviz_plugin)へ。地図の上には出さない。
+    // rviz は日本語を文字化けさせるので英字版を出す(日本語はログに出ている)。
+    (void)jp;
+    if (layers_pub_) {
+      std_msgs::msg::String sm;
+      sm.data = ascii;
+      layers_pub_->publish(sm);
+    }
+  }
+  measure_pub_->publish(arr);
 }
 
 void V2XOvertaker::publishTrajectory(const Frame & f, PlanCtx & c)
@@ -10263,6 +10588,8 @@ void V2XOvertaker::publishTrajectory(const Frame & f, PlanCtx & c)
 
   out.header.stamp = this->now();
   pub_->publish(out);
+  // 速度上限が確定した後に出す(publishMeasure は層の一覧も出すため)
+  publishMeasure(f, c);
   {
     std_msgs::msg::Bool ov;
     // 追い越し試行中は pure_pursuit の目標点を近づけ、横オフセットへ
