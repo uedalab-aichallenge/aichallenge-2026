@@ -620,6 +620,19 @@
             <param name="detect_range" value="25.0"/>
             <param name="avoid_range" value="14.0"/>
             <param name="stopped_look_ahead" value="40.0"/>
+            <!-- 【2026-09-17 devTT5 から取り込み】スタートレーン保持(グリッドの横位置を 12m/12s 保つ)を切る。
+                 横の範囲を縛って停止車を避けられず、当たってから右へそれていた(devTT4 でも再現)。 -->
+            <param name="launch_hold_grid" value="false"/>
+            <!-- 【同】「停止車の側へ寄らない」を切る。停止車の反対側へ抜ける計画でも横の範囲が
+                 空集合になり、当たってから右へそれていた(gate2)。 -->
+            <param name="stopped_bound_enable" value="false"/>
+            <!-- 【同・A/B 中】停止車の余裕を「帯が無ければ外す」か。true=従来(devTT4) / false=devTT5。
+                 STOPPED_PAD_RELAX で車ごとに振る。結論が出るまで既定は従来。 -->
+            <param name="stopped_pad_relax" value="$(env STOPPED_PAD_RELAX true)"/>
+            <!-- 【2026-09-17・A/B 中】追突防止の「近距離の円」[m]。帯の外でもこの距離以内・接近中なら進路上とみなす。
+                 横にいる停止車でも捕まり、横をじりじり進む原因。8/29 に棄却して 0 にしたが、9/4 の 763badb で
+                 既定 4.5 に戻っていた(submit_11 は 0)。REAR_END_NEAR で車ごとに振る。小数点必須。 -->
+            <param name="rear_end_near" value="$(env REAR_END_NEAR 4.5)"/>
             <!-- 【2026-08-31】1.9 -> 1.75。pass_gap は「狙う間隔」だが side_fits_ の
                  判定では余地に収まることを要求するため、実質の必要幅になっていた。
                  実測(sepfix01)では 余地に 1.7〜1.8m あるのに 1.9 が入らず却下。

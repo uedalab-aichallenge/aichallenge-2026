@@ -27,6 +27,7 @@ V2XOvertaker::V2XOvertaker()
   contact_log_hold_(declare_parameter<double>("contact_log_hold", 6.0)),
   avoid_range_(declare_parameter<double>("avoid_range", 8.0)),
   collision_radius_(declare_parameter<double>("collision_radius", 1.7)),
+  avoid_min_lon_(declare_parameter<double>("avoid_min_lon", 2.1)),
   ttc_threshold_(declare_parameter<double>("ttc_threshold", 1.0)),
   big_gap_closing_(declare_parameter<double>("big_gap_closing", 5.0)),
   inside_time_gain_(declare_parameter<double>("inside_time_gain", 1.4)),
@@ -1048,25 +1049,20 @@ V2XOvertaker::V2XOvertaker()
       }
     });
   // レース開始の検知。AWSIM は latch(transient_local) で流すので合わせる。
+  // 停止車の余裕を外して測り直すか(devTT5 から取り込み。A/B 用に既定は従来の true)。
+  stopped_pad_relax_ = declare_parameter<bool>("stopped_pad_relax", true);
+  // 【2026-09-17】AWSIM は state を transient_local で1レース数回しか送らない。
+  // volatile だけで購読すると、送出より後に起動したノードは開始を受け取れない。
+  // 安全ゲート(volatile と見られる)にも対応するため、両方の QoS で購読する。
+  // 同じ通知が2回届くことがあるので onRaceState は冪等にしてある。
   sub_state_ = create_subscription<std_msgs::msg::String>(
     "/awsim/state",
+    rclcpp::QoS(10),
+    [this](const std_msgs::msg::String::SharedPtr m) { onRaceState(m->data); });
+  sub_state_latched_ = create_subscription<std_msgs::msg::String>(
+    "/awsim/state",
     rclcpp::QoS(1).transient_local().reliable(),
-    [this](const std_msgs::msg::String::SharedPtr m) {
-      if (!race_started_ && m->data == "Start") {
-        race_started_ = true;
-        race_start_time_ = this->now().seconds();
-        launch_since_ = race_start_time_;
-        launch_motion_since_ = -1.0;
-        launch_wait_log_at_ = -1.0;
-        // 初期位置投入(teleport)の差分速度を物理発進と誤認しない。Start前に
-        // 推定器へ残った速度だけを消し、位置と時刻は次標本の差分用に保つ。
-        for (auto & kv : others_) {
-          kv.second.vx = 0.0;
-          kv.second.vy = 0.0;
-        }
-        RCLCPP_INFO(get_logger(), "レース開始を検知。回避と追い越しを有効化する");
-      }
-    });
+    [this](const std_msgs::msg::String::SharedPtr m) { onRaceState(m->data); });
   sub_traj_ = create_subscription<Trajectory>(
     "input/trajectory", qos, [this](const Trajectory::SharedPtr m) { traj_ = m; });
   sub_odom_ = create_subscription<Odometry>(
@@ -1130,6 +1126,40 @@ bool V2XOvertaker::loadCorridor(const std::string & path)
   RCLCPP_INFO(get_logger(), "corridor 読み込み %zu 点", corridor_.lo.size());
   buildRadiusMin();
   return !corridor_.lo.empty();
+}
+
+void V2XOvertaker::onRaceState(const std::string & state)
+{
+  const auto reset_launch = [this]() {
+    race_start_time_ = this->now().seconds();
+    launch_since_ = race_start_time_;
+    launch_motion_since_ = -1.0;
+    launch_wait_log_at_ = -1.0;
+    // 初期位置投入(teleport)の差分速度を物理発進と誤認しない。Start前に
+    // 推定器へ残った速度だけを消し、位置と時刻は次標本の差分用に保つ。
+    for (auto & kv : others_) {
+      kv.second.vx = 0.0;
+      kv.second.vy = 0.0;
+    }
+  };
+  // 安全ゲートは Start を出さず Grounded で走り出す(公式 autostart_orchestrator も Grounded で開始)。
+  if (!race_started_ && (state == "Start" || state == "Grounded")) {
+    race_started_ = true;
+    race_start_by_grounded_ = (state == "Grounded");
+    reset_launch();
+    RCLCPP_INFO(get_logger(), "レース開始を検知(%s)。回避と追い越しを有効化する", state.c_str());
+    return;
+  }
+  // AWSIM では Grounded の約30秒後に Start が来る。合図からの時間窓
+  // (launch_p1_pass_sec など)を Grounded から数えると発進前に切れるので、
+  // Start が来たら基準を Start に付け替える。まだ動いていないときだけ。
+  if (race_started_ && race_start_by_grounded_ && state == "Start") {
+    race_start_by_grounded_ = false;
+    if (launch_motion_since_ < 0.0) {
+      reset_launch();
+      RCLCPP_INFO(get_logger(), "Start を検知。合図の時刻を Grounded から Start に付け替える");
+    }
+  }
 }
 
 void V2XOvertaker::onV2X(const V2XVehiclePositionArray::SharedPtr msg)
@@ -7123,7 +7153,8 @@ void V2XOvertaker::avoidStoppedCars(const Frame & f, PlanCtx & c)
       double best_w = -1.0, best_a = 0.0, best_b = 0.0;
       int group = 0;          // 2段探索の外で持つ(下のログが使う)
       bool occ_pad = true;
-      for (int occ_pass = 0; occ_pass < 2; ++occ_pass) {
+      // stopped_pad_relax=false なら停止車の余裕は外さない。帯が無ければ手前で止まる。
+      for (int occ_pass = 0; occ_pass < (stopped_pad_relax_ ? 2 : 1); ++occ_pass) {
       occ_pad = (occ_pass == 0);
       best_w = -1.0; best_a = 0.0; best_b = 0.0;
       std::vector<std::pair<double, double>> blocked;
@@ -7408,6 +7439,11 @@ void V2XOvertaker::avoidCollision(const Frame & f, PlanCtx & c)
         const double fl = std::hypot(fx, fy);
         if (fl > 1e-9) { fx /= fl; fy /= fl; }
         if (dx * fx + dy * fy < -kRearIgnore) { continue; }
+        // 縦に重なっている(真横に並んでいる)車は正面衝突の相手ではない。
+        // 距離が collision_radius より近いと TTC が負になり、同じ向きに並走している
+        // だけの車を「止まれない正面衝突」とみなして壁側へ押していた(4台レースの
+        // スタートで P3 が壁に接触)。真横の相手は並走の層(追突防止・車体ガード)が扱う。
+        if (dx * fx + dy * fy < avoid_min_lon_) { continue; }
       }
       const size_t oi2 = nearest(in, o.x, o.y);
       double nx2, ny2;

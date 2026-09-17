@@ -4,6 +4,7 @@
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <chrono>
 #include <fstream>
 #include <deque>
 #include <rclcpp/rclcpp.hpp>
@@ -315,7 +316,12 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr force_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr crash_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr race_state_sub_;
+  // /awsim/state を transient_local でも購読する(AWSIM の latched 送出を後から起動しても受け取る)
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr race_state_sub_latched_;
   bool force_recovery_{false};
+  double launch_no_recovery_sec_{8.0};                 // 発進(最初の実移動)からこの秒数は復帰を始めない
+  std::optional<rclcpp::Time> launch_moving_since_;    // 最初の実移動を観測した時刻
+  rclcpp::Time last_launch_hold_log_{0, 0, RCL_ROS_TIME};
   bool race_started_{false};
 
   // 復帰経路の計算に使う情報
@@ -465,6 +471,42 @@ private:
   rclcpp::Time trace_ref_t_{0, 0, RCL_ROS_TIME};
   double trace_ref_x_{0.0}, trace_ref_y_{0.0}, trace_moved_1s_{0.0};
   unsigned long trace_cb_seq_{0};
+  // --- 処理時間の計測(2026-09-17) ---
+  // 全コールバックは1本のスレッドで直列に動くので、1つが重いと指令が止まり、
+  // 直前の指令が出続ける(4台走行で 4.6秒止まり壁へ入った)。トレースは止まった
+  // 処理の中で書くため、止まった区間を記録できない。そこで各周期の所要時間と
+  // 内訳を steady_clock で測り、遅かった周期だけ後からログへ出す。挙動は変えない。
+  struct ProfEntry { const char * name; double ms; };
+  class ProfScope
+  {
+  public:
+    ProfScope(std::vector<ProfEntry> & v, const char * name)
+    : v_(v), name_(name), t0_(std::chrono::steady_clock::now()) {}
+    ~ProfScope()
+    {
+      v_.push_back({name_, std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t0_).count()});
+    }
+    ProfScope(const ProfScope &) = delete;
+    ProfScope & operator=(const ProfScope &) = delete;
+  private:
+    std::vector<ProfEntry> & v_;
+    const char * name_;
+    std::chrono::steady_clock::time_point t0_;
+  };
+  void profCycleBegin(std::chrono::steady_clock::time_point t0);
+  void profCycleEnd(std::chrono::steady_clock::time_point t0);
+  void profOtherCallback(const char * name, std::chrono::steady_clock::time_point t0);
+  std::vector<ProfEntry> prof_;
+  double slow_cycle_warn_ms_{50.0};     // 指令周期の所要がこれ以上なら内訳を出す
+  double cycle_gap_warn_ms_{200.0};     // 指令周期の間隔がこれ以上空いたら出す
+  bool prof_have_prev_{false};
+  std::chrono::steady_clock::time_point prof_prev_begin_{};
+  double prof_prev_cycle_ms_{0.0};
+  // 前回の指令周期から今回までに走った他のコールバックのうち、最も重かったもの
+  const char * prof_other_name_{"-"};
+  double prof_other_ms_{0.0};
+  double prof_last_gap_log_s_{-1e9};
   std::optional<rclcpp::Time> reverse_deadlock_since_;
   bool reverse_deadlock_active_{false};
   int reverse_deadlock_count_{0};

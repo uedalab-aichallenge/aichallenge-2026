@@ -167,10 +167,12 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   traj_sub_ = create_subscription<Trajectory>(
     "input/trajectory", traj_qos,
     [this](const Trajectory::ConstSharedPtr msg) {
+      const auto cb_t0 = std::chrono::steady_clock::now();
       latest_traj_ = msg;
       // 復帰中は認証済み経路を維持し、無動作時の方向変更はrunPhaseで行う。
       traj_following_ = publishRecoveryTrajectory();
       if (!traj_following_) { traj_pub_->publish(*msg); }
+      profOtherCallback("経路の受信(publishRecoveryTrajectory)", cb_t0);
     });
 
   gear_report_sub_ = create_subscription<GearReport>(
@@ -207,10 +209,13 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
     });
 
   // Start前のグリッド待機はスタックではない。状態はlatched配信なので、ノードが。
-  race_state_sub_ = create_subscription<std_msgs::msg::String>(
-    "/awsim/state", rclcpp::QoS(1).transient_local().reliable(),
-    [this](const std_msgs::msg::String::ConstSharedPtr msg) {
-      if (!race_started_ && msg->data == "Start") {
+  launch_no_recovery_sec_ = declare_parameter<double>("launch_no_recovery_sec", 8.0);
+  // 【2026-09-17】AWSIM は state を transient_local で1レース数回しか送らない。volatile だけだと
+  // 送出より後に起動したノードが開始を受け取れない。安全ゲート(volatile と見られる)にも
+  // 対応するため両方の QoS で購読する。処理は !race_started_ で冪等。
+  const auto on_race_state = [this](const std_msgs::msg::String::ConstSharedPtr msg) {
+      // 安全ゲートは Start を出さず Grounded で走り出す。実移動を観測するまで判定しないので待機中は安全。
+      if (!race_started_ && (msg->data == "Start" || msg->data == "Grounded")) {
         race_started_ = true;
         moving_observed_ = false;
         stuck_start_time_.reset();
@@ -218,9 +223,13 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
         healthy_wait_since_.reset();
         pre_steer_valid_ = false;
         RCLCPP_INFO(get_logger(),
-          "レース開始を検知。実移動を観測するまで復帰判定は開始しない");
+          "レース開始を検知(%s)。実移動を観測するまで復帰判定は開始しない", msg->data.c_str());
       }
-    });
+    };
+  race_state_sub_ = create_subscription<std_msgs::msg::String>(
+    "/awsim/state", rclcpp::QoS(10), on_race_state);
+  race_state_sub_latched_ = create_subscription<std_msgs::msg::String>(
+    "/awsim/state", rclcpp::QoS(1).transient_local().reliable(), on_race_state);
 
   nominal_sub_ = create_subscription<AckermannControlCommand>(
     "/control/command/nominal_control_cmd", 1,
@@ -246,6 +255,9 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   // 処理内容を示す。
   rev_gear_fix_ = declare_parameter<bool>("rev_gear_fix", false);
   rev_cmd_hold_sec_ = declare_parameter<double>("rev_cmd_hold_sec", 0.5);
+  // 処理時間の計測(ログを出すだけで挙動は変えない)。
+  slow_cycle_warn_ms_ = declare_parameter<double>("slow_cycle_warn_ms", 50.0);
+  cycle_gap_warn_ms_ = declare_parameter<double>("cycle_gap_warn_ms", 200.0);
   wall_forward_ban_ = declare_parameter<bool>("wall_forward_ban", false);
   wall_forward_ban_hold_ = declare_parameter<double>("wall_forward_ban_hold", 0.8);
   wall_forward_ban_gain_ = declare_parameter<double>("wall_forward_ban_gain", 0.03);
@@ -384,7 +396,11 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
     publishGrid();
     // 起動時の1回だけでは、後から起動した rviz が Volatile で購読していると。
     grid_timer_ = create_wall_timer(std::chrono::milliseconds(2000),
-                                    [this]() { publishGrid(); });
+                                    [this]() {
+                                      const auto cb_t0 = std::chrono::steady_clock::now();
+                                      publishGrid();
+                                      profOtherCallback("占有格子の送出(publishGrid)", cb_t0);
+                                    });
   } else if (!grid.empty()) {
     RCLCPP_WARN(get_logger(),
                 "復帰用の占有格子を読めない: %s (コリドアで代用する)", grid.c_str());
@@ -984,6 +1000,7 @@ std::string StuckRecoveryController::traceLine(const rclcpp::Time & now)
 
 void StuckRecoveryController::traceSample(const rclcpp::Time & now)
 {
+  ProfScope prof_scope(prof_, "traceSample");
   traceInit();
   // 「1秒で何m進んだか」= 停滞判定の入力そのもの。判断の材料は必ず残す。
   recovery::Pose p;
@@ -1113,6 +1130,7 @@ void StuckRecoveryController::detectUnexpectedReverse(
 
 void StuckRecoveryController::traceDump(const rclcpp::Time & now, const char * kind)
 {
+  ProfScope prof_scope(prof_, "traceDump");
   if (trace_dir_.empty() || ring_.empty()) { return; }
   char name[256];
   std::snprintf(name, sizeof(name), "%s/events/%.1f_%s.tsv",
@@ -1123,9 +1141,86 @@ void StuckRecoveryController::traceDump(const rclcpp::Time & now, const char * k
   for (const auto & l : ring_) { f << l << "\n"; }
 }
 
+void StuckRecoveryController::profCycleBegin(std::chrono::steady_clock::time_point t0)
+{
+  prof_.clear();
+  if (prof_have_prev_) {
+    const double gap_ms =
+      std::chrono::duration<double, std::milli>(t0 - prof_prev_begin_).count();
+    const double t0_s = std::chrono::duration<double>(t0.time_since_epoch()).count();
+    if (gap_ms >= cycle_gap_warn_ms_ && t0_s - prof_last_gap_log_s_ >= 1.0) {
+      prof_last_gap_log_s_ = t0_s;
+      // 間隔が空いた理由の切り分け:
+      //   直前の周期の所要が大きい      -> この周期自身が重かった(内訳は直前の「処理が遅い」)
+      //   他のコールバックの所要が大きい -> 同じスレッドの別処理が塞いだ
+      //   どちらも小さい                -> 入力(pure_pursuit)が来なかった、または CPU を取れなかった
+      RCLCPP_WARN(get_logger(),
+        "処理時間 指令周期の間隔が空いた %.0fms 直前の周期の所要%.0fms "
+        "間に走った他のコールバックで最大=%s %.0fms",
+        gap_ms, prof_prev_cycle_ms_, prof_other_name_, prof_other_ms_);
+    }
+  }
+  prof_have_prev_ = true;
+  prof_prev_begin_ = t0;
+  prof_other_name_ = "-";
+  prof_other_ms_ = 0.0;
+}
+
+void StuckRecoveryController::profCycleEnd(std::chrono::steady_clock::time_point t0)
+{
+  const double total_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+  prof_prev_cycle_ms_ = total_ms;
+  if (total_ms < slow_cycle_warn_ms_) { return; }
+  // 同じ名前を合算する。時間は入れ子を含む(makePlan は beginRecovery の内側に含まれる)。
+  struct Agg { const char * name; double sum; double max; int n; };
+  std::vector<Agg> agg;
+  for (const auto & e : prof_) {
+    auto it = std::find_if(agg.begin(), agg.end(), [&](const Agg & a) {
+      return std::string(a.name) == e.name;
+    });
+    if (it == agg.end()) { agg.push_back({e.name, e.ms, e.ms, 1}); }
+    else { it->sum += e.ms; it->max = std::max(it->max, e.ms); ++it->n; }
+  }
+  std::sort(agg.begin(), agg.end(), [](const Agg & a, const Agg & b) { return a.sum > b.sum; });
+  std::string desc;
+  for (std::size_t i = 0; i < agg.size() && i < 10; ++i) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), " %s=%.0fms(x%d 最大%.0fms)",
+                  agg[i].name, agg[i].sum, agg[i].n, agg[i].max);
+    desc += buf;
+  }
+  RCLCPP_WARN(get_logger(),
+    "処理時間 処理が遅い 指令周期の所要%.0fms 出=%s 内訳(入れ子を含む):%s",
+    total_ms, cmd_src_ ? cmd_src_ : "-", desc.empty() ? " なし" : desc.c_str());
+}
+
+void StuckRecoveryController::profOtherCallback(
+  const char * name, std::chrono::steady_clock::time_point t0)
+{
+  const double ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0).count();
+  if (ms > prof_other_ms_) {
+    prof_other_ms_ = ms;
+    prof_other_name_ = name;
+  }
+  if (ms >= slow_cycle_warn_ms_) {
+    RCLCPP_WARN(get_logger(), "処理時間 処理が遅い コールバック=%s 所要%.0fms", name, ms);
+  }
+}
+
 void StuckRecoveryController::onNominalCommand(
   const AckermannControlCommand::ConstSharedPtr msg)
 {
+  // 周期の所要時間を測る。途中の return すべてで終わりを記録するため RAII にする。
+  const auto cycle_t0 = std::chrono::steady_clock::now();
+  profCycleBegin(cycle_t0);
+  struct CycleGuard
+  {
+    StuckRecoveryController & self;
+    std::chrono::steady_clock::time_point t0;
+    ~CycleGuard() { self.profCycleEnd(t0); }
+  } cycle_guard{*this, cycle_t0};
   const auto now = this->now();
   // 動作確認用。指示を受けたら数秒だけ全舵で壁へ向かって走る。
   if (crash_me_) {
@@ -1158,7 +1253,10 @@ void StuckRecoveryController::onNominalCommand(
       wall_ban_acted_ = true;
       wall_ban_acted_seq_ = plan_seq_;
       wall_ban_acted_at_ = tnow;
-      if (!recovery_start_time_.has_value() && !in_cooldown) {
+      const bool in_launch_hold =
+        launch_moving_since_.has_value() &&
+        (now - launch_moving_since_.value()).seconds() < launch_no_recovery_sec_;
+      if (!recovery_start_time_.has_value() && !in_cooldown && !in_launch_hold) {
         RCLCPP_WARN(get_logger(),
           "壁前進禁止が前進を止めた。前進が塞がれているとみて復帰を始める");
         stuck_start_time_.reset();
@@ -1327,6 +1425,7 @@ bool StuckRecoveryController::hasNoProgress(const rclcpp::Time & now)
 void StuckRecoveryController::updateStuckDetection(
   const AckermannControlCommand & command, const rclcpp::Time & now)
 {
+  ProfScope prof_scope(prof_, "updateStuckDetection");
   const float velocity = latest_velocity_;
   logV2XSelfOffset();   // V2X の基準点を実測する(2秒に1回)
   // Ready中は指令値・近接車・経過時間にかかわらず復帰状態を作らない。
@@ -1341,6 +1440,10 @@ void StuckRecoveryController::updateStuckDetection(
   }
   // Require movement once to avoid detecting the initial stationary state as stuck.
   if (velocity >= kMovingSpeedThreshold) {
+    if (!moving_observed_) {
+      launch_moving_since_ = now;
+      RCLCPP_INFO(get_logger(), "発進を観測。%.1f 秒間は復帰を始めない", launch_no_recovery_sec_);
+    }
     moving_observed_ = true;
   }
   // 動けているなら手詰まりではない。計時を落とす。
@@ -1500,6 +1603,16 @@ void StuckRecoveryController::updateStuckDetection(
           (now - recovery_end_time_.value()).seconds() < kCooldownSec) {
         return;
       }
+      // 発進から launch_no_recovery_sec 秒は復帰を始めない(スタート直後の誤起動対策)。
+      if (launch_moving_since_.has_value() &&
+          (now - launch_moving_since_.value()).seconds() < launch_no_recovery_sec_) {
+        if ((now - last_launch_hold_log_).seconds() > 1.0) {
+          last_launch_hold_log_ = now;
+          RCLCPP_INFO(get_logger(), "発進から%.1fs: 復帰の開始を見送る(%.1fs まで)",
+            (now - launch_moving_since_.value()).seconds(), launch_no_recovery_sec_);
+        }
+        return;
+      }
       // **代入の前に**「既に復帰中だったか」を控える(順序が逆だと必ず真になる)
       const bool was_active_stall = recovery_start_time_.has_value();
       stuck_start_time_.reset();
@@ -1562,8 +1675,14 @@ bool StuckRecoveryController::currentPose(recovery::Pose & p) const
 // 現在姿勢から、走行可能領域を守って目標経路へ戻る操作を計算する。
 bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase)
 {
+  ProfScope prof_scope(prof_, "makePlan");
   last_plan_attempt_ = now;
   const auto cars = carObstacles();
+  // 探索器の呼び出しごとの時間を測る(呼び出し回数も内訳に出る)。
+  auto timed_plan = [this](auto &&... args) {
+    ProfScope s(prof_, "makePlan/recovery::plan");
+    return recovery::plan(std::forward<decltype(args)>(args)...);
+  };
   recovery::Pose p;
   if (!currentPose(p) || !corridor_.valid()) { return false; }
   escape_certificate_ = {};
@@ -1582,6 +1701,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   const double clear_at_plan = recovery::wallClearanceAt(obstacles_, veh_, p);
   const double car_clear_at_plan = recovery::carClearanceAt(cars, veh_, p);
   auto certify_candidate = [&](const char * source) {
+    ProfScope certify_scope(prof_, "makePlan/certify_candidate");
     std::vector<double> wall_clearances;
     std::vector<double> car_clearances;
     wall_clearances.reserve(plan_.path.size());
@@ -1682,8 +1802,10 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
     // 呼び出し側の「後退から引き直す」をこの探索にも効かせる。
     gp.first_phase = first_phase;   // 上で実効値に揃えてある
     std::size_t gi = 0;
-    const auto gplan = recovery::planToGoal(corridor_, obstacles_, veh_, p,
-                                            cars, gp, &gi);
+    const auto gplan = [&]() {
+      ProfScope goal_scope(prof_, "makePlan/planToGoal");
+      return recovery::planToGoal(corridor_, obstacles_, veh_, p, cars, gp, &gi);
+    }();
     if (gplan.valid) {
       plan_ = gplan;
     }
@@ -1706,12 +1828,12 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   }
   if (!used_goal) {
   // まず「中断されない経路」を狙って厳しい余裕つきで計画する。
-  plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+  plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                          first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
                          kPlanWallClear, kPlanCarClear);
   plan_strict = plan_.valid;
   if (!plan_.valid) {
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            first_phase, gain, kPlanMinEscape, min_rev, max_rev, cars,
                            0.0, 0.0);
     plan_strict = false;
@@ -1719,33 +1841,33 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   // この段が first_phase を明示的に 0 へ戻すので、。
   if (!plan_.valid && first_phase != 0) {
     // 縛ったせいで解が無いなら縛りを外す
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            0, gain, kPlanMinEscape, min_rev, max_rev, cars);
   }
   if (!plan_.valid && gain > 0.0) {
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            first_phase, 0.0, kPlanMinEscape, min_rev, max_rev, cars);
   }
   // 壁に挟まれていて 2.5m も動けないときだけ、脱出量の下限を緩める。
   if (!plan_.valid) {
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            0, 0.0, 1.0, min_rev, max_rev, cars);
   }
   if (!plan_.valid) {
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            0, 0.0, 0.0, min_rev, max_rev, cars);
   }
   // 前進が塞がっていると分かっているなら、前進だけの計画は受け取らない。
   if (plan_.valid && blocked_dir_ > 0 && !plan_.phases.empty() &&
       plan_.phases.front().forward)
   {
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            -1, 0.0, 0.0, 0.0, std::max(max_rev, 1.5), cars);
     plan_strict = false;
   }
   if (!plan_.valid) {
     // 最後のフォールバック。ここでも解が無いなら best_effort を立てて、。
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            eff_first, 0.0, 0.0, 0.0,
                            8.0, cars, 0.0, 0.0, true);
     plan_best_effort = plan_.valid;
@@ -1843,7 +1965,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
   // 却下で計画が消えたら、最後の受け皿(総当り)をやり直す ---。
   if (!plan_.valid) {
     // 食い込んでいるなら総当りにも「後退から始める」を要求する。
-    plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+    plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                            eff_first, 0.0, 0.0, 0.0,
                            8.0, cars, 0.0, 0.0, true);
     // 後退必須の要求をフォールバックで解除しない ---。
@@ -1851,7 +1973,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
       // ---。
       bool took_forward = false;
       if (embed_forward_escape_) {
-        auto fwd = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+        auto fwd = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                                   +1, 0.0, 0.0, 0.0,
                                   8.0, cars, 0.0, 0.0, true);
         if (fwd.valid && fwd.min_wall_clear > clear_at_plan + kEmbedImprove) {
@@ -1869,7 +1991,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
       }
     } else if (!plan_.valid && clear_at_plan < 0.0 && eff_first > 0) {
       // 後ろ当たり。前進で逃げる計画を、向きの縛りなしで探し直す。
-      plan_ = recovery::plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
+      plan_ = timed_plan(corridor_, obstacles_, veh_, p, 4.0, 16.0,
                              +1, 0.0, 0.0, 0.0,
                              8.0, cars, 0.0, 0.0, true);
       RCLCPP_WARN(get_logger(),
@@ -1959,6 +2081,7 @@ bool StuckRecoveryController::makePlan(const rclcpp::Time & now, int first_phase
 void StuckRecoveryController::beginRecovery(
   const rclcpp::Time & now, bool forward_blocked, bool was_active)
 {
+  ProfScope prof_scope(prof_, "beginRecovery");
   // 開始回数を数えるための専用ログ ---。
   traceDump(now, "recovery_begin");
   ++recovery_begin_seq_;
@@ -2528,6 +2651,7 @@ std::optional<bool> StuckRecoveryController::handleStall(
 // ===================================================================。
 bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
 {
+  ProfScope prof_scope(prof_, "runRecoverySimple");
   recovery::Pose p;
   if (!currentPose(p) || line_x_.size() < 3) { return false; }
   const auto cars = carObstacles();
@@ -2767,8 +2891,18 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
       return true;
     }
   }
+  // AWSIM は速度指令を使わず加速度だけを見る。一定の加速度を出し続けると速度が
+  // 上がり続ける(4台レースで復帰の前進が 5m/s に達し、舵を振ったまま壁へ衝突)。
+  // simple_speed に達したら踏むのをやめ、超えたら制動する。
+  double simple_a = simple_accel_;
+  const double v_abs_now = std::abs(latest_velocity_);
+  if (v_abs_now > simple_speed_ + 0.3) {
+    simple_a = kBrakeAccel;
+  } else if (v_abs_now >= simple_speed_) {
+    simple_a = 0.0;
+  }
   publishCommand(static_cast<float>(forward ? simple_speed_ : -simple_speed_),
-                 static_cast<float>(simple_accel_), st_cmd);
+                 static_cast<float>(simple_a), st_cmd);
   if ((now - last_simple_log_).seconds() > 0.5) {
     last_simple_log_ = now;
     RCLCPP_INFO(get_logger(),
@@ -2784,6 +2918,7 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
 
 bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 {
+  ProfScope prof_scope(prof_, "runRecovery");
   if (!recovery_start_time_.has_value()) { return false; }
   const double total = (now - recovery_start_time_.value()).seconds();
   if (recovery_simple_) {
@@ -3295,6 +3430,9 @@ bool StuckRecoveryController::publishRecoveryTrajectory()
       pt.longitudinal_velocity_mps =
           static_cast<float>(recovery_speed_ * w + vt * (1.0 - w));
     }
+    // 復帰中の経路は全区間を recovery_speed 以下にする(先頭の合流区間だけでなく)。
+    pt.longitudinal_velocity_mps =
+        std::min(pt.longitudinal_velocity_mps, static_cast<float>(recovery_speed_));
     out.points.push_back(pt);
   }
   publishRecoveryPathMarker(from);
@@ -3413,6 +3551,7 @@ void StuckRecoveryController::finishRecovery(const rclcpp::Time & now,
 // 壁への食い込みの観測。**前進指令の有無に関わらず毎周期更新する。**。
 void StuckRecoveryController::updateWallBanState()
 {
+  ProfScope prof_scope(prof_, "updateWallBanState");
   recovery::Pose p;
   if (!currentPose(p) || !obstacles_.valid()) { return; }
   const double clear = recovery::wallClearanceAt(obstacles_, veh_, p);
@@ -3694,6 +3833,7 @@ void StuckRecoveryController::applyReachableWallGuard(
 
 void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
 {
+  ProfScope prof_scope(prof_, "publishFiltered");
   float speed = cmd.longitudinal.speed;
   float accel = cmd.longitudinal.acceleration;
   wall_ban_steer_valid_ = false;

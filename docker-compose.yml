@@ -72,6 +72,9 @@ x-autoware-base: &autoware-base
     - STOPPED_KEEP_PASS_EXCLUDE=${STOPPED_KEEP_PASS_EXCLUDE:-false}
     - GATE_RUNUP_SIDESTEP=${GATE_RUNUP_SIDESTEP:-true}
     - SIZE_PAD=${SIZE_PAD:-0.12}
+    - STOPPED_PAD_RELAX=${STOPPED_PAD_RELAX:-true}
+    - REAR_END_NEAR=${REAR_END_NEAR:-4.5}
+    - LAUNCH_NO_RECOVERY_SEC=${LAUNCH_NO_RECOVERY_SEC:-8.0}
     # 公式オーバーテイクレーン(SIM決勝)。既定は無効。A/B で確かめてから入れる。
     - WALL_FWD_BAN=${WALL_FWD_BAN:-true}
     - WALL_FWD_BAN_HOLD=${WALL_FWD_BAN_HOLD:-0.8}

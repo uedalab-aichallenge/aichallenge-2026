@@ -50,6 +50,8 @@
     <param name="embed_min_reverse" value="$(env EMBED_MIN_REV 0.20)"/>
     <!-- 候補(到達可否のキネマティック判定)は有効。 -->
     <param name="simple_stall_sec" value="$(env SIMPLE_STALL_SEC 3.0)"/>
+    <!-- 【2026-09-17 devTT5 から取り込み】発進(最初の実移動)から8秒は復帰を始めない。 -->
+    <param name="launch_no_recovery_sec" value="$(env LAUNCH_NO_RECOVERY_SEC 8.0)"/>
     <param name="simple_stall_min_m" value="$(env SIMPLE_STALL_MIN_M 0.15)"/>
     <!-- いまの向きの候補がこの秒数続けて見つからないときだけ向きを変える(切り返しの発振防止)。 -->
     <param name="simple_lost_confirm_sec" value="$(env SIMPLE_LOST_CONFIRM_SEC 0.5)"/>

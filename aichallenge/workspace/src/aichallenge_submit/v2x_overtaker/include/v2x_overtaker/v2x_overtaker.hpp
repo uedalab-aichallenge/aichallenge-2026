@@ -674,6 +674,7 @@ private:
   const double contact_log_hold_;  // これ以内に他車がいれば車両接触とみなす[m]
   const double avoid_range_;       // 衝突回避で見る範囲[m]
   const double collision_radius_;  // 衝突とみなす半径[m](車体2台分)
+  const double avoid_min_lon_;   // これより前に出ていない相手は衝突回避の対象外[m]
   const double ttc_threshold_;     // この時間[s]以内に衝突しそうなら回避する
   const double big_gap_closing_;   // 速度差[km/h]がこれ以上なら距離制限を外す
   const double inside_time_gain_;  // イン側から抜くときの所要時間の許容倍率
@@ -1142,6 +1143,8 @@ private:
   const double launch_stopped_grace_; // 実移動開始後、停止車分類を待つ時間[s]
   const double look_width_ahead_;
   const double v2x_timeout_;
+  // true で「余裕込みで帯が無ければ余裕を外して測り直す」(従来の devTT4)。false は devTT5。
+  bool stopped_pad_relax_{true};
   bool race_started_{false};       // /awsim/state が Start になったか
   const double safe_gap_;
   const double safe_gap_min_;      // 車間の下限[m]
@@ -1931,6 +1934,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr overtaking_pub_;
   rclcpp::Subscription<Float32MultiArray>::SharedPtr sub_status_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_state_;
+  // /awsim/state は AWSIM が transient_local、安全ゲートが volatile で送る(と見られる)。
+  // 片方の QoS では他方と非互換になるので、両方で購読する。
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_state_latched_;
+  void onRaceState(const std::string & state);
+  bool race_start_by_grounded_{false};  // Grounded で開始扱いにし、まだ Start を見ていない
   rclcpp::Time last_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_reject_log_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_latch_log_{0, 0, RCL_ROS_TIME};   // latch で継続した周期の記録用
