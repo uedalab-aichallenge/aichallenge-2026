@@ -409,6 +409,12 @@ private:
   double simple_press_since_{-1.0};
   double press_flip_sec_{1.0};     // この秒数動かなければ切り替える
   double press_wall_m_{0.2};       // 進もうとしている側の壁までの距離がこれ未満なら「押し付き」
+  // 【2026-09-18 調査用】指令する実舵角の上限[rad]。0 以下なら kMaxSteerRad(0.31=17.8度)。
+  // 「車は本当に18度までしか切れないのか」を測るためだけの設定。既定は従来どおり。
+  double steer_clamp_test_{0.0};
+  double steerCmdMax() const {
+    return (steer_clamp_test_ > 0.0) ? steer_clamp_test_ : 0.31;
+  }
   double last_no_move_log_{-1e9};
   float pre_ban_speed_{0.0f};        // 壁前進禁止・壁ガードに入る前の指令
   float pre_ban_accel_{0.0f};

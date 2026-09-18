@@ -345,6 +345,11 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   simple_stall_sec_ = declare_parameter<double>("simple_stall_sec", 3.0);
   press_flip_sec_ = declare_parameter<double>("press_flip_sec", 1.0);
   press_wall_m_ = declare_parameter<double>("press_wall_m", 0.2);
+  steer_clamp_test_ = declare_parameter<double>("steer_clamp_test", 0.0);
+  if (steer_clamp_test_ > 0.0) {
+    RCLCPP_WARN(get_logger(), "【調査用】指令舵の上限を %.2frad(%.0fdeg)に上げている",
+                steer_clamp_test_, steer_clamp_test_ * 180.0 / M_PI);
+  }
   simple_stall_min_m_ = declare_parameter<double>("simple_stall_min_m", 0.15);
   simple_lost_confirm_sec_ =
     declare_parameter<double>("simple_lost_confirm_sec", 0.5);
@@ -3974,7 +3979,7 @@ void StuckRecoveryController::publishFiltered(AckermannControlCommand cmd)
   // ---。
   if (steer_clamp_all_ && std::isfinite(steer_cmd_scale_) && steer_cmd_scale_ > 1e-6) {
     const double phys = static_cast<double>(cmd.lateral.steering_tire_angle) / steer_cmd_scale_;
-    const double lim = std::clamp(phys, -kMaxSteerRad, kMaxSteerRad);
+    const double lim = std::clamp(phys, -steerCmdMax(), steerCmdMax());
     if (std::abs(lim - phys) > 1e-6) {
       cmd.lateral.steering_tire_angle = static_cast<float>(lim * steer_cmd_scale_);
       if ((this->now() - last_steer_clamp_log_).seconds() > 1.0) {
@@ -4158,7 +4163,7 @@ void StuckRecoveryController::publishCommand(float speed, float acceleration, fl
 {
   const auto stamp = this->now();
   // --- 出力段で必ず範囲に収める(唯一の publish 地点なので、ここだけで全経路を守れる) ---。
-  constexpr float kOutMaxSteer = static_cast<float>(kMaxSteerRad);
+  const float kOutMaxSteer = static_cast<float>(steerCmdMax());
   constexpr float kOutMaxAccel = 2.0f;
   constexpr float kOutMaxSpeed = 10.0f;
   if (!std::isfinite(steer)) { steer = 0.0f; }

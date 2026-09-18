@@ -24,6 +24,8 @@
 #include "v2x_overtaker/rear_end_inpath.hpp"
 #include "v2x_overtaker/rear_end_release.hpp"
 #include "v2x_overtaker/overtake_start.hpp"
+#include "v2x_overtaker/steer_feasible.hpp"
+#include "v2x_overtaker/steer_feasible.hpp"
 #include "v2x_overtaker/stopped_pass_reachability.hpp"
 #include "v2x_overtaker/stop_nopass_latch.hpp"
 #include "v2x_overtaker/trajectory_speed_cap.hpp"
@@ -904,6 +906,13 @@ private:
   // 【2026-09-18】「この区間では抜き切れない」と判断したら追い越しをやめる(ユーザー指示)。
   // レーンの出口(idx21)直後 idx22〜33 に衝突25件中21件が集中していた。抜き切れないまま
   // レーンが終わり、相手の横のまま合流して当てている。
+  // 【2026-09-18 ユーザー指示】舵で回避しきれないなら減速する。
+  bool steer_feasible_enable_{true};
+  double steer_feasible_ay_use_{0.6};   // 横加速度の上限のうち使う割合
+  // 実測の幾何(公式 vehicle_info の 35度ではなく、飽和する 18度を使う)
+  double steer_feasible_wb_{1.087};
+  double steer_feasible_max_steer_{0.31};
+  std::size_t steer_feasible_n_{0};
   bool pass_finish_abort_{true};        // 抜き切れないと分かったら試行を中止する
   bool pass_finish_no_start_{true};     // 抜き切れないなら始めない(遅い相手でも見る)
   double pass_finish_hold_{0.3};        // その判断がこの秒数続いたら中止する

@@ -558,8 +558,8 @@ Visualization Manager:
         labels: true
         lat_bounds: true
         lat_target: true
-        rear_end_near: true
-        rear_end_zone: true
+        rear_end_near_circle(進路外でも見る円): true
+        rear_end_inpath(追突防止の進路帯): true
         stop_avoid_gap: true
         stopped_body: true
       Topic:

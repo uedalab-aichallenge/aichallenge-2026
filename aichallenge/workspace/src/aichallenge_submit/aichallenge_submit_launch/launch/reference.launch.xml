@@ -634,6 +634,8 @@
                  既定 4.5 に戻っていた(submit_11 は 0)。REAR_END_NEAR で車ごとに振る。小数点必須。 -->
             <param name="rear_end_near" value="$(env REAR_END_NEAR 4.5)"/>
             <!-- 【2026-09-18・A/B 中】区間内に抜き切れないと判断したら追い越しをやめる/始めない -->
+            <!-- 【2026-09-18・A/B 中】相手の大きさ(中心間)。実寸は 0.725×2=1.45m。既定は +10cm。 -->
+            <param name="band_car_w" value="$(env BAND_CAR_W 1.55)"/>
             <param name="pass_finish_abort" value="$(env PASS_FINISH_ABORT true)"/>
             <param name="pass_finish_no_start" value="$(env PASS_FINISH_NO_START true)"/>
             <!-- 【2026-08-31】1.9 -> 1.75。pass_gap は「狙う間隔」だが side_fits_ の

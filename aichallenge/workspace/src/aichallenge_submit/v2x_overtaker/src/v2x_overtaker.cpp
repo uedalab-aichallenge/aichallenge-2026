@@ -331,7 +331,9 @@ V2XOvertaker::V2XOvertaker()
   band_predict_(declare_parameter<bool>("band_predict", true)),
   band_horizon_(declare_parameter<double>("band_horizon", 80.0)),
   band_long_(declare_parameter<double>("band_long", 2.6)),
-  band_car_w_(declare_parameter<double>("band_car_w", 1.30)),
+  // 【2026-09-18 ユーザー指示】実寸+10cm にする。車体半幅 0.725 × 2 = 1.45m が中心間の物理下限で、
+  // 1.30 では車体が 0.15m 重なる位置まで走行可能域を作っていた。
+  band_car_w_(declare_parameter<double>("band_car_w", 1.55)),
   band_slope_(declare_parameter<double>("band_slope", 0.20)),
   band_smooth_(declare_parameter<double>("band_smooth", 0.30)),
   band_side_hyst_(declare_parameter<double>("band_side_hyst", 0.60)),
@@ -1056,6 +1058,10 @@ V2XOvertaker::V2XOvertaker()
   // 停止車の余裕を外して測り直すか(devTT5 から取り込み。A/B 用に既定は従来の true)。
   stopped_pad_relax_ = declare_parameter<bool>("stopped_pad_relax", true);
   // 抜き切れないと分かったら追い越しをやめる/始めない(2026-09-18)
+  steer_feasible_enable_ = declare_parameter<bool>("steer_feasible_enable", true);
+  steer_feasible_ay_use_ = declare_parameter<double>("steer_feasible_ay_use", 0.6);
+  steer_feasible_wb_ = declare_parameter<double>("steer_feasible_wheel_base", 1.087);
+  steer_feasible_max_steer_ = declare_parameter<double>("steer_feasible_max_steer", 0.31);
   pass_finish_abort_ = declare_parameter<bool>("pass_finish_abort", true);
   pass_finish_no_start_ = declare_parameter<bool>("pass_finish_no_start", true);
   pass_finish_hold_ = declare_parameter<double>("pass_finish_hold", 0.3);
@@ -6917,6 +6923,41 @@ void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
               rrel.t_meet, rrel.sep_pred, best_gap, rin.closing * 3.6);
     }
   }
+  // 【2026-09-18】「横へ避けるから減速しない」を、舵の限界で裏取りする。
+  // 必要な横ずれを、今の車間で、舵18度の範囲で作れないなら解除しない(作れる速度まで落とす)。
+  double steer_cap = -1.0;
+  if (steer_feasible_enable_ && !best_name.empty() && best_gap > 0.0) {
+    const double need_sep =
+      v2x_overtaker::physicalPassSeparation(pass_beside_sep_, rear_end_free_min_);
+    v2x_overtaker::SteerFeasibleInput sin2;
+    sin2.lateral_need_m = std::max(need_sep - std::abs(best_sep), 0.0);
+    sin2.distance_m = std::max(best_gap - (geom_front_ + geom_rear_), 0.0);
+    sin2.wheel_base_m = steer_feasible_wb_;
+    sin2.max_steer_rad = steer_feasible_max_steer_;
+    sin2.ay_max = side_plan_ay_max_;
+    sin2.ay_use = steer_feasible_ay_use_;
+    const auto sf = v2x_overtaker::steerFeasible(sin2);
+    if (sf.need_move) {
+      if (!sf.possible) {
+        // 舵を全部使っても、この車間ではその横ずれを作れない。相手の速度まで落とす。
+        steer_cap = std::max(best_speed, 0.0);
+      } else if (sf.v_max_mps >= 0.0 && sf.v_max_mps < my_speed_for_gap_) {
+        steer_cap = sf.v_max_mps;
+      }
+      if (steer_cap >= 0.0) {
+        ++steer_feasible_n_;
+        if ((f.now - last_release_log_).seconds() > 2.0) {
+          last_release_log_ = f.now;
+          diagLog("舵で間に合わない",
+            "舵で間に合わない 累計%zu 相手=%s 車間%.1fm 要る横ずれ%.2fm "
+            "要る旋回半径%.1fm(舵の限界%.1fm) 上限%.1fkm/h 自車%.1fkm/h",
+            steer_feasible_n_, best_name.c_str(), best_gap, sin2.lateral_need_m,
+            sf.radius_need_m, sf.radius_min_m, steer_cap * 3.6,
+            my_speed_for_gap_ * 3.6);
+        }
+      }
+    }
+  }
   if (passing_beside) {
     // 並走している対象に対しては上限を出さない。
     v_allow = -1.0;
@@ -6996,6 +7037,8 @@ void V2XOvertaker::preventRearEnd(const Frame & f, PlanCtx & c)
   rear_dbg_.sep = best_sep;
   rear_dbg_.cap = v_allow;
   if (v_allow >= 0.0) { c.requestCap(v_allow, "追突防止"); }
+  // 舵で間に合わないぶんは、解除されていても効かせる(この層だけ別に出す)。
+  if (steer_cap >= 0.0) { c.requestCap(steer_cap, "舵で間に合わない"); }
   // --- 壁に押されて相手側へ寄せられているときは、縦に譲って後ろへ下がる ---。
   if (lat_relax_yield_ && lat_relaxed_prev_ && !best_name.empty() &&
       !passing_beside) {
@@ -10119,14 +10162,14 @@ void V2XOvertaker::publishMeasure(const Frame & f, PlanCtx & c)
   if (rear_dbg_.ran) {
     const double lo = std::min(rear_dbg_.my_now, rear_dbg_.my_want) - rear_dbg_.sep_th;
     const double hi = std::max(rear_dbg_.my_now, rear_dbg_.my_want) + rear_dbg_.sep_th;
-    auto ml = make("rear_end_zone", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
+    auto ml = make("rear_end_inpath(追突防止の進路帯)", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
     along(ml, 0.0, rear_end_range_, lo, 0.15);
     arr.markers.push_back(ml);
-    auto mh = make("rear_end_zone", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
+    auto mh = make("rear_end_inpath(追突防止の進路帯)", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.07);
     along(mh, 0.0, rear_end_range_, hi, 0.15);
     arr.markers.push_back(mh);
     if (rear_end_near_ > 0.0) {
-      auto mc = make("rear_end_near", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.05);
+      auto mc = make("rear_end_near_circle(進路外でも見る円)", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 0.55, 0.0, 0.05);
       for (int k = 0; k <= 36; ++k) {
         const double a = k * M_PI / 18.0;
         mc.points.push_back(pt(f.ex + rear_end_near_ * std::cos(a),
@@ -10158,7 +10201,9 @@ void V2XOvertaker::publishMeasure(const Frame & f, PlanCtx & c)
     auto mw = make("lat_target", visualization_msgs::msg::Marker::LINE_STRIP, 1.0, 1.0, 1.0, 0.05);
     along(mw, 0.0, window_full_, want, 0.25);
     arr.markers.push_back(mw);
-    const double lo = std::max(c.lat_lo, -6.0), hi = std::min(c.lat_hi, 6.0);
+    // 制限が実際に掛かっている側だけ描く(以前は無制限のとき ±6m の線を描いており、
+    // 壁の中に線が出て「走行可能域が壁に埋まっている」ように見えていた)。
+    const double lo = c.lat_lo, hi = c.lat_hi;
     if (c.lat_lo > -1e8) {
       auto m = make("lat_bounds", visualization_msgs::msg::Marker::LINE_STRIP, 0.8, 0.2, 1.0, 0.05);
       along(m, 0.0, window_full_, lo, 0.25);
