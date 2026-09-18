@@ -345,6 +345,10 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   simple_stall_sec_ = declare_parameter<double>("simple_stall_sec", 3.0);
   press_flip_sec_ = declare_parameter<double>("press_flip_sec", 1.0);
   press_wall_m_ = declare_parameter<double>("press_wall_m", 0.2);
+  escape_enable_ = declare_parameter<bool>("escape_enable", true);
+  escape_both_sec_ = declare_parameter<double>("escape_both_sec", 2.0);
+  escape_car_keep_ = declare_parameter<double>("escape_car_keep", 1.0);
+  escape_speed_ = declare_parameter<double>("escape_speed", 0.28);
   steer_clamp_test_ = declare_parameter<double>("steer_clamp_test", 0.0);
   if (steer_clamp_test_ > 0.0) {
     RCLCPP_WARN(get_logger(), "【調査用】指令舵の上限を %.2frad(%.0fdeg)に上げている",
@@ -2827,6 +2831,59 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
         "復帰(簡易) 壁へ%.2fm 食い込み -> 後退を優先する", start_wall);
       set_dir(false, "開始時に壁へ食い込み");
     }
+  }
+  // 【2026-09-18】前も後ろも候補が無いまま動けない状態の最終手段。
+  // 「当たらない経路が作れないなら何もしない」ため壁を押し続けていた。他車だけは必ず避け、
+  // 壁から離れる向きへ微速で出る。
+  if (escape_enable_ && !ok_f && !ok_b && std::abs(latest_velocity_) < 0.15) {
+    if (escape_since_ < 0.0) { escape_since_ = now.seconds(); }
+    if (now.seconds() - escape_since_ >= escape_both_sec_) {
+      // 舵を振って、壁の余裕がいちばん増える向きと舵を選ぶ。他車の余裕は escape_car_keep_ を守る。
+      double best_gain = -1e9, best_steer = 0.0; bool best_fwd = true, found = false;
+      const int N = std::max(simple_steer_steps_, 1);
+      for (int dir = 0; dir < 2; ++dir) {
+        const bool fwd = (dir == 0);
+        for (int k = -N; k <= N; ++k) {
+          const double st = kMaxSteerRad * static_cast<double>(k) / static_cast<double>(N);
+          recovery::Pose q = p;
+          bool car_hit = false;
+          const double ds = 0.2;
+          for (int m = 0; m < 5; ++m) {          // 1.0m ぶん試す
+            q = recovery::advanceBicycleExact(q, fwd ? ds : -ds, st, veh_.wheel_base);
+            if (!cars.empty() &&
+                recovery::carClearanceAt(cars, veh_, q) < escape_car_keep_) { car_hit = true; break; }
+          }
+          if (car_hit) { continue; }
+          const double gain = recovery::wallClearanceAt(obstacles_, veh_, q) - start_wall;
+          if (gain > best_gain) { best_gain = gain; best_steer = st; best_fwd = fwd; found = true; }
+        }
+      }
+      if (found && best_gain > 0.0) {
+        ++escape_n_;
+        if ((now - last_stall_log_).seconds() > 1.0) {
+          last_stall_log_ = now;
+          RCLCPP_WARN(get_logger(),
+            "復帰(簡易) 最終手段 累計%zu 前後とも候補なしで%.1fs動けない。"
+            "%s 舵%+.0fdeg で微速%.1fkm/h(壁の余裕 %+.2fm 見込み、他車は%.1fm空ける)",
+            escape_n_, now.seconds() - escape_since_, best_fwd ? "前進" : "後退",
+            best_steer * 180.0 / M_PI, escape_speed_ * 3.6, best_gain, escape_car_keep_);
+        }
+        simple_reversing_ = !best_fwd;
+        publishGear(best_fwd ? GearCommand::DRIVE : GearCommand::REVERSE);
+        publishCommand(static_cast<float>(best_fwd ? escape_speed_ : -escape_speed_),
+                       static_cast<float>(best_fwd ? simple_accel_ : -simple_accel_),
+                       static_cast<float>(best_steer));
+        cmd_src_ = "復帰(簡易) 最終手段";
+        return true;
+      }
+      if ((now - last_stall_log_).seconds() > 2.0) {
+        last_stall_log_ = now;
+        RCLCPP_WARN(get_logger(),
+          "復帰(簡易) 最終手段も見つからない(他車から%.1fm を守れる舵が無い)", escape_car_keep_);
+      }
+    }
+  } else {
+    escape_since_ = -1.0;
   }
   bool switch_dir = false;
   const char * why_switch = "";

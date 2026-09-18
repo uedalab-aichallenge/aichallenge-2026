@@ -142,6 +142,9 @@ SimplePurePursuit::SimplePurePursuit()
   lookahead_slow_speed_(declare_parameter<float>("lookahead_slow_speed", 2.78)),
   // 低速時の目標距離の上限 = 曲率半径 x この係数。
   lookahead_curve_k_(declare_parameter<float>("lookahead_curve_k", 0.35)),
+  lookahead_curve_always_(declare_parameter<bool>("lookahead_curve_always", false)),
+  lookahead_curve_min_(declare_parameter<double>("lookahead_curve_min", 2.8)),
+  lookahead_curve_max_(declare_parameter<double>("lookahead_curve_max", 6.0)),
   lookahead_slow_min_(declare_parameter<float>("lookahead_slow_min", 1.5)),
   // 低速時に目標距離を縮める指数。
   lookahead_slow_exp_(declare_parameter<float>("lookahead_slow_exp", 2.0)),
@@ -330,6 +333,14 @@ void SimplePurePursuit::onTimer()
   {
     const double v_now = std::abs(current_longitudinal_vel);
     double cap = 1e9;
+    // 曲率の上限は速度に関わらず掛ける(下限・上限の範囲で)。
+    if (lookahead_curve_always_) {
+      const double radius_a = localTurnRadius(closet_traj_point_idx);
+      const double by_curve_a = std::clamp(
+        radius_a * static_cast<double>(lookahead_curve_k_),
+        lookahead_curve_min_, lookahead_curve_max_);
+      cap = std::min(cap, by_curve_a);
+    }
     if (v_now < lookahead_slow_speed_) {
       const double radius = localTurnRadius(closet_traj_point_idx);
       const double x =
@@ -337,7 +348,7 @@ void SimplePurePursuit::onTimer()
       const double k = std::max(lookahead_slow_exp_, 1e-3);
       const double by_speed = lookahead_distance * std::exp(-k * x);
       const double by_curve = radius * lookahead_curve_k_;
-      cap = std::max(std::min(by_speed, by_curve), lookahead_slow_min_);
+      cap = std::max(std::min({by_speed, by_curve, cap}), lookahead_slow_min_);
     }
     if (lookahead_slow_now_ > 1e8 && cap > 1e8) {
       lookahead_slow_now_ = cap;

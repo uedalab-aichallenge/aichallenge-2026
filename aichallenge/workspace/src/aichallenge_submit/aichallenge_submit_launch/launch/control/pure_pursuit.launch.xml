@@ -25,6 +25,18 @@
     <param name="lookahead_slow_min" value="2.8"/>
     <param name="lookahead_slow_speed" value="2.78"/>
     <param name="lookahead_slow_exp" value="2.0"/>
+    <!-- 【2026-09-18 既定 false で棄却】曲率から lookahead に上限を掛ける(全速度)。
+         実測で壁/周 0.042 -> 0.69(16倍)、復帰 4-5回 -> 21-24回/レース。
+         復帰開始 47件中 44件が idx160-190 に集中。理由: 30km/h の通常 lookahead は
+         0.20*8.3+3.5 = 5.16m だが、idx169-195 は半径 7-14m なので
+         2.8-3.6m まで縮み(最大46%減)、実効ゲインが上がって発振した。
+         下限 2.8 が通常値の半分しかなく歯止めになっていない。
+         launch のもう一つのコメント「曲率で決めると idx51-65 等が強く縮まって発振する」
+         と同じ現象。再度試すなら下限は通常値(5.0m 以上)にすること。 -->
+    <param name="lookahead_curve_k" value="$(env LOOKAHEAD_CURVE_K 0.35)"/>
+    <param name="lookahead_curve_always" value="$(env LOOKAHEAD_CURVE_ALWAYS false)"/>
+    <param name="lookahead_curve_min" value="$(env LOOKAHEAD_CURVE_MIN 2.8)"/>
+    <param name="lookahead_curve_max" value="$(env LOOKAHEAD_CURVE_MAX 6.0)"/>
     <param name="speed_proportional_gain" value="1.0"/>
     <!-- OVER ペナルティ(|a|>3 m/s^2 で 2 秒間 5 km/h 制限)を踏まないための上限。
          AWSIM は入力を ±1.37 に clamp するので 2.0 でも性能は落ちない。 -->

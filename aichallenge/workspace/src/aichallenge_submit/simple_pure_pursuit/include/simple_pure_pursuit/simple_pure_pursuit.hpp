@@ -64,6 +64,11 @@ class SimplePurePursuit : public rclcpp::Node {
   // 基準速度以上では変更しない。
   double lookahead_slow_speed_;   // これ[m/s]以上なら従来どおり
   double lookahead_curve_k_;      // 上限 = 曲率半径 x この係数
+  // 【2026-09-18】曲率から lookahead に上限を掛ける。以前は 10km/h 未満でしか効かず、
+  // 11km/h で急カーブ(半径4.8m)に入ると要求舵が ±45度(実舵は18度で飽和)になり蛇行していた。
+  bool lookahead_curve_always_;
+  double lookahead_curve_min_;   // 下限[m]。これより短くしない(振動する)
+  double lookahead_curve_max_;   // 上限[m]。これより長い制限は掛けない
   double lookahead_slow_min_;     // 縮めすぎ防止の下限[m]
   double lookahead_slow_exp_;     // 低速での縮め方の鋭さ(指数)
   // 追い越し試行中は目標点を近づける。横にずらした軌道へ素早く追従させるため。

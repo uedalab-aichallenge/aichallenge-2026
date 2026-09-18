@@ -409,6 +409,14 @@ private:
   double simple_press_since_{-1.0};
   double press_flip_sec_{1.0};     // この秒数動かなければ切り替える
   double press_wall_m_{0.2};       // 進もうとしている側の壁までの距離がこれ未満なら「押し付き」
+  // 【2026-09-18 ユーザー指示】前も後ろも候補が無いまま壁を押し続ける状態の最終手段。
+  // 押し付き検出 71回のうち 65回が「反対にも候補が無い」で続行し、30秒の上限まで押していた。
+  bool escape_enable_{true};
+  double escape_both_sec_{2.0};    // 前後とも候補が無い状態がこの秒数続いたら発動
+  double escape_car_keep_{1.0};    // 他車から最低これだけ空ける[m]
+  double escape_speed_{0.28};      // 微速[m/s](約1km/h)
+  double escape_since_{-1.0};
+  std::size_t escape_n_{0};
   // 【2026-09-18 調査用】指令する実舵角の上限[rad]。0 以下なら kMaxSteerRad(0.31=17.8度)。
   // 「車は本当に18度までしか切れないのか」を測るためだけの設定。既定は従来どおり。
   double steer_clamp_test_{0.0};
