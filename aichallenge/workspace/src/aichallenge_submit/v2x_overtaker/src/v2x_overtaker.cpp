@@ -11,6 +11,8 @@
 #include "v2x_overtaker/v2x_overtaker.hpp"
 #include "v2x_overtaker/runup_sim.hpp"
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
+
 #include <cstdarg>
 #include <cstring>
 
@@ -137,10 +139,11 @@ V2XOvertaker::V2XOvertaker()
   wall_guard_corridor_half_(
     declare_parameter<double>("wall_guard_corridor_half", 0.73)),
   occ_enable_(declare_parameter<bool>("occ_enable", true)),
-  occ_map_yaml_(declare_parameter<std::string>(
-    "occ_map_yaml",
-    "/aichallenge/workspace/install/multi_purpose_mpc_ros/share/multi_purpose_mpc_ros"
-    "/env/ten_final_ver3/ten_occupancy_grid_map.yaml")),
+  // 【2026-09-18】既定は空。空なら resolveOccYaml() が実行時に探す。
+  // 以前は "/aichallenge/workspace/install/..." を決め打ちしていたが、公式環境は
+  // 車ごとに /aichallenge/d1/workspace/... へ置くため必ず読込に失敗し、
+  // 占有格子ガードが丸ごと無効になっていた(ローカルは1台構成なので再現しない)。
+  occ_map_yaml_(declare_parameter<std::string>("occ_map_yaml", "")),
   occ_sample_step_(declare_parameter<double>("occ_sample_step", 0.15)),
   occ_steer_bins_(declare_parameter<int>("occ_steer_bins", 41)),
   occ_clear_search_(declare_parameter<double>("occ_clear_search", 1.0)),
@@ -1028,7 +1031,7 @@ V2XOvertaker::V2XOvertaker()
       RCLCPP_INFO(get_logger(),
         "壁予測(格子) 読込成功 %s %dx%d res=%.3f origin=(%.3f,%.3f) 占有=%.1f%% "
         "車体=[前%.2f 後%.2f 半幅%.2f] 探索=%.2fm 候補=%d",
-        occ_map_yaml_.c_str(), occ_.w, occ_.h, occ_.res, occ_.ox, occ_.oy,
+        occ_map_path_.c_str(), occ_.w, occ_.h, occ_.res, occ_.ox, occ_.oy,
         100.0 * static_cast<double>(occ_.n_occ) /
           std::max<double>(1.0, static_cast<double>(occ_.w) * occ_.h),
         geom_front_, geom_rear_, geom_half_width_,
@@ -1036,8 +1039,8 @@ V2XOvertaker::V2XOvertaker()
     } else {
       occ_warned_ = true;
       RCLCPP_WARN(get_logger(),
-        "壁予測(格子) 読込失敗 %s -> 占有格子ガードを無効化(CSV 判定のみで動作)",
-        occ_map_yaml_.c_str());
+        "壁予測(格子) 読込失敗 試した候補=[%s] -> 占有格子ガードを無効化(CSV 判定のみで動作)",
+        occ_tried_.c_str());
     }
   }
   // 制御側が実際に上書きしたかどうかの通知。ログへ併記するためだけに購読する。
@@ -8901,10 +8904,47 @@ bool readPgm(const std::string & path, int & w, int & h, std::vector<uint8_t> & 
 
 // 占有格子地図(yaml + pgm)を読み、符号付き距離場を作る。
 // 失敗したら false を返し、呼び出し側が機能を丸ごと無効化する。
+// 占有格子の yaml を実行時に探す。どの環境でも動くよう、次の順に試す。
+//   1. パラメータ occ_map_yaml(明示指定。空なら飛ばす)
+//   2. ament のインデックスから引いた multi_purpose_mpc_ros の share
+//   3. 自分の share から見た隣のパッケージ(インストール木が同じなら当たる)
+//   4. 従来の決め打ち(後方互換)
+std::string V2XOvertaker::resolveOccYaml()
+{
+  const std::string rel = "/env/ten_final_ver3/ten_occupancy_grid_map.yaml";
+  std::vector<std::string> cand;
+  if (!occ_map_yaml_.empty()) { cand.push_back(occ_map_yaml_); }
+  try {
+    cand.push_back(
+      ament_index_cpp::get_package_share_directory("multi_purpose_mpc_ros") + rel);
+  } catch (const std::exception &) {                 // パッケージが無い環境
+  }
+  try {
+    const std::string self =
+      ament_index_cpp::get_package_share_directory("v2x_overtaker");
+    const std::size_t sl = self.find_last_of('/');
+    if (sl != std::string::npos) {
+      cand.push_back(self.substr(0, sl + 1) + "multi_purpose_mpc_ros" + rel);
+    }
+  } catch (const std::exception &) {
+  }
+  cand.push_back(
+    "/aichallenge/workspace/install/multi_purpose_mpc_ros/share/multi_purpose_mpc_ros" + rel);
+  occ_tried_.clear();
+  for (const auto & c : cand) {
+    occ_tried_ += (occ_tried_.empty() ? "" : " / ") + c;
+    std::ifstream f(c);
+    if (f) { return c; }
+  }
+  return {};
+}
+
 bool V2XOvertaker::loadOccGrid()
 {
   occ_ = OccGrid{};
-  std::ifstream ifs(occ_map_yaml_);
+  occ_map_path_ = resolveOccYaml();
+  if (occ_map_path_.empty()) { return false; }
+  std::ifstream ifs(occ_map_path_);
   if (!ifs) { return false; }
 
   std::string image;
@@ -8980,8 +9020,8 @@ bool V2XOvertaker::loadOccGrid()
   if (image.empty() || res <= 0.0 || origin_seen < 2) { return false; }
 
   std::string dir;
-  const std::size_t sl = occ_map_yaml_.find_last_of('/');
-  if (sl != std::string::npos) { dir = occ_map_yaml_.substr(0, sl + 1); }
+  const std::size_t sl = occ_map_path_.find_last_of('/');
+  if (sl != std::string::npos) { dir = occ_map_path_.substr(0, sl + 1); }
   const std::string pgm = (image.front() == '/') ? image : (dir + image);
 
   int w = 0, h = 0;

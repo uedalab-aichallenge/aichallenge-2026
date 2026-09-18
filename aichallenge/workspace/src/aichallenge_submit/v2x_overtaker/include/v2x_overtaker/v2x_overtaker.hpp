@@ -747,7 +747,9 @@ private:
   const double wall_guard_corridor_half_;
 
   const bool occ_enable_;            // 占有格子ガードの有効化
-  const std::string occ_map_yaml_;   // 占有格子地図の yaml(絶対パス)
+  const std::string occ_map_yaml_;   // 占有格子地図の yaml(空なら実行時に探す)
+  std::string occ_map_path_;         // 実際に読めたパス
+  std::string occ_tried_;            // 試した候補(失敗したときのログ用)
   const double occ_sample_step_;     // 車体の辺を刻む間隔[m]
   const int occ_steer_bins_;         // 候補舵角の本数
   const double occ_clear_search_;    // 余裕を測る上限[m](これ以上は飽和させる)
@@ -769,6 +771,7 @@ private:
   bool occ_warned_{false};
   rclcpp::Time last_occ_log_{0, 0, RCL_ROS_TIME};
 
+  std::string resolveOccYaml();
   bool loadOccGrid();
   // (x, y) の符号付き余裕[m]。地図外は「コース外」なので最大の食い込み扱い。
   double occSignedDist(double x, double y) const;
