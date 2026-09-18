@@ -12,7 +12,9 @@
     <param name="sat_accel_guard" value="$(env SAT_ACCEL_GUARD true)"/>
     <param name="use_external_target_vel" value="false"/>
     <param name="external_target_vel" value="10.0"/>
-    <param name="lookahead_gain" value="0.20"/>
+    <!-- 【2026-09-18】蛇行(直線で舵指令の符号反転 18.5回/分)を詰めるため env で振れるようにした。
+         lookahead = lookahead_gain*速度 + lookahead_min_distance。37km/h で 2.06+3.5=5.56m。 -->
+    <param name="lookahead_gain" value="$(env LOOKAHEAD_GAIN 0.20)"/>
     <param name="lookahead_min_distance" value="3.5"/>
     <!-- 場所を指定して lookahead を縮める。"開始:終了:倍率" をカンマ区切り。
          idx165-185 は内側の余地が 0.90m しかなく、pure_pursuit が
@@ -41,7 +43,7 @@
     <!-- OVER ペナルティ(|a|>3 m/s^2 で 2 秒間 5 km/h 制限)を踏まないための上限。
          AWSIM は入力を ±1.37 に clamp するので 2.0 でも性能は落ちない。 -->
     <param name="max_acceleration" value="2.0"/>
-    <param name="steering_tire_angle_gain" value="2.8"/>
+    <param name="steering_tire_angle_gain" value="$(env STEER_GAIN 2.8)"/>
 
     <remap from="input/kinematics" to="/localization/kinematic_state"/>
     <remap from="input/trajectory" to="/planning/scenario_planning/trajectory"/>

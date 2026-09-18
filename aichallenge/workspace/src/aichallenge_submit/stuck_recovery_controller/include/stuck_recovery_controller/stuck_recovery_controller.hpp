@@ -50,6 +50,7 @@ private:
   void onNominalCommand(const AckermannControlCommand::ConstSharedPtr msg);
   void updateStuckDetection(
     const AckermannControlCommand & command, const rclcpp::Time & now);
+  bool normalPathClear(double & min_wall, double & min_car, double & yaw_diff_deg) const;
   bool runRecovery(const rclcpp::Time & now);
   bool runRecoverySimple(const rclcpp::Time & now);
   void publishCommand(float speed, float acceleration, float steer = 0.0f);
@@ -414,6 +415,18 @@ private:
   bool escape_enable_{true};
   double escape_both_sec_{2.0};    // 前後とも候補が無い状態がこの秒数続いたら発動
   double escape_car_keep_{1.0};    // 他車から最低これだけ空ける[m]
+  // 【2026-09-19】復帰の終了条件。通常走行の経路をこの距離だけ先まで調べ、
+  // 壁・他車の余裕が下限以上で、向きも合っていれば通常制御へ返す。
+  bool exit_path_enable_{true};
+  double exit_path_look_m_{15.0};
+  double exit_path_wall_{0.05};
+  double exit_path_car_{0.30};
+  double exit_path_yaw_deg_{60.0};
+  double exit_path_hold_{0.5};
+  double exit_path_cooldown_{2.0};
+  double exit_path_last_end_{-1.0};
+  double exit_path_since_{-1.0};
+  std::size_t exit_path_n_{0};
   double escape_speed_{0.28};      // 微速[m/s](約1km/h)
   double escape_since_{-1.0};
   std::size_t escape_n_{0};

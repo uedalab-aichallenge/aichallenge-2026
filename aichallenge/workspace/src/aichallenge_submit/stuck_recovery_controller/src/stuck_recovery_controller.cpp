@@ -348,6 +348,13 @@ StuckRecoveryController::StuckRecoveryController() : Node("stuck_recovery_contro
   escape_enable_ = declare_parameter<bool>("escape_enable", true);
   escape_both_sec_ = declare_parameter<double>("escape_both_sec", 2.0);
   escape_car_keep_ = declare_parameter<double>("escape_car_keep", 1.0);
+  exit_path_enable_ = declare_parameter<bool>("exit_path_enable", true);
+  exit_path_look_m_ = declare_parameter<double>("exit_path_look", 15.0);
+  exit_path_wall_ = declare_parameter<double>("exit_path_wall", 0.05);
+  exit_path_car_ = declare_parameter<double>("exit_path_car", 0.30);
+  exit_path_yaw_deg_ = declare_parameter<double>("exit_path_yaw_deg", 60.0);
+  exit_path_hold_ = declare_parameter<double>("exit_path_hold", 0.5);
+  exit_path_cooldown_ = declare_parameter<double>("exit_path_cooldown", 2.0);
   escape_speed_ = declare_parameter<double>("escape_speed", 0.28);
   steer_clamp_test_ = declare_parameter<double>("steer_clamp_test", 0.0);
   if (steer_clamp_test_ > 0.0) {
@@ -1670,6 +1677,14 @@ void StuckRecoveryController::updateStuckDetection(
           RCLCPP_INFO(get_logger(), "発進から%.1fs: 復帰の開始を見送る(%.1fs まで)",
             (now - launch_moving_since_.value()).seconds(), launch_no_recovery_sec_);
         }
+        return;
+      }
+      // 「通常経路が走れる」で返した直後は、少し待ってから再突入する。
+      // 返した瞬間にまた停滞判定が立つと、出入りを繰り返して余計に遅くなる。
+      if (exit_path_last_end_ > 0.0 &&
+          now.seconds() - exit_path_last_end_ < exit_path_cooldown_ &&
+          !recovery_start_time_.has_value())
+      {
         return;
       }
       // **代入の前に**「既に復帰中だったか」を控える(順序が逆だと必ず真になる)
@@ -3063,11 +3078,86 @@ bool StuckRecoveryController::runRecoverySimple(const rclcpp::Time & now)
   return true;
 }
 
+// 【2026-09-19 ユーザー指示】復帰を終える条件を
+// 「実際に走ることになる通常走行の経路が、ぶつからずに実行できるようになったら」にする。
+//
+// 従来の終了条件は「復帰が自分で決めた目標点に着く」か「30秒」で、入った理由
+// (1秒で0.5mも進めない)と無関係だった。公式環境の safety-gate test5 では、
+// コリドア内を 10.8km/h で 18秒・40m 走り続けているのに復帰から抜けられず、
+// 復帰(簡易)の切り返しで横に±3m 振れ続けていた(=蛇行の正体)。
+//
+// 判定には新しい仕組みを作らず、復帰が毎周期使っている壁/他車の余裕の計算を
+// そのまま通常走行の経路へ当てる。
+bool StuckRecoveryController::normalPathClear(
+  double & min_wall, double & min_car, double & yaw_diff_deg) const
+{
+  min_wall = 1e9; min_car = 1e9; yaw_diff_deg = 180.0;
+  if (!latest_traj_ || latest_traj_->points.size() < 2) { return false; }
+  recovery::Pose p;
+  if (!currentPose(p)) { return false; }
+  const auto & pts = latest_traj_->points;
+  // 自車にいちばん近い点から前へ辿る。
+  std::size_t near = 0;
+  double best = 1e18;
+  for (std::size_t i = 0; i < pts.size(); ++i) {
+    const auto & q = pts[i].pose.position;
+    const double d = (q.x - p.x) * (q.x - p.x) + (q.y - p.y) * (q.y - p.y);
+    if (d < best) { best = d; near = i; }
+  }
+  auto yaw_of = [](const auto & pose) {
+    const auto & q = pose.orientation;
+    return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  };
+  // 経路と同じ向きを向いているか(真横や逆走のまま返さない)。
+  double dy = p.yaw - yaw_of(pts[near].pose);
+  while (dy > M_PI) { dy -= 2.0 * M_PI; }
+  while (dy < -M_PI) { dy += 2.0 * M_PI; }
+  yaw_diff_deg = std::abs(dy) * 180.0 / M_PI;
+  const auto cars = carObstacles();
+  double run = 0.0;
+  std::size_t checked = 0;
+  for (std::size_t k = near; k + 1 < pts.size() && run < exit_path_look_m_; ++k) {
+    const auto & a = pts[k].pose.position;
+    const auto & b = pts[k + 1].pose.position;
+    run += std::hypot(b.x - a.x, b.y - a.y);
+    recovery::Pose q;
+    q.x = pts[k].pose.position.x;
+    q.y = pts[k].pose.position.y;
+    q.yaw = yaw_of(pts[k].pose);
+    min_wall = std::min(min_wall, recovery::wallClearanceAt(obstacles_, veh_, q));
+    min_car = std::min(min_car, recovery::carClearanceAt(cars, veh_, q));
+    ++checked;
+  }
+  if (checked == 0) { return false; }
+  return min_wall >= exit_path_wall_ && min_car >= exit_path_car_ &&
+         yaw_diff_deg <= exit_path_yaw_deg_;
+}
+
 bool StuckRecoveryController::runRecovery(const rclcpp::Time & now)
 {
   ProfScope prof_scope(prof_, "runRecovery");
   if (!recovery_start_time_.has_value()) { return false; }
   const double total = (now - recovery_start_time_.value()).seconds();
+  // 通常走行の経路がそのまま走れるようになったら、目標点を待たずに返す。
+  if (exit_path_enable_) {
+    double mw = 0.0, mc = 0.0, yd = 0.0;
+    if (normalPathClear(mw, mc, yd)) {
+      if (exit_path_since_ < 0.0) { exit_path_since_ = now.seconds(); }
+      if (now.seconds() - exit_path_since_ >= exit_path_hold_) {
+        ++exit_path_n_;
+        RCLCPP_WARN(get_logger(),
+          "復帰 通常経路が走れるので返す 累計%zu 先%.0fm 壁の余裕%.2fm 他車の余裕%.2fm "
+          "方位差%.0fdeg 経過%.1fs",
+          exit_path_n_, exit_path_look_m_, mw, mc, yd, total);
+        exit_path_last_end_ = now.seconds();
+        finishRecovery(now, "通常経路が走れる");
+        return false;
+      }
+    } else {
+      exit_path_since_ = -1.0;
+    }
+  }
   if (recovery_simple_) {
     if (total > kRecoveryMaxSec) {
       RCLCPP_WARN(get_logger(), "復帰(簡易) 上限%.0fs に到達。通常制御へ返す", kRecoveryMaxSec);
