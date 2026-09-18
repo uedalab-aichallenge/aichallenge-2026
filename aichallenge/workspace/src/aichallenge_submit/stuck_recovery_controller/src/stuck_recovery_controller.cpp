@@ -2156,6 +2156,10 @@ void StuckRecoveryController::beginRecovery(
   const rclcpp::Time & now, bool forward_blocked, bool was_active)
 {
   ProfScope prof_scope(prof_, "beginRecovery");
+  // 【2026-09-19】復帰に入る前から条件が成立していると、保持時間を待たずに
+  // 即座に終了してしまう(実測でゲート2回の復帰 177件中 152件が 継続=0.0秒)。
+  // 開始のたびに測り直す。
+  exit_path_since_ = -1.0;
   // 開始回数を数えるための専用ログ ---。
   traceDump(now, "recovery_begin");
   ++recovery_begin_seq_;
@@ -3130,6 +3134,11 @@ bool StuckRecoveryController::normalPathClear(
     ++checked;
   }
   if (checked == 0) { return false; }
+  // 【2026-09-19】経路がきれいでも、車体自身が壁に食い込んでいたら復帰は終わっていない。
+  // gate test4 では壁へ 0.81m 食い込んだまま「前方15mの経路はきれい」で返してしまい、
+  // そのまま壁に接触した。自車位置の余裕も同じ下限で見る。
+  const double ego_wall = recovery::wallClearanceAt(obstacles_, veh_, p);
+  if (ego_wall < exit_path_wall_) { return false; }
   return min_wall >= exit_path_wall_ && min_car >= exit_path_car_ &&
          yaw_diff_deg <= exit_path_yaw_deg_;
 }
